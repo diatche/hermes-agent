@@ -640,6 +640,43 @@ def _auto_continue_freshness_window() -> float:
     return auto_continue_freshness_window()
 
 
+def _build_restart_resume_note(reason_phrase: str, message: str = "") -> str:
+    """Build the one-shot recovery turn after a gateway interruption.
+
+    Restart/shutdown commands and recorded tool calls must never be replayed,
+    but that safety boundary must not abandon the higher-level goal. With no
+    new user message, continue the next safe incomplete step automatically.
+    A real new message takes priority and may supersede the old goal.
+    """
+    if message:
+        resume_guidance = (
+            "Address the user's NEW message below FIRST. Then resume the "
+            "unfinished goal from its next safe incomplete step unless the "
+            "new message supersedes it."
+        )
+    else:
+        resume_guidance = (
+            "Briefly report that the session was restored successfully, then "
+            "review the conversation history, identify the active unfinished "
+            "goal, and continue the unfinished goal from its next safe "
+            "incomplete step. Ask the user only if no unfinished goal is "
+            "clear, continuation is ambiguous, or user input or approval is "
+            "required."
+        )
+
+    note = (
+        f"[System note: The previous turn was interrupted by {reason_phrase}; "
+        f"the gateway is now back online. Any restart/shutdown command in the "
+        f"history has already run — do NOT re-execute or verify it. "
+        f"{resume_guidance} Do NOT re-execute old tool calls blindly; treat "
+        f"their recorded outputs as authoritative prior results, including "
+        f"failures. Continue from the next safe incomplete step, using a new "
+        f"tool call only when needed for that step. Do not skip unfinished "
+        f"work solely because the gateway restarted.]"
+    )
+    return note + (f"\n\n{message}" if message else "")
+
+
 def _float_env(name: str, default: float) -> float:
     """Read an env var as float, falling back to ``default`` on typos/empty.
 
@@ -18778,27 +18815,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _persist_user_message_override = message
                 # The empty-message case is the auto-resume startup turn
                 # synthesized by _schedule_resume_pending_sessions — there is
-                # no NEW user message to address, so tell the model to report
-                # recovery instead of the (nonexistent) "new message".
-                if message:
-                    _resume_guidance = (
-                        "Address the user's NEW message below FIRST and focus "
-                        "on what the user is asking now."
-                    )
-                else:
-                    _resume_guidance = (
-                        "Report to the user that the session was restored "
-                        "successfully and ask what they would like to do next."
-                    )
-                message = (
-                    f"[System note: The previous turn was interrupted by "
-                    f"{_reason_phrase}; the gateway is now back online. "
-                    f"Any restart/shutdown command in the history has already "
-                    f"run — do NOT re-execute or verify it. {_resume_guidance} "
-                    f"Do NOT re-execute old tool calls — skip any unfinished "
-                    f"work from the conversation history.]"
-                    + (f"\n\n{message}" if message else "")
-                )
+                # no NEW user message to address, so report recovery and
+                # continue the active goal instead of inventing a new request.
+                message = _build_restart_resume_note(_reason_phrase, message)
             elif _has_fresh_tool_tail:
                 _persist_user_message_override = message
                 message = (
@@ -18845,16 +18864,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _sn_reason == "shutdown_timeout"
                     else "a gateway interruption"
                 )
-                message = (
-                    f"[System note: The previous turn was interrupted by "
-                    f"{_sn_reason_phrase}; the gateway is now back online. "
-                    f"Any restart/shutdown command in the history has already "
-                    f"run — do NOT re-execute or verify it. Report to the user "
-                    f"that the session was restored successfully and ask what "
-                    f"they would like to do next. Do NOT re-execute old tool "
-                    f"calls — skip any unfinished work from the conversation "
-                    f"history.]"
-                )
+                message = _build_restart_resume_note(_sn_reason_phrase)
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
