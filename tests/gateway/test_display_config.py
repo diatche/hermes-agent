@@ -70,6 +70,19 @@ class TestResolveDisplaySetting:
 
         assert resolve_display_setting(config, "telegram", "busy_steer_ack_enabled", True) is False
 
+    def test_todo_progress_defaults_off_and_honours_platform_override(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "telegram", "todo_progress") is False
+        config = {
+            "display": {
+                "todo_progress": False,
+                "platforms": {"telegram": {"todo_progress": "true"}},
+            }
+        }
+        assert resolve_display_setting(config, "telegram", "todo_progress") is True
+        assert resolve_display_setting(config, "discord", "todo_progress") is False
+
     def test_fallback_parameter_used_last(self):
         """Explicit fallback is used when nothing else matches."""
         from gateway.display_config import resolve_display_setting

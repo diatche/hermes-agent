@@ -168,6 +168,97 @@ class ThinkingAgent:
         }
 
 
+class TodoChecklistAgent:
+    """Emits authoritative todo results plus a delegated-task batch."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tool_complete_callback = kwargs.get("tool_complete_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        complete = self.tool_complete_callback
+        assert cb is not None
+        assert complete is not None
+        cb(
+            "tool.started",
+            "todo",
+            "planning 3 task(s)",
+            {
+                "todos": [
+                    {"id": "inspect", "content": "Inspect configuration", "status": "completed"},
+                    {"id": "patch", "content": "Implement checklist", "status": "in_progress"},
+                    {"id": "verify", "content": "Run tests", "status": "pending"},
+                ],
+                "merge": False,
+            },
+        )
+        complete(
+            "todo-1",
+            "todo",
+            {"merge": False},
+            '{"todos": ['
+            '{"id":"inspect","content":"Inspect configuration","status":"completed"},'
+            '{"id":"patch","content":"Implement checklist","status":"in_progress"},'
+            '{"id":"verify","content":"Run tests","status":"pending"}'
+            ']}'
+        )
+        time.sleep(0.35)
+        cb(
+            "tool.started",
+            "todo",
+            "updating 2 task(s)",
+            {
+                "todos": [
+                    {"id": "patch", "content": "Implement checklist", "status": "completed"},
+                    {"id": "verify", "content": "Run tests", "status": "in_progress"},
+                ],
+                "merge": True,
+            },
+        )
+        complete(
+            "todo-2",
+            "todo",
+            {"todos": [{"id": "patch", "status": "completed"}], "merge": True},
+            '{"todos": ['
+            '{"id":"inspect","content":"Inspect configuration","status":"completed"},'
+            '{"id":"patch","content":"Implement checklist","status":"completed"},'
+            '{"id":"verify","content":"Run tests","status":"in_progress"}'
+            ']}'
+        )
+        time.sleep(0.35)
+        complete(
+            "todo-2-retry",
+            "todo",
+            {"todos": [{"id": "patch", "status": "completed"}], "merge": True},
+            '{"todos": ['
+            '{"id":"inspect","content":"Inspect configuration","status":"completed"},'
+            '{"id":"patch","content":"Implement checklist","status":"completed"},'
+            '{"id":"verify","content":"Run tests","status":"in_progress"}'
+            ']}'
+        )
+        time.sleep(0.35)
+        cb(
+            "tool.started",
+            "delegate_task",
+            "delegating 2 tasks",
+            {
+                "tasks": [
+                    {"goal": "Review gateway integration"},
+                    {"goal": "Check Telegram rendering"},
+                ]
+            },
+        )
+        time.sleep(0.35)
+        cb("tool.started", "terminal", "should stay hidden", {"command": "echo hidden"})
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class LongPreviewAgent:
     """Agent that emits a tool call with a very long preview string."""
     LONG_CMD = "cd /home/teknium/.hermes/hermes-agent/.worktrees/hermes-d8860339 && source .venv/bin/activate && python -m pytest tests/gateway/test_run_progress_topics.py -n0 -q"
@@ -1638,6 +1729,62 @@ async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_
     # Exactly TWO terminal headers: one for the first run of three calls,
     # one for the terminal call after web_search broke the streak.
     assert final.count("terminal\n```") == 2
+
+
+@pytest.mark.asyncio
+async def test_run_agent_renders_live_todo_checklist_when_tool_progress_off(monkeypatch, tmp_path):
+    """Task checklists are a dedicated surface, not ordinary tool chrome."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "off")
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TodoChecklistAgent,
+        session_id="sess-todo-checklist",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "todo_progress": True,
+                "interim_assistant_messages": False,
+            }
+        },
+    )
+
+    assert result["final_response"] == "done"
+    contents = [call["content"] for call in adapter.sent + adapter.edits]
+    assert contents
+    final_checklist = contents[-1]
+    assert "📋 Tasks — 2/3 completed" in final_checklist
+    assert "✅ Inspect configuration" in final_checklist
+    assert "✅ Implement checklist" in final_checklist
+    assert "🔄 Run tests" in final_checklist
+    assert "🤖 Delegated tasks" in final_checklist
+    assert "↳ Review gateway integration" in final_checklist
+    assert "↳ Check Telegram rendering" in final_checklist
+    assert "should stay hidden" not in "\n".join(contents)
+    assert len(adapter.edits) == 2, (
+        "one edit should update todo state and one should add delegations; "
+        "the repeated todo result must not edit unchanged text"
+    )
+
+
+@pytest.mark.asyncio
+async def test_todo_checklist_does_not_suppress_enabled_delegate_tool_progress(monkeypatch, tmp_path):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TodoChecklistAgent,
+        session_id="sess-todo-with-tool-progress",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "todo_progress": True,
+                "interim_assistant_messages": False,
+            }
+        },
+    )
+
+    contents = [call["content"] for call in adapter.sent + adapter.edits]
+    assert any("delegating 2 tasks" in content for content in contents)
 
 
 @pytest.mark.asyncio
