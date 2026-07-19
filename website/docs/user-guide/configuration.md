@@ -1459,6 +1459,7 @@ This controls both the `text_to_speech` tool and spoken replies in voice mode (`
 ```yaml
 display:
   tool_progress: all      # off | new | all | verbose
+  todo_progress: false    # Gateway: show todo plans as a live checklist, independent of tool_progress
   tool_progress_command: false  # Enable /verbose slash command in messaging gateway
   platforms: {}           # Per-platform display overrides (see below)
   tool_progress_overrides: {}  # DEPRECATED — use display.platforms instead
@@ -1535,6 +1536,20 @@ display:
 In the CLI, cycle through these modes with `/verbose`. To use `/verbose` in messaging platforms (Telegram, Discord, Slack, etc.), set `tool_progress_command: true` in the `display` section above. The command will then cycle the mode and save to config.
 
 Tool progress requires a gateway adapter that can display progress updates safely. Platforms without message editing support, including Signal, suppress tool-progress bubbles even if `/verbose` saves a non-`off` mode.
+
+### Live task checklist
+
+Set `display.todo_progress: true` to render calls to the `todo` tool as a compact checklist in one editable gateway message. This is independent of ordinary tool progress, so a quiet Telegram configuration can show only the active plan and final response:
+
+```yaml
+display:
+  platforms:
+    telegram:
+      tool_progress: 'off'
+      todo_progress: true
+```
+
+A full todo update replaces the main checklist; a `merge: true` update changes only the supplied task IDs while preserving their order. Goals dispatched through `delegate_task` appear in a **Delegated tasks** section below the main list. The checklist is off by default and requires an adapter with message-editing support.
 
 ### Runtime-metadata footer (gateway only)
 

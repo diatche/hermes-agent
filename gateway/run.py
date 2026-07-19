@@ -17646,11 +17646,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for={Platform.MATTERMOST},
         )
         _thinking_enabled = _thinking_mode != "off"
-        needs_progress_queue = tool_progress_enabled or _thinking_enabled
+        # Task checklists are a dedicated presentation surface. They remain
+        # available when ordinary tool chrome is disabled so mobile chats can
+        # stay quiet while still showing the active plan.
+        todo_progress_enabled = (
+            source.platform != Platform.WEBHOOK
+            and bool(resolve_display_setting(
+                user_config, platform_key, "todo_progress", False
+            ))
+        )
+        needs_progress_queue = (
+            tool_progress_enabled or _thinking_enabled or todo_progress_enabled
+        )
 
 
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if needs_progress_queue else None
+        from gateway.todo_progress import TodoChecklist
+        todo_checklist = TodoChecklist()
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -17736,6 +17749,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return
             if not progress_queue or not _run_still_current():
                 return
+
+            # Delegated goals are known at dispatch time and appear as child
+            # rows. Todo state itself is consumed from the authoritative full
+            # result in ``todo_complete_callback`` below.
+            if (
+                todo_progress_enabled
+                and event_type == "tool.started"
+                and tool_name == "delegate_task"
+            ):
+                checklist_text = todo_checklist.add_delegations(args)
+                if checklist_text:
+                    progress_queue.put(("__todo__", checklist_text))
+                # Continue into ordinary tool rendering when that independent
+                # surface is enabled; its normal off gate below keeps it quiet.
 
             # First-touch onboarding: the first time a tool takes longer than
             # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
@@ -17935,7 +17962,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             repeat_count[0] = 0
             
             progress_queue.put(msg)
-        
+
+        def todo_complete_callback(call_id, tool_name, args, result):
+            """Render the full, validated TodoStore result after a todo call."""
+            if (
+                not todo_progress_enabled
+                or tool_name != "todo"
+                or not progress_queue
+                or not _run_still_current()
+            ):
+                return
+            checklist_text = todo_checklist.update_from_result(result)
+            if checklist_text is not None:
+                progress_queue.put(("__todo__", checklist_text))
+
         # Background task to send progress messages
         # Accumulates tool lines into a single message that gets edited.
         #
@@ -18037,6 +18077,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
             progress_msg_id = None   # ID of the current progress message to edit
+            todo_msg_id = None       # Dedicated live checklist message
+            last_todo_text = None    # Last successfully delivered checklist text
             can_edit = progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
@@ -18121,6 +18163,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _track_progress_result(result)
                 return result
 
+            def _todo_formatted_len(value: str) -> int:
+                formatter = getattr(adapter, "format_message", None)
+                if callable(formatter):
+                    try:
+                        formatted = formatter(value)
+                        if isinstance(formatted, str):
+                            value = formatted
+                    except Exception:
+                        pass
+                return _progress_len_fn(value)
+
+            def _fit_todo_text(text: str) -> str:
+                """Fit a checklist into one editable platform message."""
+                if _todo_formatted_len(text) <= _PROGRESS_TEXT_LIMIT:
+                    return text
+                marker = "\n… more tasks"
+                low, high = 0, len(text)
+                while low < high:
+                    mid = (low + high + 1) // 2
+                    candidate = text[:mid].rstrip() + marker
+                    if _todo_formatted_len(candidate) <= _PROGRESS_TEXT_LIMIT:
+                        low = mid
+                    else:
+                        high = mid - 1
+                return text[:low].rstrip() + marker
+
+            async def _deliver_todo_checklist(text: str) -> None:
+                """Send the first checklist, then edit that message in place."""
+                nonlocal todo_msg_id, last_todo_text
+                text = _fit_todo_text(text)
+                if text == last_todo_text:
+                    return
+                if todo_msg_id is not None:
+                    result = None
+                    for attempt in range(2):
+                        try:
+                            result = await _edit_progress_message(todo_msg_id, text)
+                        except Exception:
+                            logger.debug("Todo checklist edit failed", exc_info=True)
+                            result = None
+                        if result is not None and result.success:
+                            last_todo_text = text
+                            return
+                        if not (result is not None and getattr(result, "retryable", False)):
+                            break
+                        if attempt == 0:
+                            await asyncio.sleep(min(float(result.retry_after or 0.5), 3.0))
+                    # A permanently uneditable/deleted message, or a transient
+                    # edit that exhausted retry, gets a fresh checklist bubble.
+                    todo_msg_id = None
+
+                result = None
+                for attempt in range(2):
+                    try:
+                        result = await _send_progress_text(text)
+                    except Exception:
+                        logger.debug("Todo checklist send failed", exc_info=True)
+                        result = None
+                    if result is not None and result.success:
+                        if result.message_id:
+                            todo_msg_id = result.message_id
+                        last_todo_text = text
+                        return
+                    if not (result is not None and getattr(result, "retryable", False)):
+                        return
+                    if attempt == 0:
+                        await asyncio.sleep(min(float(result.retry_after or 0.5), 3.0))
+
             async def _roll_progress_overflow_if_needed() -> bool:
                 """Start fresh editable progress bubbles before a bubble exceeds limit.
 
@@ -18184,6 +18294,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             continue
                     except Exception:
                         pass
+
+                    if isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__todo__":
+                        await _deliver_todo_checklist(str(raw[1]))
+                        await asyncio.sleep(0)
+                        continue
 
                     # Handle dedup messages: update last line with repeat counter
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
@@ -18308,7 +18423,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     while not progress_queue.empty():
                         try:
                             raw = progress_queue.get_nowait()
-                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                            if isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__todo__":
+                                await _deliver_todo_checklist(str(raw[1]))
+                            elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                                 _, base_msg, count = raw
                                 if progress_lines:
                                     progress_lines[-1] = f"{base_msg} (×{count + 1})"
@@ -18903,6 +19020,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # though the progress queue was created for them.
             agent.tool_progress_callback = (
                 progress_callback if (needs_progress_queue or log_mode_enabled) else None
+            )
+            setattr(
+                agent,
+                "tool_complete_callback",
+                todo_complete_callback if todo_progress_enabled else None,
             )
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).

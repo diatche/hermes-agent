@@ -32,6 +32,7 @@ from typing import Any
 
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
+    "todo_progress": False,  # Dedicated live checklist; independent of ordinary tool chrome.
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
     "show_reasoning": False,
     # How a reasoning/thinking summary is rendered when show_reasoning is on.
@@ -252,6 +253,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "busy_ack_detail",
         "busy_steer_ack_enabled",
         "thinking_progress",
+        "todo_progress",
     }:
         if isinstance(value, str):
             val = value.strip().lower()
