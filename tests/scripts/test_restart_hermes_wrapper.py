@@ -6,6 +6,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "restart-hermes-wrapper.sh"
 
@@ -115,8 +117,29 @@ def test_status_rejects_listener_not_owned_by_wrapper_tree(tmp_path: Path) -> No
     assert "wrapper-owned gateway/listener is not ready" in result.stdout
 
 
-def test_update_quiescence_rejects_any_surviving_gateway(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("command", "should_block"),
+    [
+        ("/usr/local/bin/hermes --profile crmwebhook gateway run --replace", True),
+        ("/usr/local/bin/hermes --profile crmwebhook gateway", True),
+        ("/usr/local/bin/hermes-gateway --profile crmwebhook", True),
+        ("python /repo/gateway/run.py --profile crmwebhook", True),
+        ("python -m hermes_cli.main --profile crmwebhook dashboard", True),
+        ("python /repo/hermes_cli/main.py --profile crmwebhook dashboard", True),
+        ("python /repo/hermes_cli/main.py serve --profile crmwebhook", True),
+        ("/usr/local/bin/hermes --profile crmwebhook dashboard --port 9000", True),
+        ("/usr/local/bin/other gateway run --replace", False),
+        ("python chat.py say hermes dashboard", False),
+        ("python chat.py say hermes_cli.main dashboard", False),
+        ("python chat.py say /repo/hermes_cli/main.py serve", False),
+        ("python chat.py say web_server.start_server", False),
+    ],
+)
+def test_update_quiescence_detects_hermes_runtime_command_shapes(
+    tmp_path: Path, command: str, should_block: bool
+) -> None:
     env, fake_bin = _environment(tmp_path)
+    env["HERMES_REPO"] = str(SCRIPT.parents[1])
     _command(
         fake_bin,
         "launchctl",
@@ -129,9 +152,70 @@ def test_update_quiescence_rejects_any_surviving_gateway(tmp_path: Path) -> None
         fake_bin,
         "ps",
         "#!/usr/bin/env bash\n"
-        "echo '4242 /usr/local/bin/hermes gateway run --replace'\n",
+        f"echo '4242 1 {command}'\n",
     )
     _command(fake_bin, "lsof", "#!/usr/bin/env bash\nexit 1\n")
+    _command(fake_bin, "sleep", "#!/usr/bin/env bash\nexit 0\n")
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--assert-update-quiescence"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert (result.returncode != 0) is should_block, result.stdout + result.stderr
+    if should_block:
+        assert "update quiescence could not be established" in result.stderr
+    else:
+        assert "Update quiescence verified" in result.stdout
+
+
+def test_update_quiescence_ignores_matcher_ancestry(tmp_path: Path) -> None:
+    env, fake_bin = _environment(tmp_path)
+    env["HERMES_REPO"] = str(SCRIPT.parents[1])
+    _command(
+        fake_bin,
+        "launchctl",
+        "#!/usr/bin/env bash\n"
+        "if [[ $1 == print ]]; then exit 1; fi\n"
+        "exit 0\n",
+    )
+    _command(
+        fake_bin,
+        "ps",
+        "#!/usr/bin/env bash\n"
+        "echo \"$PPID 1 /usr/local/bin/hermes dashboard\"\n",
+    )
+    _command(fake_bin, "lsof", "#!/usr/bin/env bash\nexit 1\n")
+    _command(fake_bin, "sleep", "#!/usr/bin/env bash\nexit 0\n")
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--assert-update-quiescence"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Update quiescence verified" in result.stdout
+
+
+def test_update_quiescence_fails_closed_on_malformed_process_row(tmp_path: Path) -> None:
+    env, fake_bin = _environment(tmp_path)
+    env["HERMES_REPO"] = str(SCRIPT.parents[1])
+    _command(
+        fake_bin,
+        "launchctl",
+        "#!/usr/bin/env bash\n"
+        "if [[ $1 == print ]]; then exit 1; fi\n"
+        "exit 0\n",
+    )
+    _command(fake_bin, "ps", "#!/usr/bin/env bash\necho 'not-a-valid-process-row'\n")
+    _command(fake_bin, "lsof", "#!/usr/bin/env bash\nexit 1\n")
+    _command(fake_bin, "sleep", "#!/usr/bin/env bash\nexit 0\n")
 
     result = subprocess.run(
         ["bash", str(SCRIPT), "--assert-update-quiescence"],
@@ -143,6 +227,7 @@ def test_update_quiescence_rejects_any_surviving_gateway(tmp_path: Path) -> None
 
     assert result.returncode == 1
     assert "update quiescence could not be established" in result.stderr
+    assert "matcher-unavailable" in result.stderr
 
 
 def test_update_quiescence_rejects_dashboard_that_starts_after_clean_samples(tmp_path: Path) -> None:
@@ -162,7 +247,7 @@ def test_update_quiescence_rejects_dashboard_that_starts_after_clean_samples(tmp
         "#!/usr/bin/env bash\n"
         f"count=$(cat '{ps_calls}' 2>/dev/null || echo 0)\n"
         f"echo $((count + 1)) > '{ps_calls}'\n"
-        "if (( count >= 9 )); then echo '4343 /usr/local/bin/hermes dashboard --port 9119'; fi\n",
+        "if (( count >= 9 )); then echo '4343 1 /usr/local/bin/hermes dashboard --port 9119'; fi\n",
     )
     _command(fake_bin, "lsof", "#!/usr/bin/env bash\nexit 1\n")
     _command(fake_bin, "sleep", "#!/usr/bin/env bash\nexit 0\n")
@@ -179,7 +264,7 @@ def test_update_quiescence_rejects_dashboard_that_starts_after_clean_samples(tmp
     assert "update quiescence could not be established" in result.stderr
 
 
-def test_status_rejects_extra_manual_gateway(tmp_path: Path) -> None:
+def test_status_allows_named_profile_gateway(tmp_path: Path) -> None:
     env, fake_bin = _environment(tmp_path)
     env["HERMES_REPO"] = "/repo"
     extra_gateway = tmp_path / "extra-gateway"
@@ -210,7 +295,7 @@ def test_status_rejects_extra_manual_gateway(tmp_path: Path) -> None:
         "  echo \"99111 $HERMES_WRAPPER_APP/Contents/MacOS/HermesGateway\"\n"
         "  echo '99333 /repo/venv/bin/hermes gateway run --replace'\n"
         "  echo '99444 /repo/venv/bin/hermes dashboard --port 9119'\n"
-        "  [[ -e $EXTRA_GATEWAY ]] && echo '99555 /other/venv/bin/hermes gateway run --replace'\n"
+        "  [[ -e $EXTRA_GATEWAY ]] && echo '99555 /other/venv/bin/hermes --profile crmwebhook gateway run --replace'\n"
         "  exit 0\n"
         "fi\n"
         "exit 0\n",
@@ -234,8 +319,8 @@ def test_status_rejects_extra_manual_gateway(tmp_path: Path) -> None:
     )
 
     assert healthy.returncode == 0, healthy.stdout + healthy.stderr
-    assert result.returncode == 1
-    assert "wrapper-owned gateway/listener is not ready" in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "OK: Hermes gateway is wrapper-owned and :9119 is listening" in result.stdout
 
 
 def test_detached_restart_is_blocked_by_active_maintenance(tmp_path: Path) -> None:

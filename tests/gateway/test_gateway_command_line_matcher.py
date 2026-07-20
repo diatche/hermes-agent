@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from gateway.status import (
+    looks_like_dashboard_runtime_command_line as matches_dashboard,
     looks_like_gateway_command_line as matches,
     looks_like_gateway_runtime_command_line as matches_runtime,
 )
@@ -67,3 +68,34 @@ def test_runtime_matcher_accepts_no_supervisor_restart_process():
     assert matches("python -m hermes_cli.main gateway restart") is False
     assert matches_runtime("python -m hermes_cli.main gateway restart") is True
     assert matches_runtime("python -m hermes_cli.main gateway status") is False
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "hermes dashboard",
+        "hermes --profile crmwebhook dashboard",
+        "hermes serve --profile crmwebhook",
+        "python /repo/venv/bin/hermes --profile crmwebhook dashboard",
+        "python -m hermes_cli.main --profile crmwebhook dashboard",
+        "python /repo/hermes_cli/main.py --profile crmwebhook dashboard",
+        "/repo/hermes_cli/main.py serve --profile crmwebhook",
+    ],
+)
+def test_dashboard_matcher_accepts_structural_cli_forms(cmd):
+    assert matches_dashboard(cmd) is True
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "python chat.py say hermes dashboard",
+        "python chat.py say hermes_cli.main dashboard",
+        "python chat.py say /repo/hermes_cli/main.py serve",
+        "python chat.py say web_server.start_server",
+        "python -m hermes_cli.main gateway run",
+        "some-dashboard-helper",
+    ],
+)
+def test_dashboard_matcher_rejects_prose_and_non_dashboard_commands(cmd):
+    assert matches_dashboard(cmd) is False

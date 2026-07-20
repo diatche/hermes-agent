@@ -96,11 +96,10 @@ official_unloaded() {
 }
 
 wrapper_ready() {
-  local root gateway dashboards owners all_wrapper_pids all_gateway_pids all_dashboard_pids
+  local root dashboards owners all_wrapper_pids
   local owner_count dashboard_count
   wrapper_child_running || return 1
   root="$(wrapper_pid)"
-  gateway="$(wrapper_gateway_pids "$root")"
   owners="$(lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sort -u)"
   owner_count="$(printf '%s\n' "$owners" | awk 'NF { count++ } END { print count+0 }')"
   [[ "$owner_count" == "1" ]] || return 1
@@ -110,11 +109,7 @@ wrapper_ready() {
   [[ "$owners" == "$dashboards" ]] || return 1
 
   all_wrapper_pids="$(wrapper_app_pids | sort -nu)"
-  [[ "$all_wrapper_pids" == "$root" ]] || return 1
-  all_gateway_pids="$(gateway_related_pids | sort -nu)"
-  [[ "$all_gateway_pids" == "$gateway" ]] || return 1
-  all_dashboard_pids="$(dashboard_related_pids | sort -nu)"
-  [[ "$all_dashboard_pids" == "$dashboards" ]]
+  [[ "$all_wrapper_pids" == "$root" ]]
 }
 
 wrapper_signature() {
@@ -245,15 +240,61 @@ wrapper_app_pids() {
     }'
 }
 
-gateway_related_pids() {
-  ps -axo pid=,command= | awk '
-    /(^|[[:space:]])gateway[[:space:]]+(run|restart)([[:space:]]|$)/ { print $1 }'
-}
+hermes_runtime_pids() {
+  local python_bin="${HERMES_WRAPPER_PYTHON:-$REPO/venv/bin/python}" output
+  if [[ ! -x "$python_bin" ]]; then
+    echo "matcher-unavailable"
+    return 0
+  fi
+  if ! output="$(
+    ps -axo pid=,ppid=,command= | PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" \
+      "$python_bin" -c '
+import os
+import sys
 
-dashboard_related_pids() {
-  ps -axo pid=,command= | awk '
-    /(^|[[:space:]\/])hermes([[:space:]][^[:space:]]+)*[[:space:]]dashboard([[:space:]]|$)/ ||
-    /web_server[.]start_server/ { print $1 }'
+from gateway.status import (
+    looks_like_dashboard_runtime_command_line,
+    looks_like_gateway_runtime_command_line,
+)
+
+
+records = []
+parents = {}
+for line in sys.stdin:
+    stripped = line.strip()
+    if not stripped:
+        continue
+    parts = stripped.split(None, 2)
+    if len(parts) != 3:
+        raise SystemExit(2)
+    pid_text, parent_text, command = parts
+    try:
+        pid = int(pid_text)
+        parent = int(parent_text)
+    except ValueError:
+        raise SystemExit(2)
+    records.append((pid, command))
+    parents[pid] = parent
+
+excluded = {os.getpid()}
+pid = os.getppid()
+while pid > 1 and pid not in excluded:
+    excluded.add(pid)
+    pid = parents.get(pid, 0)
+
+for pid, command in records:
+    if pid in excluded:
+        continue
+    if looks_like_gateway_runtime_command_line(
+        command
+    ) or looks_like_dashboard_runtime_command_line(command):
+        print(pid)
+'
+  )"; then
+    echo "matcher-unavailable"
+    return 0
+  fi
+  printf '%s\n' "$output" | awk 'NF'
 }
 
 listener_pids() {
@@ -265,8 +306,7 @@ assert_update_quiescence() {
   for _ in {1..40}; do
     if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 \
       && [[ -z "$(wrapper_app_pids)" ]] \
-      && [[ -z "$(gateway_related_pids)" ]] \
-      && [[ -z "$(dashboard_related_pids)" ]] \
+      && [[ -z "$(hermes_runtime_pids)" ]] \
       && [[ -z "$(listener_pids)" ]] \
       && [[ -z "$(loaded_official_gateway_labels)" ]]; then
       stable=$((stable + 1))
@@ -282,8 +322,7 @@ assert_update_quiescence() {
   echo "ERROR: Hermes update quiescence could not be established" >&2
   loaded_official_gateway_labels >&2 || true
   wrapper_app_pids >&2 || true
-  gateway_related_pids >&2 || true
-  dashboard_related_pids >&2 || true
+  hermes_runtime_pids >&2 || true
   lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >&2 || true
   return 1
 }

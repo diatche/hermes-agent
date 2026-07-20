@@ -390,6 +390,60 @@ def looks_like_gateway_runtime_command_line(command: str | None) -> bool:
     return _gateway_command_subcommand(command) in {"run", "restart"}
 
 
+def looks_like_dashboard_runtime_command_line(command: str | None) -> bool:
+    """Return True for structurally valid ``hermes dashboard``/``serve`` commands."""
+    if not command:
+        return False
+    try:
+        raw_tokens = shlex.split(command, posix=False)
+    except ValueError:
+        raw_tokens = command.split()
+    tokens = [token.strip("\"'").replace("\\", "/").lower() for token in raw_tokens]
+    if not tokens:
+        return False
+
+    entry_index: int | None = None
+    for index, token in enumerate(tokens):
+        basename = token.rsplit("/", 1)[-1]
+        if basename in {"hermes", "hermes.exe"}:
+            previous = tokens[0].rsplit("/", 1)[-1] if index == 1 else ""
+            if index == 0 or (index == 1 and previous.startswith(("python", "env"))):
+                entry_index = index
+                break
+        if token == "hermes_cli.main":
+            if (
+                index == 2
+                and tokens[1] == "-m"
+                and tokens[0].rsplit("/", 1)[-1].startswith("python")
+            ):
+                entry_index = index
+                break
+        if token == "hermes_cli/main.py" or token.endswith("/hermes_cli/main.py"):
+            if index == 0 or (
+                index == 1
+                and tokens[0].rsplit("/", 1)[-1].startswith("python")
+            ):
+                entry_index = index
+                break
+    if entry_index is None:
+        return False
+
+    arguments = tokens[entry_index + 1 :]
+    filtered: list[str] = []
+    skip_next = False
+    for token in arguments:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in {"--profile", "-p"}:
+            skip_next = True
+            continue
+        if token.startswith("--profile=") or token.startswith("-p="):
+            continue
+        filtered.append(token)
+    return bool(filtered) and filtered[0] in {"dashboard", "serve"}
+
+
 def _looks_like_gateway_process(pid: int) -> bool:
     """Return True when the live PID still looks like the Hermes gateway."""
     cmdline = _read_process_cmdline(pid)
