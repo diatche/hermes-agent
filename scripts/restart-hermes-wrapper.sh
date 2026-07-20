@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Restart Pavel's custom HermesGateway.app launchd wrapper.
+# Manage Pavel's custom HermesGateway.app LaunchAgent.
 #
 # Usage:
-#   scripts/restart-hermes-wrapper.sh            # foreground restart + verification
-#   scripts/restart-hermes-wrapper.sh --detach   # return immediately, restart in background
-#   scripts/restart-hermes-wrapper.sh --status   # read-only status check
-#
-# The --detach mode is intended for Hermes quick commands from chat: it prints a
-# short message, then performs the restart after this process exits so the reply
-# has a chance to reach the user before the wrapper kills/restarts the backend.
+#   scripts/restart-hermes-wrapper.sh --foreground  # restart now
+#   scripts/restart-hermes-wrapper.sh --detach      # delayed chat-safe restart
+#   scripts/restart-hermes-wrapper.sh --stop        # stop and verify unloaded
+#   scripts/restart-hermes-wrapper.sh --enforce-exclusivity
+#   scripts/restart-hermes-wrapper.sh --status      # read-only health/status
+#   scripts/restart-hermes-wrapper.sh --assert-update-quiescence
 
 set -euo pipefail
 
@@ -16,100 +15,331 @@ LABEL="${HERMES_WRAPPER_LABEL:-nz.diatche.hermes-gateway}"
 PLIST="${HERMES_WRAPPER_PLIST:-$HOME/Library/LaunchAgents/${LABEL}.plist}"
 DOMAIN="${HERMES_WRAPPER_DOMAIN:-gui/$(id -u)}"
 APP="${HERMES_WRAPPER_APP:-/Applications/HermesGateway.app}"
+ENTRYPOINT="${HERMES_WRAPPER_ENTRYPOINT:-$HOME/.hermes/local/bin/start-hermes-gateway-wrapper.sh}"
+OFFICIAL_LABEL="${HERMES_OFFICIAL_GATEWAY_LABEL:-ai.hermes.gateway}"
 LOG_DIR="${HERMES_WRAPPER_LOG_DIR:-$HOME/.hermes/logs}"
 RESTART_LOG="$LOG_DIR/hermes-gateway-wrapper.restart.log"
 PORT="${HERMES_DASHBOARD_PORT:-9119}"
+REPO="${HERMES_REPO:-$HOME/.hermes/hermes-agent}"
+MAINTENANCE_ACTIVE="${HERMES_MAINTENANCE_ACTIVE:-$HOME/.hermes/local/update/active.json}"
 
 usage() {
-  cat <<EOF
-Usage: $0 [--detach|--status|--help]
+  printf 'Usage: %s [--foreground|--detach|--stop|--enforce-exclusivity|--status|--assert-update-quiescence|--help]\n' "$0"
+}
 
-Restarts launchd service: $DOMAIN/$LABEL
-Plist: $PLIST
-App:   $APP
-EOF
+require_restart_permission() {
+  if [[ "${HERMES_MAINTENANCE_START_ALLOWED:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ -e "$MAINTENANCE_ACTIVE" ]]; then
+    echo "ERROR: maintenance owns gateway restart; refusing competing restart" >&2
+    return 1
+  fi
+}
+
+wrapper_pid() {
+  launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk '/^[[:space:]]*pid = [0-9]+/ { print $3; exit }'
+}
+
+wrapper_gateway_pids() {
+  local parent="$1"
+  ps -axo pid=,ppid=,command= | awk -v parent="$parent" \
+    '$2 == parent && /hermes gateway run --replace/ { print $1 }'
+}
+
+wrapper_dashboard_pids() {
+  local parent="$1"
+  ps -axo pid=,ppid=,command= | awk -v parent="$parent" -v port="$PORT" \
+    '$2 == parent && /hermes dashboard/ && $0 ~ "--port " port "([[:space:]]|$)" { print $1 }'
+}
+
+descendant_pids() {
+  local parent="$1" child
+  while read -r child; do
+    [[ -n "$child" ]] || continue
+    printf '%s\n' "$child"
+    descendant_pids "$child"
+  done < <(pgrep -P "$parent" 2>/dev/null || true)
+}
+
+is_descendant_of() {
+  local pid="$1" ancestor="$2" parent
+  while [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )); do
+    [[ "$pid" == "$ancestor" ]] && return 0
+    parent="$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ' || true)"
+    [[ -n "$parent" && "$parent" != "$pid" ]] || return 1
+    pid="$parent"
+  done
+  return 1
+}
+
+wrapper_child_running() {
+  local root_pid wrapper_command gateway_pids gateway_count gateway_command
+  root_pid="$(wrapper_pid)"
+  [[ -n "$root_pid" ]] || return 1
+  wrapper_command="$(ps -p "$root_pid" -o command= 2>/dev/null || true)"
+  [[ "$wrapper_command" == *"$APP/Contents/MacOS/HermesGateway"* ]] || return 1
+  gateway_pids="$(wrapper_gateway_pids "$root_pid")"
+  gateway_count="$(printf '%s\n' "$gateway_pids" | awk 'NF { count++ } END { print count+0 }')"
+  [[ "$gateway_count" == "1" ]] || return 1
+  gateway_command="$(ps -p "$gateway_pids" -o command= 2>/dev/null || true)"
+  [[ "$gateway_command" == *"$REPO/venv/bin/hermes gateway run --replace"* ]]
+}
+
+official_disabled() {
+  launchctl print-disabled "$1" 2>/dev/null \
+    | grep -Eq "[\"']?$OFFICIAL_LABEL[\"']?[[:space:]]*=>[[:space:]]*disabled"
+}
+
+official_unloaded() {
+  ! launchctl print "$1/$OFFICIAL_LABEL" >/dev/null 2>&1
+}
+
+wrapper_ready() {
+  local root gateway dashboards owners all_wrapper_pids all_gateway_pids all_dashboard_pids
+  local owner_count dashboard_count
+  wrapper_child_running || return 1
+  root="$(wrapper_pid)"
+  gateway="$(wrapper_gateway_pids "$root")"
+  owners="$(lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sort -u)"
+  owner_count="$(printf '%s\n' "$owners" | awk 'NF { count++ } END { print count+0 }')"
+  [[ "$owner_count" == "1" ]] || return 1
+  dashboards="$(wrapper_dashboard_pids "$root")"
+  dashboard_count="$(printf '%s\n' "$dashboards" | awk 'NF { count++ } END { print count+0 }')"
+  [[ "$dashboard_count" == "1" ]] || return 1
+  [[ "$owners" == "$dashboards" ]] || return 1
+
+  all_wrapper_pids="$(wrapper_app_pids | sort -nu)"
+  [[ "$all_wrapper_pids" == "$root" ]] || return 1
+  all_gateway_pids="$(gateway_related_pids | sort -nu)"
+  [[ "$all_gateway_pids" == "$gateway" ]] || return 1
+  all_dashboard_pids="$(dashboard_related_pids | sort -nu)"
+  [[ "$all_dashboard_pids" == "$dashboards" ]]
+}
+
+wrapper_signature() {
+  local root gateway dashboard owner
+  wrapper_ready || return 1
+  root="$(wrapper_pid)"
+  gateway="$(wrapper_gateway_pids "$root")"
+  dashboard="$(wrapper_dashboard_pids "$root")"
+  owner="$(lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sort -u)"
+  printf '%s:%s:%s:%s\n' "$root" "$gateway" "$dashboard" "$owner"
 }
 
 status() {
-  echo "=== launchd ==="
-  launchctl print "$DOMAIN/$LABEL" 2>&1 | sed -n '1,90p' || true
+  local healthy=0 wrapper_state user_domain="user/$(id -u)"
+  echo "=== supervisor policy ==="
+  for scope in "$DOMAIN" "$user_domain"; do
+    if official_disabled "$scope"; then
+      echo "OK: official gateway is persistently disabled: $scope/$OFFICIAL_LABEL"
+    else
+      echo "ERROR: official gateway is not persistently disabled: $scope/$OFFICIAL_LABEL"
+      healthy=1
+    fi
+    if official_unloaded "$scope"; then
+      echo "OK: competing default gateway is not loaded: $scope/$OFFICIAL_LABEL"
+    else
+      echo "ERROR: competing default gateway is loaded: $scope/$OFFICIAL_LABEL"
+      healthy=1
+    fi
+  done
+  marker="$HOME/.hermes/gateway/supervisor_repair_needed"
+  if [[ -f "$marker" ]]; then
+    echo "ERROR: persistent-disable repair marker exists: $marker"
+    healthy=1
+  fi
+  echo
+  echo "=== wrapper launchd ==="
+  if wrapper_state="$(launchctl print "$DOMAIN/$LABEL" 2>&1)"; then
+    printf '%s\n' "$wrapper_state" | sed -n '1,90p'
+  else
+    printf '%s\n' "$wrapper_state"
+    echo "ERROR: custom wrapper is not loaded: $DOMAIN/$LABEL"
+    healthy=1
+  fi
   echo
   echo "=== processes ==="
   ps -axo pid,ppid,stat,command | grep -Ei 'HermesGateway|hermes gateway run|web_server\.start_server|:9119|192\.168\.0\.109' | grep -v grep || true
+  if wrapper_ready; then
+    echo "OK: Hermes gateway is wrapper-owned and :$PORT is listening"
+  else
+    echo "ERROR: wrapper-owned gateway/listener is not ready"
+    healthy=1
+  fi
   echo
-  echo "=== optional dashboard listener :$PORT ==="
+  echo "=== dashboard listener :$PORT ==="
   lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>&1 || true
+  return "$healthy"
 }
 
 verify_prereqs() {
-  if [[ ! -f "$PLIST" ]]; then
-    echo "ERROR: plist not found: $PLIST" >&2
-    exit 2
-  fi
-  if [[ ! -x "$APP/Contents/MacOS/HermesGateway" ]]; then
-    echo "ERROR: wrapper executable not found/executable: $APP/Contents/MacOS/HermesGateway" >&2
-    exit 2
-  fi
+  [[ -f "$PLIST" ]] || { echo "ERROR: plist not found: $PLIST" >&2; exit 2; }
+  [[ -x "$APP/Contents/MacOS/HermesGateway" ]] || { echo "ERROR: wrapper executable missing: $APP/Contents/MacOS/HermesGateway" >&2; exit 2; }
+  [[ -x "$ENTRYPOINT" ]] || { echo "ERROR: wrapper entrypoint missing: $ENTRYPOINT" >&2; exit 2; }
   plutil -lint "$PLIST" >/dev/null
 }
 
+enforce_exclusivity() {
+  local user_domain="user/$(id -u)"
+  launchctl disable "$DOMAIN/$OFFICIAL_LABEL" >/dev/null 2>&1 || true
+  launchctl disable "$user_domain/$OFFICIAL_LABEL" >/dev/null 2>&1 || true
+  launchctl bootout "$DOMAIN/$OFFICIAL_LABEL" >/dev/null 2>&1 || true
+  launchctl bootout "$user_domain/$OFFICIAL_LABEL" >/dev/null 2>&1 || true
+  for _ in {1..10}; do
+    if official_disabled "$DOMAIN" && official_disabled "$user_domain" \
+      && official_unloaded "$DOMAIN" && official_unloaded "$user_domain"; then
+      echo "Official gateway is persistently disabled and unloaded in GUI and user domains"
+      return 0
+    fi
+    sleep 0.4
+  done
+  echo "ERROR: official gateway disable/unload invariant failed" >&2
+  return 1
+}
+
+stop_foreground() {
+  local old_wrapper old_children current_children pid all_gone
+  old_wrapper="$(wrapper_pid || true)"
+  old_children=""
+  if [[ -n "$old_wrapper" ]]; then
+    old_children="$(descendant_pids "$old_wrapper" || true)"
+  fi
+  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  launchctl bootout "$DOMAIN" "$PLIST" 2>/dev/null || true
+  for _ in {1..30}; do
+    if [[ -n "$old_wrapper" ]] && kill -0 "$old_wrapper" 2>/dev/null; then
+      current_children="$(descendant_pids "$old_wrapper" || true)"
+      old_children="$(printf '%s\n%s\n' "$old_children" "$current_children" | awk 'NF && !seen[$0]++')"
+    fi
+    all_gone=0
+    for pid in $old_wrapper $old_children; do
+      if kill -0 "$pid" 2>/dev/null; then
+        all_gone=1
+      fi
+    done
+    if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 \
+      && (( all_gone == 0 )) \
+      && ! lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+      echo "Stopped and quiescent: $DOMAIN/$LABEL"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: wrapper-owned process topology remains after bootout" >&2
+  ps -axo pid,ppid,stat,command | grep -Ei 'HermesGateway|hermes gateway run' | grep -v grep >&2 || true
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >&2 || true
+  return 1
+}
+
+loaded_official_gateway_labels() {
+  launchctl list 2>/dev/null | awk '$3 ~ /^ai[.]hermes[.]gateway($|-)/ { print $3 }'
+}
+
+wrapper_app_pids() {
+  ps -axo pid=,command= | awk -v wrapper="$APP/Contents/MacOS/HermesGateway" '
+    {
+      command = $0
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", command)
+      if (command == wrapper || index(command, wrapper " ") == 1) print $1
+    }'
+}
+
+gateway_related_pids() {
+  ps -axo pid=,command= | awk '
+    /(^|[[:space:]])gateway[[:space:]]+(run|restart)([[:space:]]|$)/ { print $1 }'
+}
+
+dashboard_related_pids() {
+  ps -axo pid=,command= | awk '
+    /(^|[[:space:]\/])hermes([[:space:]][^[:space:]]+)*[[:space:]]dashboard([[:space:]]|$)/ ||
+    /web_server[.]start_server/ { print $1 }'
+}
+
+listener_pids() {
+  lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sort -nu
+}
+
+assert_update_quiescence() {
+  local stable=0
+  for _ in {1..40}; do
+    if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 \
+      && [[ -z "$(wrapper_app_pids)" ]] \
+      && [[ -z "$(gateway_related_pids)" ]] \
+      && [[ -z "$(dashboard_related_pids)" ]] \
+      && [[ -z "$(listener_pids)" ]] \
+      && [[ -z "$(loaded_official_gateway_labels)" ]]; then
+      stable=$((stable + 1))
+      if (( stable >= 12 )); then
+        echo "Update quiescence verified"
+        return 0
+      fi
+    else
+      stable=0
+    fi
+    sleep 0.25
+  done
+  echo "ERROR: Hermes update quiescence could not be established" >&2
+  loaded_official_gateway_labels >&2 || true
+  wrapper_app_pids >&2 || true
+  gateway_related_pids >&2 || true
+  dashboard_related_pids >&2 || true
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >&2 || true
+  return 1
+}
+
 restart_foreground() {
+  require_restart_permission
   mkdir -p "$LOG_DIR"
   {
     echo "===== $(date '+%Y-%m-%d %H:%M:%S %Z') restarting $DOMAIN/$LABEL ====="
-    echo "Plist: $PLIST"
-    echo "App:   $APP"
-
     verify_prereqs
-
-    echo
-    echo "Booting out old service state..."
-    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-    launchctl bootout "$DOMAIN" "$PLIST" 2>/dev/null || true
-
-    echo "Bootstrapping service..."
+    stop_foreground
+    enforce_exclusivity
     launchctl bootstrap "$DOMAIN" "$PLIST"
-    launchctl kickstart -k "$DOMAIN/$LABEL"
-
-    echo "Waiting for wrapper gateway process..."
+    launchctl kickstart "$DOMAIN/$LABEL"
+    echo "Waiting for wrapper-owned gateway process..."
+    stable=0
+    stable_signature=""
     for _ in {1..30}; do
-      if ps -axo ppid,command | awk -v p="$(pgrep -f '/Applications/HermesGateway.app/Contents/MacOS/HermesGateway' | head -n1)" '$1 == p && /hermes gateway run --replace/ { found=1 } END { exit(found ? 0 : 1) }'; then
-        break
+      if signature="$(wrapper_signature)"; then
+        if [[ "$signature" == "$stable_signature" ]]; then
+          stable=$((stable + 1))
+        else
+          stable_signature="$signature"
+          stable=1
+        fi
+        if (( stable >= 3 )); then
+          echo "===== restart complete after stable readiness ====="
+          return 0
+        fi
+      else
+        stable=0
+        stable_signature=""
       fi
       sleep 1
     done
-
-    echo
-    status
-    echo "===== restart complete ====="
+    echo "ERROR: wrapper loaded but gateway child did not become ready" >&2
+    return 1
   } 2>&1 | tee -a "$RESTART_LOG"
 }
 
 detach_restart() {
+  require_restart_permission
   mkdir -p "$LOG_DIR"
   verify_prereqs
   echo "Scheduling HermesGateway.app wrapper restart in background."
   echo "This chat/client may disconnect briefly. Log: $RESTART_LOG"
-  # Use nohup + background intentionally: the caller may be a Hermes quick command
-  # running under the very service being restarted.
   nohup /bin/bash -lc "sleep 2; exec '$0' --foreground" >>"$RESTART_LOG" 2>&1 &
 }
 
 case "${1:---foreground}" in
-  --foreground)
-    restart_foreground
-    ;;
-  --detach)
-    detach_restart
-    ;;
-  --status)
-    status
-    ;;
-  --help|-h)
-    usage
-    ;;
-  *)
-    usage >&2
-    exit 2
-    ;;
+  --foreground) restart_foreground ;;
+  --detach) detach_restart ;;
+  --stop) stop_foreground ;;
+  --enforce-exclusivity) enforce_exclusivity ;;
+  --assert-update-quiescence) assert_update_quiescence ;;
+  --status) status ;;
+  --help|-h) usage ;;
+  *) usage >&2; exit 2 ;;
 esac

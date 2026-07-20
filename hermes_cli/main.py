@@ -9531,6 +9531,10 @@ def _cmd_update_pip(args):
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
+    if getattr(args, "no_gateway_restart", False) and _is_windows():
+        print("✗ --no-gateway-restart is only supported with an external POSIX supervisor")
+        sys.exit(2)
+
     # In gateway mode, use file-based IPC for prompts instead of stdin
     gw_input_fn = (
         (lambda prompt, default="": _gateway_prompt(prompt, default))
@@ -10458,6 +10462,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _exit_code_path.write_text("0")
             except OSError:
                 pass
+
+        if getattr(args, "no_gateway_restart", False):
+            print("→ Gateway/dashboard restart skipped for external maintenance supervisor")
+            return
 
         # Auto-restart ALL gateways after update.
         # The code update (git pull) is shared across all profiles, so every
