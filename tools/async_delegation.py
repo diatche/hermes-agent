@@ -78,6 +78,9 @@ _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
 _DB_LOCK = threading.Lock()
+_MAX_COMPRESSION_DELEGATIONS = 8
+_MAX_COMPRESSION_GOALS_PER_BATCH = 8
+_MAX_COMPRESSION_GOAL_CHARS = 200
 
 
 def _db_path():
@@ -842,6 +845,101 @@ def list_async_delegations() -> List[Dict[str, Any]]:
             {k: v for k, v in r.items() if k != "interrupt_fn"}
             for r in _records.values()
         ]
+
+
+def rebind_active_delegations_parent(
+    old_parent_session_id: str,
+    new_parent_session_id: str,
+) -> int:
+    """Move live completion ownership to a compression continuation session."""
+    if not old_parent_session_id or not new_parent_session_id:
+        return 0
+    with _records_lock:
+        rebound_ids = [
+            delegation_id
+            for delegation_id, record in _records.items()
+            if record.get("status") in {"running", "finalizing"}
+            and str(record.get("parent_session_id") or "") == old_parent_session_id
+        ]
+        for delegation_id in rebound_ids:
+            _records[delegation_id]["parent_session_id"] = new_parent_session_id
+    if rebound_ids:
+        try:
+            with _DB_LOCK, _connect() as conn:
+                conn.executemany(
+                    """UPDATE async_delegations
+                       SET parent_session_id=?, updated_at=?
+                       WHERE delegation_id=? AND state IN ('running','finalizing')""",
+                    [
+                        (new_parent_session_id, time.time(), delegation_id)
+                        for delegation_id in rebound_ids
+                    ],
+                )
+        except Exception:
+            # The live registry drives completion routing. Keep compression and
+            # in-process delivery working even if the durable audit update is
+            # temporarily unavailable.
+            logger.warning(
+                "Could not persist delegation parent rebind %s -> %s",
+                old_parent_session_id,
+                new_parent_session_id,
+                exc_info=True,
+            )
+    return len(rebound_ids)
+
+
+def format_active_delegations_for_compression(
+    parent_session_id: str,
+) -> Optional[str]:
+    """Return a small deterministic block for the compressed session summary."""
+    if not parent_session_id:
+        return None
+    with _records_lock:
+        active = [
+            dict(record)
+            for record in _records.values()
+            if record.get("status") in {"running", "finalizing"}
+            and str(record.get("parent_session_id") or "") == parent_session_id
+        ]
+    if not active:
+        return None
+    active.sort(
+        key=lambda record: (
+            float(record.get("dispatched_at") or 0),
+            str(record.get("delegation_id") or ""),
+        )
+    )
+    lines = ["[Active delegated work preserved across context compression]"]
+    for record in active[:_MAX_COMPRESSION_DELEGATIONS]:
+        delegation_id = str(record.get("delegation_id") or "unknown")
+        status = str(record.get("status") or "running")
+        raw_goals = record.get("goals")
+        goals = raw_goals if isinstance(raw_goals, list) else None
+        if goals:
+            lines.append(f"- {delegation_id} — {status}")
+            for raw_goal in goals[:_MAX_COMPRESSION_GOALS_PER_BATCH]:
+                goal = " ".join(str(raw_goal or "unspecified task").split())
+                if len(goal) > _MAX_COMPRESSION_GOAL_CHARS:
+                    goal = goal[: _MAX_COMPRESSION_GOAL_CHARS - 1].rstrip() + "…"
+                lines.append(f"  - {goal}")
+            if len(goals) > _MAX_COMPRESSION_GOALS_PER_BATCH:
+                lines.append(
+                    "  - … and "
+                    f"{len(goals) - _MAX_COMPRESSION_GOALS_PER_BATCH} more task(s)."
+                )
+        else:
+            goal = " ".join(str(record.get("goal") or "unspecified task").split())
+            if len(goal) > _MAX_COMPRESSION_GOAL_CHARS:
+                goal = goal[: _MAX_COMPRESSION_GOAL_CHARS - 1].rstrip() + "…"
+            lines.append(f"- {delegation_id}: {goal} — {status}")
+        lines.append(
+            "  Do not duplicate this work; wait for and incorporate its completion."
+        )
+    if len(active) > _MAX_COMPRESSION_DELEGATIONS:
+        lines.append(
+            f"- … and {len(active) - _MAX_COMPRESSION_DELEGATIONS} more active delegation(s)."
+        )
+    return "\n".join(lines)
 
 
 def interrupt_all(reason: str = "shutdown") -> int:

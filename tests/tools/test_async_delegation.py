@@ -65,6 +65,119 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
+def test_compression_formatter_is_session_scoped_active_and_deterministic():
+    with ad._records_lock:
+        ad._records.update(
+            {
+                "deleg_second": {
+                    "delegation_id": "deleg_second",
+                    "goal": "Second task",
+                    "parent_session_id": "parent",
+                    "status": "finalizing",
+                    "dispatched_at": 2.0,
+                },
+                "deleg_first": {
+                    "delegation_id": "deleg_first",
+                    "goal": "First\n task",
+                    "parent_session_id": "parent",
+                    "status": "running",
+                    "dispatched_at": 1.0,
+                },
+                "deleg_done": {
+                    "delegation_id": "deleg_done",
+                    "goal": "Already done",
+                    "parent_session_id": "parent",
+                    "status": "completed",
+                    "dispatched_at": 0.0,
+                },
+                "deleg_other": {
+                    "delegation_id": "deleg_other",
+                    "goal": "Other session",
+                    "parent_session_id": "other",
+                    "status": "running",
+                    "dispatched_at": 0.0,
+                },
+            }
+        )
+
+    block = ad.format_active_delegations_for_compression("parent")
+
+    assert block is not None
+    assert block.index("deleg_first") < block.index("deleg_second")
+    assert "First task" in block
+    assert "deleg_done" not in block
+    assert "deleg_other" not in block
+    assert ad.format_active_delegations_for_compression("missing") is None
+
+
+def test_compression_formatter_preserves_real_batch_goals():
+    shared_prefix = "A shared prefix that is longer than forty characters: "
+    goals = [shared_prefix + "audit auth", shared_prefix + "review billing"]
+    with ad._records_lock:
+        ad._records["deleg_batch"] = {
+            "delegation_id": "deleg_batch",
+            "goal": "2 parallel subagents: truncated; truncated",
+            "goals": goals,
+            "parent_session_id": "parent",
+            "status": "running",
+            "dispatched_at": 1.0,
+        }
+
+    block = ad.format_active_delegations_for_compression("parent")
+
+    assert block is not None
+    assert goals[0] in block
+    assert goals[1] in block
+    assert "2 parallel subagents: truncated" not in block
+
+
+def test_rebind_active_delegation_updates_live_and_durable_registry(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "deleg_rebind",
+        "goal": "Continue after compression",
+        "parent_session_id": "old-parent",
+        "session_key": "gateway-key",
+        "status": "running",
+        "dispatched_at": time.time(),
+    }
+    with ad._records_lock:
+        ad._records[record["delegation_id"]] = record
+    ad._persist_dispatch(record)
+
+    assert ad.rebind_active_delegations_parent("old-parent", "new-child") == 1
+
+    with ad._records_lock:
+        assert ad._records["deleg_rebind"]["parent_session_id"] == "new-child"
+    with ad._connect() as conn:
+        row = conn.execute(
+            "SELECT parent_session_id FROM async_delegations WHERE delegation_id=?",
+            ("deleg_rebind",),
+        ).fetchone()
+    assert row[0] == "new-child"
+
+
+def test_compression_formatter_is_bounded():
+    with ad._records_lock:
+        for index in range(10):
+            ad._records[f"deleg_{index}"] = {
+                "delegation_id": f"deleg_{index}",
+                "goal": "x" * 500,
+                "parent_session_id": "parent",
+                "status": "running",
+                "dispatched_at": float(index),
+            }
+
+    block = ad.format_active_delegations_for_compression("parent")
+
+    assert block is not None
+    assert block.count("Do not duplicate this work") == 8
+    assert "and 2 more active delegation(s)" in block
+    assert len(block) < 3_000
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 
