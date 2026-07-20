@@ -26,8 +26,12 @@ PRs #9850, #9934, #7536):
 """
 
 import asyncio
+import sys
+import threading
 import time
+import types
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -37,11 +41,11 @@ from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
-    _build_restart_resume_note,
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
     _should_clear_resume_pending_after_turn,
+    build_resume_recovery_note,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from tests.gateway.restart_test_helpers import (
@@ -78,6 +82,74 @@ def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
 
 def _make_store(tmp_path):
     return SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+
+
+class _RecoveryCapturingAgent:
+    last_run: dict | None = None
+
+    def __init__(self, *args, **kwargs):
+        self.tools = []
+
+    def run_conversation(
+        self,
+        user_message,
+        conversation_history=None,
+        task_id=None,
+        persist_user_message=None,
+        persist_user_timestamp=None,
+    ):
+        type(self).last_run = {
+            "user_message": user_message,
+            "persist_user_message": persist_user_message,
+            "persist_user_timestamp": persist_user_timestamp,
+        }
+        return {
+            "final_response": "ok",
+            "messages": [],
+            "api_calls": 1,
+            "completed": True,
+        }
+
+
+def _prepare_recovery_agent_runner(monkeypatch):
+    """Build the smallest runner that reaches the real _run_agent_inner path."""
+    runner, adapter = make_restart_runner()
+    runner._ephemeral_system_prompt = ""
+    runner._prefill_messages = []
+    runner._reasoning_config = None
+    runner._service_tier = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._session_db = None
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
+    runner._enrich_message_with_vision = AsyncMock(return_value="ENRICHED")
+    runner.config.streaming = None
+    runner.hooks = SimpleNamespace(loaded_hooks=False)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _RecoveryCapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    import gateway.run as gateway_run
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "test-model")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://example.invalid/v1",
+            "api_key": "***",
+        },
+    )
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda config, platform: {"core"})
+    return runner, adapter
 
 
 def _build_agent_history(history: list) -> list:
@@ -153,14 +225,9 @@ def _simulate_note_injection(
 
     if is_resume_pending:
         reason = getattr(resume_entry, "resume_reason", None) or "restart_timeout"
-        reason_phrase = (
-            "a gateway restart"
-            if reason == "restart_timeout"
-            else "a gateway shutdown"
-            if reason == "shutdown_timeout"
-            else "a gateway interruption"
-        )
-        message = _build_restart_resume_note(reason_phrase, message)
+        # Real production note builder — extracted to module scope in
+        # gateway/run.py so tests exercise the actual strings.
+        message = build_resume_recovery_note(reason, message)
     elif has_fresh_tool_tail:
         message = (
             "[System note: A new message has arrived. The conversation "
@@ -179,14 +246,7 @@ def _simulate_note_injection(
         and getattr(resume_entry, "resume_pending", False)
     ):
         sn_reason = getattr(resume_entry, "resume_reason", None) or "restart_timeout"
-        sn_reason_phrase = (
-            "a gateway restart"
-            if sn_reason == "restart_timeout"
-            else "a gateway shutdown"
-            if sn_reason == "shutdown_timeout"
-            else "a gateway interruption"
-        )
-        message = _build_restart_resume_note(sn_reason_phrase)
+        message = build_resume_recovery_note(sn_reason, "")
     return message
 
 
@@ -494,6 +554,178 @@ class TestResumePendingSystemNote:
             resume_entry=entry,
         )
         assert "gateway shutdown" in result
+
+    def test_empty_message_interactive_note_resumes_clear_unfinished_goal(self):
+        """Interactive startup recovery should continue clear safe work.
+
+        A human-facing platform may report restoration, but must not abandon a
+        clear unfinished goal merely because it can ask the user a question.
+        """
+        note = build_resume_recovery_note("restart_timeout", "", interactive=True)
+        assert "session was restored" in note
+        assert "continue the unfinished goal" in note
+        assert "next safe incomplete step" in note
+        assert "Ask the user only if" in note
+        assert "skip any unfinished work" not in note
+
+    def test_empty_message_noninteractive_note_continues_task(self):
+        """Non-interactive platforms (webhook, API server): nobody can answer
+        'what next?', so the resumed turn must complete the interrupted work
+        instead of acknowledging (#57056)."""
+        note = build_resume_recovery_note("restart_timeout", "", interactive=False)
+        assert "CONTINUE the interrupted task" in note
+        assert "session was restored" not in note
+        assert "ask what they would like to do next" not in note
+        # Must not tell the model to skip the unfinished work it should finish.
+        assert "skip any unfinished work" not in note
+        # But still guards against re-running already-recorded tool calls.
+        assert "already appear in the history" in note
+
+    def test_new_message_guidance_identical_regardless_of_interactivity(self):
+        """A real NEW user message wins first without silently dropping old work."""
+        a = build_resume_recovery_note("restart_timeout", "do the thing", interactive=True)
+        b = build_resume_recovery_note("restart_timeout", "do the thing", interactive=False)
+        assert a == b
+        assert "NEW message" in a
+        assert "FIRST" in a
+        assert "resume the unfinished goal" in a
+        assert "unless the new message supersedes it" in a
+
+    @pytest.mark.asyncio
+    async def test_pending_model_note_does_not_turn_startup_resume_into_new_user_message(
+        self, monkeypatch
+    ):
+        """Internal one-shot notes must not reclassify or pollute recovery turns."""
+        runner, _adapter = _prepare_recovery_agent_runner(monkeypatch)
+        session_key = "agent:main:telegram:dm:resume"
+        source = _make_source(chat_id="resume")
+        entry = self._pending_entry()
+        entry.session_key = session_key
+        runner.session_store._entries = {session_key: entry}
+        runner._pending_model_notes[session_key] = "[Internal model switch note]"
+
+        _RecoveryCapturingAgent.last_run = None
+        await runner._run_agent(
+            message="",
+            context_prompt="",
+            history=[
+                {"role": "assistant", "content": "in progress", "timestamp": time.time()},
+            ],
+            source=source,
+            session_id="sid",
+            session_key=session_key,
+            persist_user_message="",
+        )
+
+        captured = _RecoveryCapturingAgent.last_run
+        assert captured is not None
+        assert "[Internal model switch note]" in captured["user_message"]
+        assert "continue the unfinished goal" in captured["user_message"]
+        assert "NEW message" not in captured["user_message"]
+        assert captured["persist_user_message"] == ""
+
+    @pytest.mark.asyncio
+    async def test_recovery_preserves_clean_inbound_text_for_history(self, monkeypatch):
+        """API-only notes and rendered timestamps must stay out of user history."""
+        runner, _adapter = _prepare_recovery_agent_runner(monkeypatch)
+        session_key = "agent:main:telegram:dm:resume-clean"
+        source = _make_source(chat_id="resume-clean")
+        entry = self._pending_entry()
+        entry.session_key = session_key
+        runner.session_store._entries = {session_key: entry}
+        runner._pending_model_notes[session_key] = "[Internal model switch note]"
+
+        _RecoveryCapturingAgent.last_run = None
+        await runner._run_agent(
+            message="[2026-07-20 14:50] continue please",
+            context_prompt="",
+            history=[
+                {"role": "assistant", "content": "in progress", "timestamp": time.time()},
+            ],
+            source=source,
+            session_id="sid",
+            session_key=session_key,
+            persist_user_message="continue please",
+        )
+
+        captured = _RecoveryCapturingAgent.last_run
+        assert captured is not None
+        assert "[Internal model switch note]" in captured["user_message"]
+        assert "NEW message" in captured["user_message"]
+        assert captured["persist_user_message"] == "continue please"
+
+    @pytest.mark.asyncio
+    async def test_noninteractive_adapter_uses_no_ack_recovery_in_production_path(
+        self, monkeypatch
+    ):
+        runner, adapter = _prepare_recovery_agent_runner(monkeypatch)
+        adapter.interactive_resume = False
+        session_key = "agent:main:telegram:dm:resume-event"
+        source = _make_source(chat_id="resume-event")
+        entry = self._pending_entry()
+        entry.session_key = session_key
+        runner.session_store._entries = {session_key: entry}
+
+        _RecoveryCapturingAgent.last_run = None
+        await runner._run_agent(
+            message="",
+            context_prompt="",
+            history=[
+                {"role": "assistant", "content": "in progress", "timestamp": time.time()},
+            ],
+            source=source,
+            session_id="sid",
+            session_key=session_key,
+            persist_user_message="",
+        )
+
+        captured = _RecoveryCapturingAgent.last_run
+        assert captured is not None
+        assert "CONTINUE the interrupted task" in captured["user_message"]
+        assert "session was restored" not in captured["user_message"]
+        assert "ask questions" in captured["user_message"]
+        assert captured["persist_user_message"] == ""
+
+    @pytest.mark.asyncio
+    async def test_stale_startup_resume_safety_net_precedes_pending_api_notes(
+        self, monkeypatch
+    ):
+        """Pending internal notes must not suppress blank-turn recovery fallback."""
+        runner, _adapter = _prepare_recovery_agent_runner(monkeypatch)
+        session_key = "agent:main:telegram:dm:resume-stale"
+        source = _make_source(chat_id="resume-stale")
+        entry = self._pending_entry()
+        entry.session_key = session_key
+        entry.last_resume_marked_at = datetime.now() - timedelta(days=1)
+        runner.session_store._entries = {session_key: entry}
+        runner._pending_model_notes[session_key] = "[Internal model switch note]"
+        runner._pending_skills_reload_notes = {
+            session_key: "[Internal skills reload note]"
+        }
+
+        _RecoveryCapturingAgent.last_run = None
+        await runner._run_agent(
+            message="",
+            context_prompt="",
+            history=[
+                {
+                    "role": "assistant",
+                    "content": "old unfinished work",
+                    "timestamp": time.time() - 86400,
+                },
+            ],
+            source=source,
+            session_id="sid",
+            session_key=session_key,
+        )
+
+        captured = _RecoveryCapturingAgent.last_run
+        assert captured is not None
+        assert "[Internal model switch note]" in captured["user_message"]
+        assert "[Internal skills reload note]" in captured["user_message"]
+        assert "continue the unfinished goal" in captured["user_message"]
+        assert "NEW message" not in captured["user_message"]
+        assert captured["persist_user_message"] == ""
 
     def test_resume_pending_fires_without_tool_tail(self):
         """Key improvement over PR #9934: the restart-resume note fires
