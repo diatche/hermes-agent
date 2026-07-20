@@ -1,0 +1,256 @@
+"""Behavior tests for wrapper process-topology checks."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+
+
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "restart-hermes-wrapper.sh"
+
+
+def _command(path: Path, name: str, content: str) -> None:
+    target = path / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    target.chmod(0o755)
+
+
+def _environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    fake_bin = tmp_path / "bin"
+    app = tmp_path / "HermesGateway.app"
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "HOME": str(tmp_path),
+            "HERMES_WRAPPER_DOMAIN": "gui/501",
+            "HERMES_WRAPPER_APP": str(app),
+            "HERMES_WRAPPER_PLIST": str(tmp_path / "wrapper.plist"),
+            "HERMES_WRAPPER_ENTRYPOINT": str(tmp_path / "entrypoint"),
+            "HERMES_DASHBOARD_PORT": "9119",
+        }
+    )
+    return env, fake_bin
+
+
+def test_stop_waits_only_for_captured_wrapper_tree(tmp_path: Path) -> None:
+    env, fake_bin = _environment(tmp_path)
+    loaded = tmp_path / "loaded"
+    loaded.write_text("yes\n", encoding="utf-8")
+    _command(
+        fake_bin,
+        "launchctl",
+        "#!/usr/bin/env bash\n"
+        f"state='{loaded}'\n"
+        "if [[ $1 == print && $2 == gui/501/nz.diatche.hermes-gateway ]]; then\n"
+        "  [[ -f $state ]] || exit 1\n"
+        "  echo '    pid = 99111'\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [[ $1 == bootout ]]; then rm -f $state; exit 0; fi\n"
+        "exit 1\n",
+    )
+    _command(
+        fake_bin,
+        "ps",
+        "#!/usr/bin/env bash\n"
+        "if [[ $* == *'-axo pid=,ppid=,command='* ]]; then\n"
+        "  echo '99222 99111 /fake/hermes gateway run --replace'\n"
+        "  echo '99888 1 /other/profile/hermes gateway run --replace'\n"
+        "fi\n"
+        "exit 0\n",
+    )
+    _command(fake_bin, "pgrep", "#!/usr/bin/env bash\nexit 1\n")
+    _command(fake_bin, "lsof", "#!/usr/bin/env bash\nexit 1\n")
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--stop"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Stopped and quiescent" in result.stdout
+
+
+def test_status_rejects_listener_not_owned_by_wrapper_tree(tmp_path: Path) -> None:
+    env, fake_bin = _environment(tmp_path)
+    _command(
+        fake_bin,
+        "launchctl",
+        "#!/usr/bin/env bash\n"
+        "if [[ $1 == print-disabled ]]; then echo '\"ai.hermes.gateway\" => disabled'; exit 0; fi\n"
+        "if [[ $1 == print && $2 == gui/501/nz.diatche.hermes-gateway ]]; then\n"
+        "  echo '    pid = 99111'; exit 0\n"
+        "fi\n"
+        "if [[ $1 == print ]]; then exit 1; fi\n"
+        "exit 0\n",
+    )
+    _command(
+        fake_bin,
+        "ps",
+        "#!/usr/bin/env bash\n"
+        "if [[ $* == *'-p 99111 -o command='* ]]; then echo \"$HERMES_WRAPPER_APP/Contents/MacOS/HermesGateway\"; exit 0; fi\n"
+        "if [[ $* == *'-p 99999 -o ppid='* ]]; then echo '1'; exit 0; fi\n"
+        "if [[ $* == *'-axo pid=,ppid=,command='* ]]; then echo '99222 99111 hermes gateway run --replace'; exit 0; fi\n"
+        "if [[ $* == *'-axo pid,ppid,stat,command'* ]]; then exit 0; fi\n"
+        "exit 1\n",
+    )
+    _command(fake_bin, "lsof", "#!/usr/bin/env bash\n[[ $* == *'-t'* ]] && echo 99999\nexit 0\n")
+    _command(fake_bin, "pgrep", "#!/usr/bin/env bash\nexit 1\n")
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--status"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "wrapper-owned gateway/listener is not ready" in result.stdout
+
+
+def test_update_quiescence_rejects_any_surviving_gateway(tmp_path: Path) -> None:
+    env, fake_bin = _environment(tmp_path)
+    _command(
+        fake_bin,
+        "launchctl",
+        "#!/usr/bin/env bash\n"
+        "if [[ $1 == print-disabled ]]; then echo '\"ai.hermes.gateway\" => disabled'; exit 0; fi\n"
+        "if [[ $1 == print ]]; then exit 1; fi\n"
+        "exit 0\n",
+    )
+    _command(
+        fake_bin,
+        "ps",
+        "#!/usr/bin/env bash\n"
+        "echo '4242 /usr/local/bin/hermes gateway run --replace'\n",
+    )
+    _command(fake_bin, "lsof", "#!/usr/bin/env bash\nexit 1\n")
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--assert-update-quiescence"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "update quiescence could not be established" in result.stderr
+
+
+def test_update_quiescence_rejects_dashboard_that_starts_after_clean_samples(tmp_path: Path) -> None:
+    env, fake_bin = _environment(tmp_path)
+    ps_calls = tmp_path / "ps-calls"
+    _command(
+        fake_bin,
+        "launchctl",
+        "#!/usr/bin/env bash\n"
+        "if [[ $1 == print-disabled ]]; then echo '\"ai.hermes.gateway\" => disabled'; exit 0; fi\n"
+        "if [[ $1 == print ]]; then exit 1; fi\n"
+        "exit 0\n",
+    )
+    _command(
+        fake_bin,
+        "ps",
+        "#!/usr/bin/env bash\n"
+        f"count=$(cat '{ps_calls}' 2>/dev/null || echo 0)\n"
+        f"echo $((count + 1)) > '{ps_calls}'\n"
+        "if (( count >= 9 )); then echo '4343 /usr/local/bin/hermes dashboard --port 9119'; fi\n",
+    )
+    _command(fake_bin, "lsof", "#!/usr/bin/env bash\nexit 1\n")
+    _command(fake_bin, "sleep", "#!/usr/bin/env bash\nexit 0\n")
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--assert-update-quiescence"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "update quiescence could not be established" in result.stderr
+
+
+def test_status_rejects_extra_manual_gateway(tmp_path: Path) -> None:
+    env, fake_bin = _environment(tmp_path)
+    env["HERMES_REPO"] = "/repo"
+    extra_gateway = tmp_path / "extra-gateway"
+    env["EXTRA_GATEWAY"] = str(extra_gateway)
+    _command(
+        fake_bin,
+        "launchctl",
+        "#!/usr/bin/env bash\n"
+        "if [[ $1 == print-disabled ]]; then echo '\"ai.hermes.gateway\" => disabled'; exit 0; fi\n"
+        "if [[ $1 == print && $2 == gui/501/nz.diatche.hermes-gateway ]]; then\n"
+        "  echo '    pid = 99111'; exit 0\n"
+        "fi\n"
+        "if [[ $1 == print ]]; then exit 1; fi\n"
+        "exit 0\n",
+    )
+    _command(
+        fake_bin,
+        "ps",
+        "#!/usr/bin/env bash\n"
+        "if [[ $* == *'-p 99111 -o command='* ]]; then echo \"$HERMES_WRAPPER_APP/Contents/MacOS/HermesGateway\"; exit 0; fi\n"
+        "if [[ $* == *'-p 99333 -o command='* ]]; then echo '/repo/venv/bin/hermes gateway run --replace'; exit 0; fi\n"
+        "if [[ $* == *'-axo pid=,ppid=,command='* ]]; then\n"
+        "  echo '99333 99111 /repo/venv/bin/hermes gateway run --replace'\n"
+        "  echo '99444 99111 /repo/venv/bin/hermes dashboard --port 9119'\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [[ $* == *'-axo pid=,command='* ]]; then\n"
+        "  echo \"99111 $HERMES_WRAPPER_APP/Contents/MacOS/HermesGateway\"\n"
+        "  echo '99333 /repo/venv/bin/hermes gateway run --replace'\n"
+        "  echo '99444 /repo/venv/bin/hermes dashboard --port 9119'\n"
+        "  [[ -e $EXTRA_GATEWAY ]] && echo '99555 /other/venv/bin/hermes gateway run --replace'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 0\n",
+    )
+    _command(fake_bin, "lsof", "#!/usr/bin/env bash\n[[ $* == *'-t'* ]] && echo 99444\nexit 0\n")
+
+    healthy = subprocess.run(
+        ["bash", str(SCRIPT), "--status"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    extra_gateway.touch()
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--status"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert healthy.returncode == 0, healthy.stdout + healthy.stderr
+    assert result.returncode == 1
+    assert "wrapper-owned gateway/listener is not ready" in result.stdout
+
+
+def test_detached_restart_is_blocked_by_active_maintenance(tmp_path: Path) -> None:
+    env, _ = _environment(tmp_path)
+    marker = tmp_path / ".hermes" / "local" / "update" / "active.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text('{"run_id":"test"}\n', encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--detach"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "maintenance owns gateway restart" in result.stderr
