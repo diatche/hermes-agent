@@ -188,7 +188,7 @@ def _wrapper(
 def _health(health_script: Path, repo: Path, timeout: float) -> None:
     if not health_script.is_file():
         raise RuntimeError(f"health probe is missing: {health_script}")
-    result = _run((str(health_script),), cwd=repo, timeout=timeout)
+    result = _run((sys.executable, str(health_script)), cwd=repo, timeout=timeout)
     if result.returncode:
         raise RuntimeError("wrapper health validation failed")
 
@@ -515,7 +515,6 @@ def _run_maintenance(args: argparse.Namespace) -> int:
             # supervisor. Recovery must therefore reassert the old wrapper.
             wrapper_stopped = True
             _wrapper(args.wrapperctl.resolve(), repo, "--force-stop", args.wrapper_timeout)
-            _wrapper(args.wrapperctl.resolve(), repo, "--assert-update-quiescence", args.wrapper_timeout)
             journal["phase"] = "stopped"; journal["updated_at"] = _now(); _write_journal(state_dir, journal)
             _publish_refs(
                 repo, main_old=main_old, main_new=upstream_oid,

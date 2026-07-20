@@ -90,7 +90,7 @@ def _fake_runtime(
         "print(json.dumps({'healthy': True}))\n",
     )
     wrapper.chmod(0o755)
-    health.chmod(0o755)
+    health.chmod(0o644)
     return wrapper, health, calls
 
 
@@ -136,7 +136,6 @@ def test_success_force_stops_merges_and_restarts(tmp_path: Path) -> None:
     assert calls.read_text(encoding="utf-8").splitlines() == [
         "--status",
         "--force-stop",
-        "--assert-update-quiescence",
         "--foreground",
         "--status",
     ]
@@ -186,7 +185,6 @@ def test_health_failure_rolls_back_refs_and_restarts_old_runtime(tmp_path: Path)
     assert calls.read_text(encoding="utf-8").splitlines() == [
         "--status",
         "--force-stop",
-        "--assert-update-quiescence",
         "--foreground",
         "--status",
         "--force-stop",
