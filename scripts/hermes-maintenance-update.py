@@ -646,6 +646,29 @@ def _status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _detach(args: argparse.Namespace) -> int:
+    """Queue the already-loaded one-shot LaunchAgent without running inline."""
+    state_dir = args.state_dir.resolve()
+    domain = f"gui/{os.getuid()}/{MAINTENANCE_LABEL}"
+    try:
+        with _lock(state_dir):
+            loaded = _run(("launchctl", "print", domain), cwd=args.repo.resolve())
+            if loaded.returncode:
+                raise RuntimeError("maintenance LaunchAgent is not loaded")
+            _write_json(
+                state_dir / "state.json",
+                {"phase": "queued", "queued_at": _now(), "repo": str(args.repo.resolve())},
+            )
+            started = _run(("launchctl", "kickstart", domain), cwd=args.repo.resolve())
+            if started.returncode:
+                raise RuntimeError("could not start maintenance LaunchAgent")
+        print("Hermes maintenance update queued; active sessions will be interrupted.")
+        return 0
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=DEFAULT_REPO)
@@ -686,8 +709,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Installation is unsupported by the narrow maintenance command (no-op).")
         return 0
     if args.detach:
-        print("Detached launch is unsupported by the narrow maintenance command (no-op).")
-        return 0
+        return _detach(args)
     if args.status:
         return _status(args)
     if args.check:
