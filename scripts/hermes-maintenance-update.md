@@ -1,8 +1,8 @@
 # Guarded Hermes maintenance update
 
-`hermes-maintenance-update.py` preserves Pavel's local branch model while still
-using the official Hermes updater for dependencies, configuration migrations,
-and bundled assets.
+`hermes-maintenance-update.py` preserves Pavel's local branch model with a
+narrow Git merge and custom-wrapper restart. It does not invoke the broad
+official updater.
 
 ## Branch contract
 
@@ -43,20 +43,18 @@ only after the worker acknowledges that exact token.
    gateway child, and dashboard listener are all gone. Refuse the update if any
    other profile service, manual Hermes gateway, or dashboard listener remains;
    this prevents the official updater from spawning detached restart actors.
-9. Run `hermes update --branch main --backup --yes --no-gateway-restart`
-   while no gateway is running. The maintenance-only flag suppresses all official
-   updater gateway/dashboard stop, restart, and detached relaunch behavior; then
-   re-prove quiescence before reasserting the custom supervisor policy.
-10. Rebuild and rerun candidate validation into a separate immutable post-update
-    candidate ref against the updater's resulting Python environment and exact
-    upstream SHA (including any upstream drift); never auto-resolve conflicts.
-11. In one Git ref transaction, verify `main`, `origin/main`, the post-update
-    candidate, and the old `diatche` tip, then compare-and-swap `diatche` to the
-    tested candidate. Verify the checkout, branch ref, candidate ref,
-    cleanliness, and upstream ancestry again before restart.
-12. Validate configuration, runtime imports, and a real Hindsight recall while
-    the gateway remains stopped.
-13. Restart the custom wrapper, verify stable exact child/listener identities,
+9. In one Git ref transaction, compare-and-swap `main` and `diatche` from their
+   recorded old tips to the pinned upstream and tested candidate commits.
+10. Restore the `diatche` checkout and verify the local Hindsight embedding
+    imports. If the known trace-upload lazy dependency has downgraded
+    `huggingface-hub`, repair only that package to `>=1.5.0,<2.0`, then re-run
+    the version and import proofs. Repair uses pip `--no-deps`; the compatible
+    single-package repair is deliberately retained if a later startup check
+    fails because it restores the shared venv invariant rather than forming
+    part of the Git rollback boundary. Unrelated import failures do not trigger
+    a package mutation. The trace-upload lazy dependency uses the same range so
+    it cannot immediately undo the repair.
+11. Restart the custom wrapper, verify stable exact child/listener identities,
     then run the topology-aware live health check and re-prove branch, HEAD,
     refs, cleanliness, and unfinished-operation absence. Any mismatch stops the
     wrapper.

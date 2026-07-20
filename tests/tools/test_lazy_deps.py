@@ -14,6 +14,7 @@ from __future__ import annotations
 
 
 import pytest
+from packaging.requirements import Requirement
 
 import tools.lazy_deps as ld
 
@@ -75,6 +76,18 @@ class TestSpecSafety:
 
 
 class TestAllowlist:
+    def test_trace_upload_huggingface_requirement_preserves_local_embeddings(self):
+        requirement = next(
+            Requirement(spec)
+            for spec in ld.LAZY_DEPS["tool.trace_upload"]
+            if Requirement(spec).name == "huggingface-hub"
+        )
+
+        assert requirement.specifier.contains("1.5.0")
+        assert requirement.specifier.contains("1.24.0")
+        assert not requirement.specifier.contains("1.2.3")
+        assert not requirement.specifier.contains("2.0.0")
+
     def test_unknown_feature_raises(self, monkeypatch):
         monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
         with pytest.raises(ld.FeatureUnavailable, match="not in LAZY_DEPS"):

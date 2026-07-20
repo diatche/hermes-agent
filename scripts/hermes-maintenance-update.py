@@ -5,7 +5,9 @@ Usage: ``hermes-maintenance-update.py --run|--recover|--check|--status``.
 The command requests the gateway's existing external-drain protocol, fetches an
 immutable upstream tip into a private ref, creates a merge commit in an isolated
 worktree, and atomically publishes refs.  It never runs ``hermes update``, a
-package manager, a build, a backup, or profile/config/cache synchronization.
+general dependency update, a build, a backup, or profile/config/cache
+synchronization.  It does enforce the one compatibility constraint required by
+the configured local Hindsight embedding stack before starting the new runtime.
 """
 from __future__ import annotations
 
@@ -44,6 +46,26 @@ ZERO_OID = "0" * 40
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 OID_RE = re.compile(r"^[0-9a-f]{40}$")
 TERMINAL_PHASES = {"complete", "recovered"}
+HINDSIGHT_HUB_REQUIREMENT = "huggingface-hub>=1.5.0,<2.0"
+HINDSIGHT_HUB_MISSING = 10
+HINDSIGHT_HUB_INCOMPATIBLE = 11
+HINDSIGHT_HUB_VERSION_PROBE = """\
+from importlib.metadata import PackageNotFoundError, version
+from packaging.specifiers import SpecifierSet
+try:
+    installed = version("huggingface-hub")
+except PackageNotFoundError:
+    raise SystemExit(10)
+raise SystemExit(
+    0 if SpecifierSet(">=1.5.0,<2.0").contains(installed, prereleases=True) else 11
+)
+"""
+HINDSIGHT_IMPORT_PROBE = """\
+import hindsight_embed.daemon_embed_manager
+import huggingface_hub
+import sentence_transformers
+import transformers
+"""
 
 
 class BusyError(RuntimeError):
@@ -191,6 +213,61 @@ def _health(health_script: Path, repo: Path, timeout: float) -> None:
     result = _run((sys.executable, str(health_script)), cwd=repo, timeout=timeout)
     if result.returncode:
         raise RuntimeError("wrapper health validation failed")
+
+
+def _ensure_hindsight_embeddings(repo: Path, timeout: float) -> None:
+    """Repair the known shared-venv HF downgrade, then prove imports work."""
+    python = repo / "venv" / "bin" / "python"
+    if not python.is_file() or not os.access(python, os.X_OK):
+        raise RuntimeError(f"Hermes venv Python is missing: {python}")
+    version_probe = (str(python), "-c", HINDSIGHT_HUB_VERSION_PROBE)
+    version_checked = _run(version_probe, cwd=repo, timeout=timeout)
+    repairable_version_results = {
+        HINDSIGHT_HUB_MISSING,
+        HINDSIGHT_HUB_INCOMPATIBLE,
+    }
+    if (
+        version_checked.returncode
+        and version_checked.returncode not in repairable_version_results
+    ):
+        detail = version_checked.stderr.strip() or version_checked.stdout.strip()
+        raise RuntimeError(
+            "could not inspect huggingface-hub compatibility"
+            + (f": {detail}" if detail else "")
+        )
+    if version_checked.returncode in repairable_version_results:
+        repaired = _run(
+            (
+                str(python), "-m", "pip", "install", "--no-deps",
+                HINDSIGHT_HUB_REQUIREMENT,
+            ),
+            cwd=repo,
+            timeout=timeout,
+        )
+        if repaired.returncode:
+            detail = repaired.stderr.strip() or repaired.stdout.strip()
+            raise RuntimeError(
+                "could not repair Hindsight embedding dependencies"
+                + (f": {detail}" if detail else "")
+            )
+        version_verified = _run(version_probe, cwd=repo, timeout=timeout)
+        if version_verified.returncode in repairable_version_results:
+            raise RuntimeError("huggingface-hub remains outside >=1.5.0,<2.0")
+        if version_verified.returncode:
+            detail = version_verified.stderr.strip() or version_verified.stdout.strip()
+            raise RuntimeError(
+                "could not re-inspect huggingface-hub compatibility"
+                + (f": {detail}" if detail else "")
+            )
+
+    import_probe = (str(python), "-c", HINDSIGHT_IMPORT_PROBE)
+    imports_verified = _run(import_probe, cwd=repo, timeout=timeout)
+    if imports_verified.returncode:
+        detail = imports_verified.stderr.strip() or imports_verified.stdout.strip()
+        raise RuntimeError(
+            "Hindsight embedding imports fail"
+            + (f": {detail}" if detail else "")
+        )
 
 
 def _create_drain_marker(marker: Path, request_id: str) -> int:
@@ -467,6 +544,7 @@ def _recover_payload(
             integration_new=payload["integration_new"],
         )
         _restore_checkout(repo, "diatche", payload["integration_old"])
+        _ensure_hindsight_embeddings(repo, health_timeout)
         _wrapper(
             wrapper, repo, "--foreground", wrapper_timeout, maintenance_start=True
         )
@@ -524,6 +602,7 @@ def _run_maintenance(args: argparse.Namespace) -> int:
             published = True
             journal["phase"] = "published"; journal["updated_at"] = _now(); _write_journal(state_dir, journal)
             _restore_checkout(repo, "diatche", candidate_oid)
+            _ensure_hindsight_embeddings(repo, args.health_timeout)
             _wrapper(
                 args.wrapperctl.resolve(), repo, "--foreground",
                 args.wrapper_timeout, maintenance_start=True,
@@ -554,6 +633,7 @@ def _run_maintenance(args: argparse.Namespace) -> int:
                         integration_new=journal["integration_new"],
                     )
                 _restore_checkout(repo, "diatche", journal["integration_old"])
+                _ensure_hindsight_embeddings(repo, args.health_timeout)
                 _wrapper(
                     args.wrapperctl.resolve(), repo, "--foreground",
                     args.wrapper_timeout, maintenance_start=True,

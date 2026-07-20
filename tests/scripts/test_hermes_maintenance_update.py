@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "hermes-maintenance-update.py"
+
+
+def _load_script_module():
+    spec = importlib.util.spec_from_file_location("hermes_maintenance_update", SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _git(path: Path, *args: str, check: bool = True) -> str:
@@ -48,6 +59,9 @@ def _make_repo(tmp_path: Path, *, conflict: bool = False) -> tuple[Path, str]:
     _git(seed, "push", "-u", "origin", "main")
     _git(tmp_path, "clone", str(remote), str(repo))
     _git(repo, "switch", "-c", "diatche")
+    python = _write(repo, "venv/bin/python", "#!/bin/sh\nexit 0\n")
+    python.chmod(0o755)
+    _write(repo, ".git/info/exclude", "venv/\n")
     _write(repo, "base.txt" if conflict else "local.txt", "local\n")
     _commit(repo, "local")
     _write(seed, "base.txt" if conflict else "upstream.txt", "upstream\n")
@@ -233,6 +247,111 @@ def test_never_invokes_updater_package_or_build_commands(tmp_path: Path) -> None
 
     assert result.returncode == 0, result.stderr
     assert not called.exists()
+
+
+def test_hindsight_embedding_guard_repairs_only_incompatible_hub(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _load_script_module()
+    repo = tmp_path / "repo"
+    python = repo / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    python.chmod(0o755)
+    commands: list[tuple[str, ...]] = []
+    outcomes = iter([11, 0, 0, 0])
+
+    def fake_run(command, *, cwd, timeout=60, check=False, env=None):
+        commands.append(tuple(command))
+        return subprocess.CompletedProcess(command, next(outcomes), "", "")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    module._ensure_hindsight_embeddings(repo, timeout=30)
+
+    assert commands[0][0] == str(python)
+    assert commands[0][1] == "-c"
+    assert commands[1] == (
+        str(python), "-m", "pip", "install", "--no-deps",
+        "huggingface-hub>=1.5.0,<2.0",
+    )
+    assert commands[2] == commands[0]
+    assert commands[3][1] == "-c"
+    assert commands[3] != commands[0]
+
+
+def test_hindsight_embedding_guard_is_noop_when_version_and_imports_work(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _load_script_module()
+    repo = tmp_path / "repo"
+    python = repo / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    python.chmod(0o755)
+    commands: list[tuple[str, ...]] = []
+
+    def fake_run(command, *, cwd, timeout=60, check=False, env=None):
+        commands.append(tuple(command))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    module._ensure_hindsight_embeddings(repo, timeout=30)
+
+    assert len(commands) == 2
+    assert commands[0][1] == "-c"
+    assert commands[1][1] == "-c"
+    assert commands[1] != commands[0]
+
+
+def test_hindsight_embedding_guard_does_not_repair_unrelated_import_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _load_script_module()
+    repo = tmp_path / "repo"
+    python = repo / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    python.chmod(0o755)
+    commands: list[tuple[str, ...]] = []
+    outcomes = iter([0, 1])
+
+    def fake_run(command, *, cwd, timeout=60, check=False, env=None):
+        commands.append(tuple(command))
+        return subprocess.CompletedProcess(command, next(outcomes), "", "broken import")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    with pytest.raises(RuntimeError, match="embedding imports fail"):
+        module._ensure_hindsight_embeddings(repo, timeout=30)
+
+    assert len(commands) == 2
+    assert all("pip" not in command for command in commands)
+
+
+def test_hindsight_embedding_guard_does_not_repair_version_probe_crash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _load_script_module()
+    repo = tmp_path / "repo"
+    python = repo / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    python.chmod(0o755)
+    commands: list[tuple[str, ...]] = []
+
+    def fake_run(command, *, cwd, timeout=60, check=False, env=None):
+        commands.append(tuple(command))
+        return subprocess.CompletedProcess(command, 1, "", "packaging probe crashed")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    with pytest.raises(RuntimeError, match="could not inspect huggingface-hub"):
+        module._ensure_hindsight_embeddings(repo, timeout=30)
+
+    assert len(commands) == 1
+    assert "pip" not in commands[0]
 
 
 def test_install_writes_command_and_one_shot_job_without_running_update(tmp_path: Path) -> None:
