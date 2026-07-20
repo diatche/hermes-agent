@@ -64,12 +64,21 @@ class TestInterruptForSessionByParentId:
 class TestGatewayPinningFailsClosed:
     """The gateway injection path must never resurrect an ended session."""
 
-    def _make_runner(self, pinned_row):
+    def _make_runner(self, pinned_row, *, compression_tip=None, tip_row=None):
         from gateway.run import GatewayRunner
 
         runner = object.__new__(GatewayRunner)
         db = MagicMock()
-        db.get_session = AsyncMock(return_value=pinned_row)
+
+        async def _get_session(session_id):
+            if compression_tip and session_id == compression_tip:
+                return tip_row
+            return pinned_row
+
+        db.get_session = AsyncMock(side_effect=_get_session)
+        db.get_compression_tip = AsyncMock(
+            return_value=compression_tip or "sess_old"
+        )
         runner._session_db = db
 
         entry = MagicMock()
@@ -95,11 +104,27 @@ class TestGatewayPinningFailsClosed:
                         pinned_row = await runner._session_db.get_session(pinned)
                 except Exception:
                     pinned_row = None
+                if pinned_row is not None and pinned_row.get("ended_at"):
+                    if pinned_row.get("end_reason") == "compression":
+                        try:
+                            tip = await runner._session_db.get_compression_tip(pinned)
+                        except Exception:
+                            tip = pinned
+                        if tip and tip != pinned:
+                            pinned = tip
+                            try:
+                                pinned_row = await runner._session_db.get_session(pinned)
+                            except Exception:
+                                pinned_row = None
                 if pinned_row is None or pinned_row.get("ended_at"):
                     return "dropped"
-                switched = runner.session_store.switch_session(session_entry.session_key, pinned)
-                if switched is not None:
-                    return "pinned"
+                if pinned != session_entry.session_id:
+                    switched = runner.session_store.switch_session(
+                        session_entry.session_key, pinned
+                    )
+                    if switched is not None:
+                        return "pinned"
+                return "continued"
             return "default"
 
         return asyncio.run(_go())
@@ -109,9 +134,43 @@ class TestGatewayPinningFailsClosed:
         assert self._run_pinning_prefix(runner, "sess_old") == "pinned"
 
     def test_ended_spawning_session_drops(self):
-        runner, _ = self._make_runner({"id": "sess_old", "ended_at": "2026-07-08T00:00:00"})
+        runner, _ = self._make_runner(
+            {
+                "id": "sess_old",
+                "ended_at": "2026-07-08T00:00:00",
+                "end_reason": "reset",
+            }
+        )
         assert self._run_pinning_prefix(runner, "sess_old") == "dropped"
         runner.session_store.switch_session.assert_not_called()
+
+    def test_compression_parent_completion_routes_to_current_continuation(self):
+        runner, _ = self._make_runner(
+            {
+                "id": "sess_old",
+                "ended_at": "2026-07-08T00:00:00",
+                "end_reason": "compression",
+            },
+            compression_tip="sess_current",
+            tip_row={"id": "sess_current", "ended_at": None},
+        )
+        assert self._run_pinning_prefix(runner, "sess_old") == "continued"
+        runner.session_store.switch_session.assert_not_called()
+
+    def test_compression_parent_completion_pins_live_continuation(self):
+        runner, _ = self._make_runner(
+            {
+                "id": "sess_old",
+                "ended_at": "2026-07-08T00:00:00",
+                "end_reason": "compression",
+            },
+            compression_tip="sess_child",
+            tip_row={"id": "sess_child", "ended_at": None},
+        )
+        assert self._run_pinning_prefix(runner, "sess_old") == "pinned"
+        runner.session_store.switch_session.assert_called_once_with(
+            "agent:main:telegram:dm:1", "sess_child"
+        )
 
     def test_unknown_spawning_session_drops(self):
         runner, _ = self._make_runner(None)

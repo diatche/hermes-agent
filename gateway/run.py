@@ -11944,13 +11944,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ).strip()
         if pinned_session_id and pinned_session_id != session_entry.session_id:
             # Fail closed (#55578): the spawning session may have ENDED since
-            # dispatch (user /new-reset, compression rotation whose parent was
-            # closed). switch_session() re-opens ended sessions, so pinning
+            # dispatch. switch_session() re-opens ended sessions, so pinning
             # blindly would RESURRECT a conversation the user explicitly
-            # ended and inject into it — the same illicit-revival class as
-            # the ws_orphan_reap loop (#60609). A completion whose spawning
-            # session is dead is dropped from injection; the subagent's
-            # output remains in the delegation records.
+            # ended. A compression-ended parent is handled narrowly below by
+            # resolving its indexed continuation; every other dead spawning
+            # session is dropped and the output remains in delegation records.
             pinned_row = None
             try:
                 if self._session_db is not None:
@@ -11958,6 +11956,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pinned_row = await self._session_db.get_session(pinned_session_id)
             except Exception:
                 pinned_row = None
+            if pinned_row is not None and pinned_row.get("ended_at"):
+                # Compression is the one ended-session case with an explicit,
+                # indexed continuation. Resolve the old parent to that lineage
+                # tip so a completion racing the rotation is not dropped. This
+                # does not weaken /new fail-closed behavior: non-compression
+                # endings still fall through to the drop below.
+                if pinned_row.get("end_reason") == "compression":
+                    try:
+                        compression_tip = await self._session_db.get_compression_tip(
+                            pinned_session_id
+                        )
+                    except Exception:
+                        compression_tip = pinned_session_id
+                    if compression_tip and compression_tip != pinned_session_id:
+                        pinned_session_id = compression_tip
+                        try:
+                            pinned_row = await self._session_db.get_session(
+                                pinned_session_id
+                            )
+                        except Exception:
+                            pinned_row = None
             if pinned_row is None or pinned_row.get("ended_at"):
                 logger.warning(
                     "Async-delegation completion pinned to session %s, which is "
@@ -11968,17 +11987,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "unknown" if pinned_row is None else "ended",
                 )
                 return
-            prior_session_id = session_entry.session_id
-            switched = await self.async_session_store.switch_session(session_key, pinned_session_id)
-            if switched is not None:
-                session_entry = switched
-                logger.info(
-                    "Pinned async-delegation completion to spawning session %s "
-                    "(was %s) for routing key %s (#57498)",
-                    pinned_session_id,
-                    prior_session_id,
-                    session_key,
+            if pinned_session_id != session_entry.session_id:
+                prior_session_id = session_entry.session_id
+                switched = await self.async_session_store.switch_session(
+                    session_key, pinned_session_id
                 )
+                if switched is not None:
+                    session_entry = switched
+                    logger.info(
+                        "Pinned async-delegation completion to spawning session %s "
+                        "(was %s) for routing key %s (#57498)",
+                        pinned_session_id,
+                        prior_session_id,
+                        session_key,
+                    )
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:

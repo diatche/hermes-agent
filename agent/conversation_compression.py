@@ -1161,6 +1161,45 @@ def compress_context(
                         "check auxiliary.compression.model in config.yaml."
                     )
 
+        # Keep active delegated work attached to the summary itself. This is
+        # deliberately not a second synthetic turn: the compacted handoff
+        # remains role-stable while carrying a deterministic reminder into
+        # both in-place and rotated continuation sessions.
+        try:
+            from tools.async_delegation import (
+                format_active_delegations_for_compression,
+            )
+
+            delegation_snapshot = format_active_delegations_for_compression(
+                str(agent.session_id or "")
+            )
+        except Exception as exc:
+            logger.warning("Could not snapshot active delegations: %s", exc)
+            delegation_snapshot = None
+        if delegation_snapshot:
+            try:
+                from agent.context_compressor import (
+                    COMPRESSED_SUMMARY_METADATA_KEY,
+                    _append_text_to_content,
+                )
+
+                summary_message = next(
+                    (
+                        message
+                        for message in compressed
+                        if isinstance(message, dict)
+                        and message.get(COMPRESSED_SUMMARY_METADATA_KEY) is True
+                    ),
+                    None,
+                )
+                if summary_message is not None:
+                    summary_message["content"] = _append_text_to_content(
+                        summary_message.get("content", ""),
+                        "\n\n" + delegation_snapshot,
+                    )
+            except Exception as exc:
+                logger.warning("Could not append active delegations to summary: %s", exc)
+
         todo_snapshot = agent._todo_store.format_for_injection()
         if todo_snapshot:
             compressed.append({
@@ -1316,6 +1355,24 @@ def compress_context(
                         agent._session_db_created = True
                         raise
                     agent._session_db_created = True
+                    # Active async completions are pinned to their spawning
+                    # session. Compression has deliberately ended that parent,
+                    # so move only its still-active records to the indexed
+                    # continuation before a completion can be dropped as stale.
+                    try:
+                        from tools.async_delegation import (
+                            rebind_active_delegations_parent,
+                        )
+
+                        rebind_active_delegations_parent(
+                            old_session_id,
+                            agent.session_id,
+                        )
+                    except Exception as _delegation_err:
+                        logger.warning(
+                            "Could not rebind active delegations after compression: %s",
+                            _delegation_err,
+                        )
                     # Carry a persistent /goal onto the continuation session.
                     # Compression mints a fresh child id; load_goal does a flat
                     # per-session lookup with no parent walk, so without this an

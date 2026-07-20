@@ -36,7 +36,11 @@ def _make_agent(session_db, session_id, *, in_place):
     # test exercises the DB-mutation path, not summarization quality.
     def _fake_compress(messages, current_tokens=None, focus_topic=None, force=False):
         return [
-            {"role": "user", "content": "[CONTEXT COMPACTION] summary of prior turns"},
+            {
+                "role": "user",
+                "content": "[CONTEXT COMPACTION] summary of prior turns",
+                "_compressed_summary": True,
+            },
             {"role": "assistant", "content": "recent reply"},
         ]
 
@@ -123,6 +127,93 @@ class TestInPlaceCompaction:
             assert agent._last_compaction_in_place is True
             # Live transcript actually shrank.
             assert len(compressed) == 2
+
+    def test_active_delegation_is_appended_verbatim_to_compaction_summary(self):
+        """Compression keeps a deterministic reminder of delegated work."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+        from tools import async_delegation
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_120100_delegation"
+            _seed(db, sid, "delegation")
+            agent = _make_agent(db, sid, in_place=True)
+            record = {
+                "delegation_id": "deleg_deadbeef",
+                "goal": "Audit the authentication flow",
+                "parent_session_id": sid,
+                "status": "running",
+                "dispatched_at": 1.0,
+            }
+            with async_delegation._records_lock:
+                async_delegation._records[record["delegation_id"]] = record
+            try:
+                compressed, _ = compress_context(
+                    agent,
+                    [{"role": "user", "content": f"m{i}"} for i in range(8)],
+                    approx_tokens=100_000,
+                    system_message="sys",
+                )
+            finally:
+                with async_delegation._records_lock:
+                    async_delegation._records.pop(record["delegation_id"], None)
+
+            assert compressed[0]["content"].endswith(
+                "\n\n[Active delegated work preserved across context compression]\n"
+                "- deleg_deadbeef: Audit the authentication flow — running\n"
+                "  Do not duplicate this work; wait for and incorporate its completion."
+            )
+            assert len(compressed) == 2
+
+    def test_delegation_snapshot_targets_tagged_merged_summary_after_head(self):
+        """Protected head content stays untouched; multimodal merged summaries work."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+        from tools import async_delegation
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_120101_tagged"
+            _seed(db, sid, "tagged")
+            agent = _make_agent(db, sid, in_place=True)
+            agent.context_compressor.compress = lambda *args, **kwargs: [
+                {"role": "system", "content": "protected head"},
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "merged summary"}],
+                    "_compressed_summary": True,
+                },
+                {"role": "assistant", "content": "tail"},
+            ]
+            with async_delegation._records_lock:
+                async_delegation._records["deleg_tagged"] = {
+                    "delegation_id": "deleg_tagged",
+                    "goal": "Inspect summary placement",
+                    "parent_session_id": sid,
+                    "status": "running",
+                    "dispatched_at": 1.0,
+                }
+            try:
+                compressed, _ = compress_context(
+                    agent,
+                    [{"role": "user", "content": f"m{i}"} for i in range(8)],
+                    approx_tokens=100_000,
+                    system_message="sys",
+                )
+            finally:
+                with async_delegation._records_lock:
+                    async_delegation._records.pop("deleg_tagged", None)
+
+            assert compressed[0]["content"] == "protected head"
+            summary_text = "".join(
+                part.get("text", "")
+                for part in compressed[1]["content"]
+                if isinstance(part, dict)
+            )
+            assert "merged summary" in summary_text
+            assert "deleg_tagged" in summary_text
+            assert "deleg_tagged" not in compressed[2]["content"]
 
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""
@@ -223,6 +314,49 @@ class TestRotationFallbackWhenFlagOff:
             ]
             # Rotation mode does NOT set the in-place signal.
             assert getattr(agent, "_last_compaction_in_place", False) is False
+
+    def test_rotation_rebinds_active_completion_to_continuation(self, monkeypatch):
+        """A child finishing after rotation targets the live continuation."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+        from tools import async_delegation
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_130100_deleg"
+            _seed(db, sid, "delegation")
+            agent = _make_agent(db, sid, in_place=False)
+            monkeypatch.setattr(
+                async_delegation,
+                "_connect",
+                lambda: (_ for _ in ()).throw(RuntimeError("test DB unavailable")),
+            )
+            with async_delegation._records_lock:
+                async_delegation._records["deleg_rotate"] = {
+                    "delegation_id": "deleg_rotate",
+                    "goal": "Finish after rotation",
+                    "parent_session_id": sid,
+                    "status": "running",
+                    "dispatched_at": 1.0,
+                }
+            try:
+                compressed, _ = compress_context(
+                    agent,
+                    [{"role": "user", "content": f"m{i}"} for i in range(8)],
+                    approx_tokens=100_000,
+                    system_message="sys",
+                )
+                with async_delegation._records_lock:
+                    record = dict(async_delegation._records["deleg_rotate"])
+            finally:
+                with async_delegation._records_lock:
+                    async_delegation._records.pop("deleg_rotate", None)
+
+            assert agent.session_id != sid
+            assert record["parent_session_id"] == agent.session_id
+            assert "deleg_rotate" in compressed[0]["content"]
+            persisted = db.get_messages_as_conversation(agent.session_id)
+            assert "deleg_rotate" in persisted[0]["content"]
 
 
 class TestInPlaceSignalForGateway:
