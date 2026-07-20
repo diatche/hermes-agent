@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
-"""Guarded maintenance updater for Pavel's Hermes integration checkout.
+"""Narrow, crash-recoverable Git + wrapper maintenance transaction.
 
-Entrypoints:
-  scripts/hermes-maintenance-update.py --check
-  scripts/hermes-maintenance-update.py --install
-  ~/.hermes/local/bin/hermes-maintenance-update --detach
-
-The updater preserves ``main`` as an upstream mirror and ``diatche`` as the
-validated local integration branch. It never resolves merge conflicts. The
-installed one-shot LaunchAgent runs independently of HermesGateway.app so it
-can stop the wrapper before the official updater and start it once afterward.
+Usage: ``hermes-maintenance-update.py --run|--recover|--check|--status``.
+The command requests the gateway's existing external-drain protocol, fetches an
+immutable upstream tip into a private ref, creates a merge commit in an isolated
+worktree, and atomically publishes refs.  It never runs ``hermes update``, a
+package manager, a build, a backup, or profile/config/cache synchronization.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -19,6 +14,7 @@ import fcntl
 import json
 import os
 import plistlib
+import re
 import shutil
 import signal
 import subprocess
@@ -31,39 +27,120 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-
 DEFAULT_REPO = Path.home() / ".hermes" / "hermes-agent"
 DEFAULT_STATE_DIR = Path.home() / ".hermes" / "local" / "update"
 DEFAULT_WRAPPERCTL = Path.home() / ".hermes" / "local" / "bin" / "hermes-gateway-wrapperctl"
 DEFAULT_HEALTH_SCRIPT = Path.home() / ".hermes" / "local" / "health" / "hermes_core_health.py"
+DEFAULT_DRAIN_MARKER = Path.home() / ".hermes" / ".drain_request.json"
+DEFAULT_GATEWAY_STATUS = Path.home() / ".hermes" / "gateway_state.json"
 MAINTENANCE_LABEL = "nz.diatche.hermes-maintenance-update"
-DEFAULT_INSTALLED_SCRIPT = Path.home() / ".hermes" / "local" / "bin" / "hermes-maintenance-update"
-DEFAULT_MAINTENANCE_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{MAINTENANCE_LABEL}.plist"
+DEFAULT_INSTALLED_SCRIPT = (
+    Path.home() / ".hermes" / "local" / "bin" / "hermes-maintenance-update"
+)
+DEFAULT_MAINTENANCE_PLIST = (
+    Path.home() / "Library" / "LaunchAgents" / f"{MAINTENANCE_LABEL}.plist"
+)
+ZERO_OID = "0" * 40
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+OID_RE = re.compile(r"^[0-9a-f]{40}$")
+TERMINAL_PHASES = {"complete", "recovered"}
 
 
-class MaintenanceBusyError(RuntimeError):
-    """Raised when another maintenance worker owns the update lock."""
+class BusyError(RuntimeError):
+    pass
 
 
 class MaintenanceInterruptedError(RuntimeError):
-    """Raised so SIGINT/SIGTERM enter the same fail-closed recovery path."""
+    pass
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _run(
+    command: Sequence[str], *, cwd: Path, timeout: float = 60, check: bool = False,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a bounded child in its own process group and reap its descendants."""
+    process = subprocess.Popen(
+        list(command), cwd=cwd, text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, start_new_session=True, env=env,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except BaseException:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate(timeout=3)
+        raise
+    result = subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
+    if check and result.returncode:
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args, output=result.stdout, stderr=result.stderr
+        )
+    return result
+
+
+def _git(repo: Path, *args: str, check: bool = True, timeout: float = 60) -> subprocess.CompletedProcess[str]:
+    return _run(("git", *args), cwd=repo, timeout=timeout, check=check)
+
+
+def _oid(repo: Path, ref: str) -> str:
+    value = _git(repo, "rev-parse", "--verify", ref).stdout.strip()
+    if not OID_RE.fullmatch(value):
+        raise RuntimeError(f"invalid object id for {ref}")
+    return value
+
+
+def _common_git_dir(repo: Path) -> Path:
+    value = _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    return Path(value).resolve()
+
+
+def _fsync_dir(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    _fsync_dir(path.parent)
 
 
 @contextmanager
-def _maintenance_signal_guard() -> Iterator[None]:
+def _signal_guard() -> Iterator[None]:
     previous: dict[int, Any] = {}
 
-    def _raise_interrupted(signum: int, _frame: Any) -> None:
-        # Recovery must be allowed to finish after the first interruption.
-        for guarded_signum in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(guarded_signum, signal.SIG_IGN)
+    def interrupted(signum: int, _frame: Any) -> None:
+        for guarded in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(guarded, signal.SIG_IGN)
         raise MaintenanceInterruptedError(
             f"maintenance interrupted by {signal.Signals(signum).name}"
         )
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous[signum] = signal.getsignal(signum)
-        signal.signal(signum, _raise_interrupted)
+        signal.signal(signum, interrupted)
     try:
         yield
     finally:
@@ -71,1216 +148,553 @@ def _maintenance_signal_guard() -> Iterator[None]:
             signal.signal(signum, handler)
 
 
-def _run(
-    args: Sequence[str],
-    *,
-    cwd: Path,
-    check: bool = False,
-    timeout: float | None = 300,
-    env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    command = list(args)
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-        env=env,
-    )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except BaseException:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.communicate(timeout=5)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                if process.stdout is not None:
-                    process.stdout.close()
-                if process.stderr is not None:
-                    process.stderr.close()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-        raise
-    completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-    if check and process.returncode:
-        raise subprocess.CalledProcessError(process.returncode, command, output=stdout, stderr=stderr)
-    return completed
-
-
-def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return _run(("git", *args), cwd=repo, check=check)
-
-
-def _rev_parse(repo: Path, ref: str) -> str:
-    return _git(repo, "rev-parse", "--verify", ref).stdout.strip()
-
-
-def check_mergeability(
-    repo: Path,
-    *,
-    integration_branch: str,
-    upstream_ref: str,
-) -> dict[str, Any]:
-    integration_sha = _rev_parse(repo, integration_branch)
-    upstream_sha = _rev_parse(repo, upstream_ref)
-    merge = _git(
-        repo,
-        "merge-tree",
-        "--write-tree",
-        integration_sha,
-        upstream_sha,
-        check=False,
-    )
-    return {
-        "ok": merge.returncode == 0,
-        "mergeable": merge.returncode == 0,
-        "integration_branch": integration_branch,
-        "integration_sha": integration_sha,
-        "upstream_ref": upstream_ref,
-        "upstream_sha": upstream_sha,
-        "merge_tree": merge.stdout.strip(),
-        "error": merge.stderr.strip() if merge.returncode else "",
-    }
-
-
-def _write_state(state_dir: Path, payload: dict[str, Any]) -> None:
-    state_dir.mkdir(parents=True, exist_ok=True)
-    target = state_dir / "state.json"
-    temporary = state_dir / f".{target.name}.tmp"
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, target)
-
-
 @contextmanager
-def _exclusive_lock(state_dir: Path, *, wait_seconds: float = 0) -> Iterator[None]:
+def _lock(state_dir: Path) -> Iterator[None]:
     state_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = state_dir / "maintenance.lock"
-    deadline = time.monotonic() + wait_seconds
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        while True:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError as exc:
-                if time.monotonic() >= deadline:
-                    raise MaintenanceBusyError("another Hermes maintenance update is already running") from exc
-                time.sleep(0.1)
+    with (state_dir / "maintenance.lock").open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise BusyError("another maintenance or recovery operation is active") from exc
         yield
 
 
-def _active_marker(state_dir: Path) -> Path:
-    return state_dir / "active.json"
+def _assert_checkout(repo: Path, integration_branch: str) -> None:
+    if _git(repo, "branch", "--show-current").stdout.strip() != integration_branch:
+        raise RuntimeError(f"checkout must be clean and on {integration_branch}")
+    if _git(repo, "status", "--porcelain").stdout.strip():
+        raise RuntimeError("checkout is dirty")
+    for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "sequencer"):
+        path = Path(_git(repo, "rev-parse", "--git-path", name).stdout.strip())
+        if not path.is_absolute():
+            path = repo / path
+        if path.exists():
+            raise RuntimeError(f"unfinished Git operation: {name}")
 
 
-def _claim_active_lifecycle(state_dir: Path, run_id: str) -> Path:
-    marker = _active_marker(state_dir)
-    payload = json.dumps({"run_id": run_id, "pid": os.getpid()}) + "\n"
+def _wrapper(
+    wrapper: Path, repo: Path, argument: str, timeout: float, *,
+    maintenance_start: bool = False,
+) -> None:
+    env = None
+    if maintenance_start:
+        env = {**os.environ, "HERMES_MAINTENANCE_START_ALLOWED": "1"}
+    result = _run((str(wrapper), argument), cwd=repo, timeout=timeout, env=env)
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"wrapper {argument} failed{': ' + detail if detail else ''}")
+
+
+def _health(health_script: Path, repo: Path, timeout: float) -> None:
+    if not health_script.is_file():
+        raise RuntimeError(f"health probe is missing: {health_script}")
+    result = _run((str(health_script),), cwd=repo, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError("wrapper health validation failed")
+
+
+def _create_drain_marker(marker: Path, request_id: str) -> int:
+    """Create the external marker without adopting an existing request."""
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "action": "drain", "requested_at": _now(),
+        "principal": "hermes-maintenance", "request_id": request_id,
+        "suppress_notification": True,
+    }
     try:
         descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError as exc:
-        raise MaintenanceBusyError(
-            f"maintenance lifecycle marker exists; inspect {marker} before retrying"
-        ) from exc
+        raise BusyError(f"drain marker already exists: {marker}") from exc
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        handle.write(payload)
+        json.dump(payload, handle, sort_keys=True)
+        handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
-    directory_fd = os.open(state_dir, os.O_RDONLY)
+    _fsync_dir(marker.parent)
+    return marker.stat().st_mtime_ns
+
+
+def _owned_marker(marker: Path, request_id: str) -> bool:
     try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-    return marker
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("request_id") == request_id
 
 
-def _assert_no_active_lifecycle(state_dir: Path) -> None:
-    marker = _active_marker(state_dir)
-    if marker.exists():
-        raise MaintenanceBusyError(
-            f"maintenance lifecycle is still active or needs recovery: {marker}"
-        )
+def _remove_owned_marker(marker: Path, request_id: str) -> bool:
+    if not _owned_marker(marker, request_id):
+        return False
+    # Re-read immediately before unlink; replacement by a cooperating writer is
+    # detected. Atomic ownership+unlink is not available for ordinary files.
+    if not _owned_marker(marker, request_id):
+        return False
+    marker.unlink()
+    _fsync_dir(marker.parent)
+    return True
 
 
-def _require_clean_integration_checkout(repo: Path, integration_branch: str) -> None:
-    current = _git(repo, "branch", "--show-current").stdout.strip()
-    if current != integration_branch:
-        raise RuntimeError(
-            f"checkout must be on '{integration_branch}', currently on '{current or 'detached HEAD'}'"
-        )
-    dirty = _git(repo, "status", "--porcelain").stdout.strip()
-    if dirty:
-        raise RuntimeError("checkout is dirty; commit, stash, or remove local changes first")
-    _assert_no_git_operation(repo)
-
-    worktrees = _git(repo, "worktree", "list", "--porcelain").stdout.splitlines()
-    current_path: Path | None = None
-    for line in worktrees:
-        if line.startswith("worktree "):
-            current_path = Path(line.removeprefix("worktree ")).resolve()
-        elif line.startswith("branch refs/heads/") and current_path != repo:
-            branch = line.removeprefix("branch refs/heads/")
-            if branch in {integration_branch, "main"}:
-                raise RuntimeError(f"relevant branch '{branch}' is checked out in {current_path}")
-
-
-def _assert_no_git_operation(repo: Path) -> None:
-    for name in (
-        "MERGE_HEAD",
-        "CHERRY_PICK_HEAD",
-        "REVERT_HEAD",
-        "rebase-merge",
-        "rebase-apply",
-        "sequencer",
-    ):
-        git_path_text = _git(repo, "rev-parse", "--git-path", name).stdout.strip()
-        git_path = Path(git_path_text)
-        if not git_path.is_absolute():
-            git_path = repo / git_path
-        if git_path_text and git_path.exists():
-            raise RuntimeError(f"unfinished Git operation detected: {name}")
-
-def _create_backup_refs(repo: Path, integration_branch: str, upstream_branch: str) -> dict[str, str]:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-    branches = [integration_branch, upstream_branch]
-    feature_lines = _git(
-        repo,
-        "for-each-ref",
-        "--format=%(refname:short)",
-        "refs/heads/feature/",
-    ).stdout.splitlines()
-    branches.extend(branch for branch in feature_lines if branch)
-    backups: dict[str, str] = {}
-    for branch in dict.fromkeys(branches):
-        sha = _rev_parse(repo, branch)
-        backup = f"backup/maintenance-{stamp}/{branch}"
-        created = _git(
-            repo,
-            "update-ref",
-            f"refs/heads/{backup}",
-            sha,
-            "0" * 40,
-            check=False,
-        )
-        if created.returncode:
-            raise RuntimeError(f"backup ref already exists: {backup}")
-        backups[branch] = backup
-    return backups
-
-
-def _find_pytest_python(source_repo: Path) -> Path | None:
-    candidates = (
-        source_repo / "venv" / "bin" / "python",
-        Path.home() / "miniconda3" / "bin" / "python",
-        Path(sys.executable),
-    )
-    for python in candidates:
-        if not python.is_file():
-            continue
-        probe = _run((str(python), "-c", "import pytest"), cwd=source_repo)
-        if probe.returncode == 0:
-            return python
-    return None
-
-
-def _validate_candidate(
-    candidate: Path,
-    old_sha: str,
-    candidate_sha: str,
-    *,
-    source_repo: Path,
+def _wait_for_drain(
+    marker: Path, status: Path, request_id: str, marker_mtime_ns: int,
+    *, timeout: float, interval: float, sample_interval: float,
+    stable_samples: int,
 ) -> None:
-    diff_check = _git(candidate, "diff", "--check", f"{old_sha}..{candidate_sha}", check=False)
-    if diff_check.returncode:
-        raise RuntimeError(diff_check.stdout.strip() or diff_check.stderr.strip() or "git diff --check failed")
+    deadline = time.monotonic() + timeout
+    stable: list[tuple[int, str]] = []
+    while time.monotonic() < deadline:
+        if not _owned_marker(marker, request_id):
+            raise RuntimeError("drain marker ownership was lost")
+        try:
+            stat = status.stat()
+            raw = status.read_text(encoding="utf-8")
+            payload = json.loads(raw)
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            stable.clear()
+            time.sleep(interval)
+            continue
+        signature = (stat.st_mtime_ns, raw)
+        fresh = stat.st_mtime_ns > marker_mtime_ns
+        valid = (
+            fresh and isinstance(payload, dict)
+            and payload.get("gateway_state") == "draining"
+            and type(payload.get("active_agents")) is int
+            and payload.get("active_agents") == 0
+        )
+        if valid and (not stable or signature != stable[-1]):
+            stable.append(signature)
+            if len(stable) >= stable_samples:
+                return
+            time.sleep(sample_interval)
+        else:
+            if not valid:
+                stable.clear()
+            time.sleep(interval)
+    raise RuntimeError(
+        f"drain timed out without {stable_samples} fresh acknowledged stable samples"
+    )
 
-    compile_roots = [
-        candidate / name
-        for name in ("agent", "gateway", "hermes_cli", "tools", "scripts")
-        if (candidate / name).is_dir()
-    ]
-    if compile_roots:
-        compiled = _run(
-            (sys.executable, "-m", "compileall", "-q", *(str(path) for path in compile_roots)),
-            cwd=candidate,
-        )
-        if compiled.returncode:
-            raise RuntimeError(compiled.stderr.strip() or "Python compile validation failed")
 
-    focused_paths = [
-        relative
-        for relative in (
-            "tests/gateway/test_restart_resume_pending.py",
-            "tests/gateway/test_todo_progress.py",
-            "tests/gateway/test_run_progress_topics.py",
-            "tests/gateway/test_display_config.py",
-        )
-        if (candidate / relative).is_file()
-    ]
-    if focused_paths:
-        python = _find_pytest_python(source_repo)
-        if python is None:
-            raise RuntimeError("focused patch tests exist but no Python environment can import pytest")
-        tested = _run(
-            (str(python), "-m", "pytest", *focused_paths, "-q", "--tb=short"),
-            cwd=candidate,
-        )
-        if tested.returncode:
-            detail = tested.stdout[-8000:] + tested.stderr[-4000:]
-            raise RuntimeError(f"focused patch tests failed:\n{detail.strip()}")
+def _fetch_private(repo: Path, remote: str, upstream_branch: str, run_id: str) -> tuple[str, str]:
+    ref = f"refs/hermes-maintenance/fetches/{run_id}/upstream"
+    result = _git(
+        repo, "fetch", "--no-write-fetch-head", "--refmap=", remote,
+        f"refs/heads/{upstream_branch}:{ref}", check=False, timeout=300,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "upstream fetch failed")
+    return ref, _oid(repo, ref)
+
+
+def _check_merge(repo: Path, integration_oid: str, upstream_oid: str) -> None:
+    result = _git(repo, "merge-tree", "--write-tree", integration_oid, upstream_oid, check=False)
+    if result.returncode:
+        raise RuntimeError("upstream conflicts with diatche; refs and checkout were not changed")
 
 
 def _build_candidate(
-    repo: Path,
-    *,
-    integration_sha: str,
-    upstream_sha: str,
-    state_dir: Path,
-    candidate_ref: str,
-) -> str:
-    """Build and retain the exact tested merge without moving maintained branches."""
-    temp_root = Path(tempfile.mkdtemp(prefix="hermes-maintenance-candidate-", dir=state_dir))
-    candidate = temp_root / "worktree"
+    repo: Path, state_dir: Path, run_id: str, integration_oid: str, upstream_oid: str
+) -> tuple[str, str]:
+    candidate_ref = f"refs/hermes-maintenance/candidates/{run_id}"
+    root = Path(tempfile.mkdtemp(prefix=f"candidate-{run_id}-", dir=state_dir))
+    worktree = root / "worktree"
     added = False
     try:
-        _git(repo, "worktree", "add", "--detach", str(candidate), integration_sha)
+        _git(repo, "worktree", "add", "--detach", str(worktree), integration_oid, timeout=120)
         added = True
         merged = _git(
-            candidate,
-            "-c",
-            "user.name=Hermes Maintenance",
-            "-c",
-            "user.email=maintenance@localhost",
-            "merge",
-            "--no-ff",
-            "--no-edit",
-            upstream_sha,
-            check=False,
+            worktree, "-c", "user.name=Hermes Maintenance", "-c",
+            "user.email=maintenance@localhost", "merge", "--no-ff", "--no-edit",
+            upstream_oid, check=False, timeout=120,
         )
         if merged.returncode:
-            raise RuntimeError(merged.stdout.strip() or merged.stderr.strip() or "candidate merge failed")
-        candidate_sha = _rev_parse(candidate, "HEAD")
-        _validate_candidate(candidate, integration_sha, candidate_sha, source_repo=repo)
-        published = _git(
-            repo,
-            "update-ref",
-            candidate_ref,
-            candidate_sha,
-            "0" * 40,
-            check=False,
-        )
-        if published.returncode:
-            raise RuntimeError(f"candidate ref already exists or moved: {candidate_ref}")
+            raise RuntimeError("isolated candidate merge failed")
+        candidate_oid = _oid(worktree, "HEAD")
+        checked = _git(worktree, "diff", "--check", f"{integration_oid}..{candidate_oid}", check=False)
+        if checked.returncode:
+            raise RuntimeError("candidate failed git diff --check")
+        created = _git(repo, "update-ref", candidate_ref, candidate_oid, ZERO_OID, check=False)
+        if created.returncode:
+            raise RuntimeError("candidate ref creation compare-and-swap failed")
+        return candidate_ref, candidate_oid
     finally:
         if added:
-            _git(repo, "worktree", "remove", "--force", str(candidate))
-        shutil.rmtree(temp_root)
-    if _rev_parse(repo, candidate_ref) != candidate_sha:
-        raise RuntimeError("candidate ref does not resolve to the tested commit")
-    return candidate_sha
+            _git(repo, "worktree", "remove", "--force", str(worktree), check=False, timeout=60)
+        shutil.rmtree(root, ignore_errors=True)
 
 
-def _promote_candidate(
-    repo: Path,
-    *,
-    integration_branch: str,
-    integration_before: str,
-    upstream_branch: str,
-    upstream_ref: str,
-    upstream_sha: str,
-    candidate_ref: str,
-    candidate_sha: str,
-) -> None:
-    commands = "\n".join(
-        (
-            "start",
-            f"verify refs/heads/{upstream_branch} {upstream_sha}",
-            f"verify refs/remotes/{upstream_ref} {upstream_sha}",
-            f"verify {candidate_ref} {candidate_sha}",
-            f"update refs/heads/{integration_branch} {candidate_sha} {integration_before}",
-            "prepare",
-            "commit",
-            "",
-        )
+def _update_ref_transaction(repo: Path, commands: list[str]) -> None:
+    body = "\n".join(["start", *commands, "prepare", "commit", ""])
+    result = subprocess.run(
+        ("git", "update-ref", "--stdin"), cwd=repo, input=body,
+        text=True, capture_output=True, check=False, timeout=30,
     )
-    promoted = subprocess.run(
-        ("git", "update-ref", "--stdin"),
-        cwd=repo,
-        input=commands,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if promoted.returncode:
-        detail = promoted.stderr.strip() or promoted.stdout.strip()
+    if result.returncode:
         raise RuntimeError(
-            f"could not atomically verify refs and promote tested candidate to {integration_branch}: {detail}"
+            "ref compare-and-swap transaction failed: "
+            + (result.stderr.strip() or result.stdout.strip())
         )
 
 
-def _restore_checkout_exact(repo: Path, branch: str, expected_sha: str) -> None:
-    _assert_no_git_operation(repo)
-    switched = _git(repo, "switch", branch, check=False)
+def _publish_refs(
+    repo: Path, *, main_old: str, main_new: str, integration_branch: str,
+    integration_old: str, integration_new: str,
+) -> None:
+    _update_ref_transaction(repo, [
+        f"update refs/heads/main {main_new} {main_old}",
+        f"update refs/heads/{integration_branch} {integration_new} {integration_old}",
+    ])
+
+
+def _restore_refs(
+    repo: Path, *, main_old: str, main_new: str, integration_branch: str,
+    integration_old: str, integration_new: str,
+) -> None:
+    current_main = _oid(repo, "refs/heads/main")
+    current_integration = _oid(repo, f"refs/heads/{integration_branch}")
+    if current_main == main_old and current_integration == integration_old:
+        return
+    if current_main != main_new or current_integration != integration_new:
+        raise RuntimeError("cannot recover after concurrent ref movement")
+    _update_ref_transaction(repo, [
+        f"update refs/heads/main {main_old} {main_new}",
+        f"update refs/heads/{integration_branch} {integration_old} {integration_new}",
+    ])
+
+
+def _restore_checkout(repo: Path, integration_branch: str, expected_oid: str) -> None:
+    switched = _git(repo, "switch", integration_branch, check=False)
     if switched.returncode:
-        raise RuntimeError(switched.stderr.strip() or f"could not switch to {branch}")
-    current = _git(repo, "branch", "--show-current").stdout.strip()
-    head = _rev_parse(repo, "HEAD")
-    branch_sha = _rev_parse(repo, branch)
-    if current != branch or head != expected_sha or branch_sha != expected_sha:
-        raise RuntimeError(
-            f"refusing runtime start: expected {branch}@{expected_sha}, got {current or 'detached'}@{head}"
-        )
-    if _git(repo, "status", "--porcelain").stdout.strip():
-        raise RuntimeError("refusing runtime start from a dirty checkout")
-    _assert_no_git_operation(repo)
+        raise RuntimeError("could not restore integration checkout")
+    reset = _git(repo, "reset", "--hard", expected_oid, check=False)
+    if reset.returncode:
+        raise RuntimeError("could not restore integration checkout files")
+    _assert_checkout(repo, integration_branch)
+    if _oid(repo, "HEAD") != expected_oid or _oid(repo, f"refs/heads/{integration_branch}") != expected_oid:
+        raise RuntimeError("restored checkout identity does not match the expected OID")
 
 
-def _validate_config(hermes: Path, repo: Path) -> None:
-    checked = _run((str(hermes), "config", "check"), cwd=repo)
-    if checked.returncode:
-        detail = checked.stderr.strip() or checked.stdout.strip()
-        raise RuntimeError(f"Hermes config validation failed: {detail}")
+def _journal_payload(
+    repo: Path, run_id: str, main_old: str, integration_old: str,
+    main_new: str, integration_new: str, phase: str, *, owner_pid: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "version": 2, "run_id": run_id, "repo": str(repo.resolve()),
+        "common_git_dir": str(_common_git_dir(repo)), "integration_branch": "diatche",
+        "main_ref": "refs/heads/main", "integration_ref": "refs/heads/diatche",
+        "main_old": main_old, "integration_old": integration_old,
+        "main_new": main_new, "integration_new": integration_new,
+        "phase": phase, "owner_pid": os.getpid() if owner_pid is None else owner_pid,
+        "updated_at": _now(),
+    }
 
 
-def _validate_runtime_dependencies(repo: Path) -> None:
-    """Validate offline-safe runtime pieces while the gateway is stopped."""
-    python = repo / "venv" / "bin" / "python"
-    if not python.is_file():
-        raise RuntimeError(f"gateway Python is missing after update: {python}")
-    imported = _run(
-        (
-            str(python),
-            "-c",
-            "import gateway.run; import huggingface_hub, transformers, sentence_transformers",
-        ),
-        cwd=repo,
-        timeout=60,
-    )
-    if imported.returncode:
-        detail = imported.stderr.strip() or imported.stdout.strip()
-        raise RuntimeError(f"post-update runtime imports failed: {detail}")
-
-    hindsight = repo / "venv" / "bin" / "hindsight-embed"
-    if not hindsight.is_file():
-        raise RuntimeError(f"Hindsight recall executable is missing after update: {hindsight}")
-    try:
-        recalled = _run(
-            (
-                str(hindsight),
-                "-p",
-                "hermes",
-                "memory",
-                "recall",
-                "hermes",
-                "Hermes post-upgrade health probe",
-            ),
-            cwd=repo,
-            timeout=60,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("real Hindsight recall timed out after 60 seconds") from exc
-    if recalled.returncode:
-        raise RuntimeError(f"real Hindsight recall failed (exit {recalled.returncode})")
+def _validate_journal(payload: Any, repo: Path, run_id: str) -> dict[str, Any]:
+    if not isinstance(payload, dict) or payload.get("version") != 2:
+        raise RuntimeError("malformed recovery journal")
+    required = {
+        "run_id", "repo", "common_git_dir", "integration_branch", "main_ref",
+        "integration_ref", "main_old", "integration_old", "main_new",
+        "integration_new", "phase", "owner_pid", "request_id", "drain_marker",
+    }
+    if not required.issubset(payload):
+        raise RuntimeError("malformed recovery journal")
+    if payload["run_id"] != run_id or payload["repo"] != str(repo.resolve()) or payload["common_git_dir"] != str(_common_git_dir(repo)):
+        raise RuntimeError("foreign recovery journal")
+    if payload["integration_branch"] != "diatche" or payload["main_ref"] != "refs/heads/main" or payload["integration_ref"] != "refs/heads/diatche":
+        raise RuntimeError("foreign recovery journal refs")
+    if not all(OID_RE.fullmatch(str(payload[key])) for key in ("main_old", "integration_old", "main_new", "integration_new")):
+        raise RuntimeError("malformed recovery journal OID")
+    if not RUN_ID_RE.fullmatch(str(payload["request_id"])):
+        raise RuntimeError("malformed recovery journal request id")
+    owner = payload["owner_pid"]
+    if type(owner) is not int or owner <= 0:
+        raise RuntimeError("malformed recovery journal owner")
+    if owner != os.getpid():
+        try:
+            os.kill(owner, 0)
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            raise RuntimeError("recovery journal has a current active owner") from exc
+        else:
+            raise RuntimeError("recovery journal has a current active owner")
+    if payload["phase"] in TERMINAL_PHASES:
+        raise RuntimeError("recovery journal is already terminal")
+    return payload
 
 
-def _validate_live_health(repo: Path, health_script: Path) -> None:
-    """Run topology-aware health only after the custom wrapper is running."""
-    if not health_script.is_file():
-        raise RuntimeError(f"mandatory post-update health script is missing: {health_script}")
-    python = repo / "venv" / "bin" / "python"
-    checked = _run(
-        (str(python), str(health_script), "--check-only", "--no-state", "--json"),
-        cwd=repo,
-        timeout=120,
-    )
-    if checked.returncode:
-        detail = checked.stdout.strip() or checked.stderr.strip()
-        raise RuntimeError(f"post-update live health check failed: {detail}")
-    try:
-        payload = json.loads(checked.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("post-update live health check did not return JSON") from exc
-    if payload.get("healthy") is not True:
-        raise RuntimeError(f"post-update live health check is unhealthy: {checked.stdout.strip()}")
+def _journal_path(state_dir: Path, run_id: str) -> Path:
+    if not RUN_ID_RE.fullmatch(run_id):
+        raise RuntimeError("invalid run id")
+    return state_dir / "runs" / f"{run_id}.json"
 
 
-def _start_and_validate_wrapper(
-    repo: Path,
-    wrapper: Path,
-    health_script: Path,
+def _write_journal(state_dir: Path, payload: dict[str, Any]) -> None:
+    _write_json(_journal_path(state_dir, str(payload["run_id"])), payload)
+    _write_json(state_dir / "state.json", payload)
+
+
+def _recover_payload(
+    payload: dict[str, Any], repo: Path, wrapper: Path, health_script: Path,
+    marker: Path, *, wrapper_timeout: float, health_timeout: float,
 ) -> None:
-    try:
-        restart_env = {**os.environ, "HERMES_MAINTENANCE_START_ALLOWED": "1"}
-        restarted = _run(
-            (str(wrapper), "--foreground"),
-            cwd=repo,
-            timeout=60,
-            env=restart_env,
+    if payload["drain_marker"] != str(marker.resolve()):
+        raise RuntimeError("foreign recovery journal drain marker")
+    request_id = str(payload["request_id"])
+    if marker.exists() and not _owned_marker(marker, request_id):
+        raise RuntimeError("drain marker is owned by another operation")
+
+    refs_are_original = (
+        _oid(repo, "refs/heads/main") == payload["main_old"]
+        and _oid(repo, "refs/heads/diatche") == payload["integration_old"]
+    )
+    wrapper_healthy = False
+    if refs_are_original:
+        try:
+            _assert_checkout(repo, "diatche")
+            if _oid(repo, "HEAD") != payload["integration_old"]:
+                raise RuntimeError("checkout is not at the original runtime")
+            _wrapper(wrapper, repo, "--status", wrapper_timeout)
+            _health(health_script, repo, health_timeout)
+            wrapper_healthy = True
+        except Exception:
+            wrapper_healthy = False
+
+    if not wrapper_healthy:
+        _restore_refs(
+            repo, main_old=payload["main_old"], main_new=payload["main_new"],
+            integration_branch="diatche", integration_old=payload["integration_old"],
+            integration_new=payload["integration_new"],
         )
-        if restarted.returncode:
-            raise RuntimeError(restarted.stderr.strip() or "wrapper restart failed")
-        verified = _run((str(wrapper), "--status"), cwd=repo, timeout=30)
-        if verified.returncode:
-            raise RuntimeError("wrapper status failed after restart")
-        _validate_live_health(repo, health_script)
-    except BaseException:
-        _run((str(wrapper), "--stop"), cwd=repo, check=False, timeout=45)
-        raise
+        _restore_checkout(repo, "diatche", payload["integration_old"])
+        _wrapper(
+            wrapper, repo, "--foreground", wrapper_timeout, maintenance_start=True
+        )
+        _wrapper(wrapper, repo, "--status", wrapper_timeout)
+        _health(health_script, repo, health_timeout)
+
+    if marker.exists() and not _remove_owned_marker(marker, request_id):
+        raise RuntimeError("could not remove owned drain marker after recovery")
 
 
 def _run_maintenance(args: argparse.Namespace) -> int:
-    repo = args.repo.expanduser().resolve()
-    state_dir = args.state_dir.expanduser().resolve()
-    upstream_ref = f"{args.remote}/{args.upstream_branch}"
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-    preupdate_candidate_ref = f"refs/hermes-maintenance/candidates/{run_id}/pre-update"
-    candidate_ref = f"refs/hermes-maintenance/candidates/{run_id}/post-update"
-    state: dict[str, Any] = {
-        "ok": False,
-        "phase": "preflight",
-        "run_id": run_id,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "repo": str(repo),
-        "candidate_ref": preupdate_candidate_ref,
-    }
+    repo, state_dir = args.repo.resolve(), args.state_dir.resolve()
+    run_id = uuid.uuid4().hex
+    request_id = uuid.uuid4().hex
+    marker = args.drain_marker.resolve()
+    journal: dict[str, Any] | None = None
+    marker_owned = False
     wrapper_stopped = False
-    integration_before = ""
-    runtime_sha = ""
-    queued_state = state_dir / "state.json"
-    lock_wait = 0.0
-    queued_token = ""
-    lifecycle_marker: Path | None = None
-    if queued_state.is_file():
-        try:
-            queued_payload = json.loads(queued_state.read_text(encoding="utf-8"))
-            if queued_payload.get("phase") == "queued":
-                lock_wait = 5.0
-                queued_token = str(queued_payload.get("queue_token") or "")
-        except (json.JSONDecodeError, OSError):
-            pass
+    wrapper_started = False
+    published = False
     try:
-        with _maintenance_signal_guard(), _exclusive_lock(state_dir, wait_seconds=lock_wait):
-            try:
-                lifecycle_marker = _claim_active_lifecycle(state_dir, run_id)
-                if queued_token:
-                    claimed = json.loads(queued_state.read_text(encoding="utf-8"))
-                    if claimed.get("phase") != "queued" or claimed.get("queue_token") != queued_token:
-                        raise RuntimeError("queued maintenance token changed before worker claim")
-                    state["queue_token"] = queued_token
-                    state["claimed_at"] = datetime.now(timezone.utc).isoformat()
-                    _write_state(state_dir, state)
-                _require_clean_integration_checkout(repo, args.integration_branch)
-                if not args.no_fetch:
-                    fetched = _git(repo, "fetch", args.remote, args.upstream_branch, check=False)
-                    if fetched.returncode:
-                        raise RuntimeError(fetched.stderr.strip() or "fetch failed")
-
-                integration_before = _rev_parse(repo, args.integration_branch)
-                runtime_sha = integration_before
-                main_before = _rev_parse(repo, args.upstream_branch)
-                upstream_sha = _rev_parse(repo, upstream_ref)
-                preflight = check_mergeability(
-                    repo,
-                    integration_branch=integration_before,
-                    upstream_ref=upstream_sha,
-                )
-                if not preflight["mergeable"]:
-                    raise RuntimeError(
-                        f"{args.integration_branch} conflicts with {upstream_ref}; no maintained refs were changed"
-                    )
-
-                wrapper = args.wrapperctl.expanduser().resolve()
-                hermes = args.hermes.expanduser().resolve()
-                health_script = args.health_script.expanduser().resolve()
-                if not health_script.is_file():
-                    raise RuntimeError(f"mandatory post-update health script is missing: {health_script}")
-                _validate_config(hermes, repo)
-                status = _run((str(wrapper), "--status"), cwd=repo, timeout=30)
-                if status.returncode:
-                    raise RuntimeError("custom Hermes wrapper is not healthy before maintenance")
-
-                state["phase"] = "validating-candidate"
-                backups = _create_backup_refs(repo, args.integration_branch, args.upstream_branch)
-                state.update(
-                    backup_refs=backups,
-                    integration_before=integration_before,
-                    main_before=main_before,
-                    upstream_sha=upstream_sha,
-                )
-                _write_state(state_dir, state)
-                candidate_sha = _build_candidate(
-                    repo,
-                    integration_sha=integration_before,
-                    upstream_sha=upstream_sha,
-                    state_dir=state_dir,
-                    candidate_ref=preupdate_candidate_ref,
-                )
-                state["candidate_sha"] = candidate_sha
-                _write_state(state_dir, state)
-
-                if _rev_parse(repo, args.integration_branch) != integration_before:
-                    raise RuntimeError(f"{args.integration_branch} moved during candidate validation")
-                if _rev_parse(repo, args.upstream_branch) != main_before:
-                    raise RuntimeError(f"{args.upstream_branch} moved during candidate validation")
-                if _rev_parse(repo, upstream_ref) != upstream_sha:
-                    raise RuntimeError("upstream moved before quiesce; run maintenance again")
-                if _rev_parse(repo, preupdate_candidate_ref) != candidate_sha:
-                    raise RuntimeError("candidate ref moved before quiesce")
-
-                state["phase"] = "updating"
-                _write_state(state_dir, state)
-                stopped = _run((str(wrapper), "--stop"), cwd=repo, timeout=45)
-                if stopped.returncode:
-                    raise RuntimeError(stopped.stderr.strip() or "could not quiesce Hermes wrapper")
-                wrapper_stopped = True
-                quiescent = _run(
-                    (str(wrapper), "--assert-update-quiescence"),
-                    cwd=repo,
-                    timeout=30,
-                )
-                if quiescent.returncode:
-                    raise RuntimeError(
-                        quiescent.stderr.strip()
-                        or "another Hermes gateway can interfere with the official updater"
-                    )
-
-                try:
-                    updated = _run(
-                        (
-                            str(hermes),
-                            "update",
-                            "--branch",
-                            args.upstream_branch,
-                            "--backup",
-                            "--yes",
-                            "--no-gateway-restart",
-                        ),
-                        cwd=repo,
-                        timeout=args.update_timeout,
-                    )
-                except subprocess.TimeoutExpired as exc:
-                    raise RuntimeError(f"hermes update timed out after {args.update_timeout} seconds") from exc
-                if updated.returncode:
-                    detail = updated.stderr.strip() or updated.stdout.strip()
-                    suffix = f": {detail}" if detail else ""
-                    raise RuntimeError(f"hermes update failed (exit {updated.returncode}){suffix}")
-                quiescent = _run(
-                    (str(wrapper), "--assert-update-quiescence"),
-                    cwd=repo,
-                    timeout=30,
-                )
-                if quiescent.returncode:
-                    raise RuntimeError(
-                        quiescent.stderr.strip()
-                        or "a gateway or restart actor appeared during the official update"
-                    )
-                exclusive = _run((str(wrapper), "--enforce-exclusivity"), cwd=repo, timeout=30)
-                if exclusive.returncode:
-                    raise RuntimeError("could not enforce custom-gateway exclusivity after update")
-
-                main_sha = _rev_parse(repo, args.upstream_branch)
-                current_upstream_sha = _rev_parse(repo, upstream_ref)
-                if main_sha != current_upstream_sha:
-                    raise RuntimeError(
-                        f"{args.upstream_branch} ({main_sha}) does not match {upstream_ref} ({current_upstream_sha})"
-                    )
-                candidate_sha = _build_candidate(
-                    repo,
-                    integration_sha=integration_before,
-                    upstream_sha=current_upstream_sha,
-                    state_dir=state_dir,
-                    candidate_ref=candidate_ref,
-                )
-                upstream_sha = current_upstream_sha
-                state.update(
-                    candidate_sha=candidate_sha,
-                    candidate_ref=candidate_ref,
-                    upstream_sha=upstream_sha,
-                )
-                _write_state(state_dir, state)
-
-                if _rev_parse(repo, args.upstream_branch) != upstream_sha:
-                    raise RuntimeError("main moved after candidate validation")
-                if _rev_parse(repo, upstream_ref) != upstream_sha:
-                    raise RuntimeError("upstream moved after candidate validation; run maintenance again")
-                if _rev_parse(repo, args.integration_branch) != integration_before:
-                    raise RuntimeError(f"{args.integration_branch} moved before candidate promotion")
-                if _rev_parse(repo, candidate_ref) != candidate_sha:
-                    raise RuntimeError("candidate ref moved before promotion")
-                _promote_candidate(
-                    repo,
-                    integration_branch=args.integration_branch,
-                    integration_before=integration_before,
-                    upstream_branch=args.upstream_branch,
-                    upstream_ref=upstream_ref,
-                    upstream_sha=upstream_sha,
-                    candidate_ref=candidate_ref,
-                    candidate_sha=candidate_sha,
-                )
-                runtime_sha = candidate_sha
-                _restore_checkout_exact(repo, args.integration_branch, candidate_sha)
-                if _git(
-                    repo,
-                    "merge-base",
-                    "--is-ancestor",
-                    upstream_sha,
-                    candidate_sha,
-                    check=False,
-                ).returncode:
-                    raise RuntimeError("tested candidate does not contain the installed upstream tip")
-                if _rev_parse(repo, candidate_ref) != candidate_sha:
-                    raise RuntimeError("promoted runtime no longer matches the retained tested candidate")
-                _validate_config(hermes, repo)
-                _validate_runtime_dependencies(repo)
-                if _rev_parse(repo, args.upstream_branch) != upstream_sha:
-                    raise RuntimeError("main moved before runtime restart")
-                if _rev_parse(repo, upstream_ref) != upstream_sha:
-                    raise RuntimeError("upstream moved before runtime restart; rerun maintenance")
-                _restore_checkout_exact(repo, args.integration_branch, candidate_sha)
-
-                state["phase"] = "restarting-wrapper"
-                _write_state(state_dir, state)
-                _start_and_validate_wrapper(repo, wrapper, health_script)
-                _restore_checkout_exact(repo, args.integration_branch, candidate_sha)
-                if (
-                    _rev_parse(repo, args.upstream_branch) != upstream_sha
-                    or _rev_parse(repo, upstream_ref) != upstream_sha
-                    or _rev_parse(repo, args.integration_branch) != candidate_sha
-                    or _rev_parse(repo, candidate_ref) != candidate_sha
-                ):
-                    _run((str(wrapper), "--stop"), cwd=repo, timeout=45)
-                    raise RuntimeError("repository refs moved during runtime restart; maintenance not complete")
-                wrapper_stopped = False
-
-                state.update(
-                    ok=True,
-                    phase="complete",
-                    completed_at=datetime.now(timezone.utc).isoformat(),
-                    wrapper_restored=True,
-                )
-                _write_state(state_dir, state)
-                lifecycle_marker.unlink(missing_ok=True)
-                lifecycle_marker = None
-                print(f"Hermes maintenance update complete on {args.integration_branch} at {candidate_sha[:12]}")
-                return 0
-            except Exception as exc:
-                state.update(
-                    ok=False,
-                    phase="failed",
-                    error=str(exc),
-                    completed_at=datetime.now(timezone.utc).isoformat(),
-                )
-                try:
-                    if wrapper_stopped:
-                        if not runtime_sha:
-                            raise RuntimeError("no validated runtime SHA is available for recovery")
-                        hermes = args.hermes.expanduser().resolve()
-                        wrapper = args.wrapperctl.expanduser().resolve()
-                        health_script = args.health_script.expanduser().resolve()
-                        _restore_checkout_exact(repo, args.integration_branch, runtime_sha)
-                        _validate_config(hermes, repo)
-                        _validate_runtime_dependencies(repo)
-                        _start_and_validate_wrapper(repo, wrapper, health_script)
-                        wrapper_stopped = False
-                        state["wrapper_restored"] = True
-                except Exception as recovery_exc:
-                    state["wrapper_restored"] = False
-                    state["recovery_error"] = str(recovery_exc)
-                _write_state(state_dir, state)
-                if lifecycle_marker is not None and not state.get("recovery_error"):
-                    lifecycle_marker.unlink(missing_ok=True)
-                    lifecycle_marker = None
-                print(f"ERROR: {exc}", file=sys.stderr)
-                if state.get("recovery_error"):
-                    print(f"RECOVERY ERROR: {state['recovery_error']}", file=sys.stderr)
-                return 1
-    except MaintenanceBusyError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
-
-
-def _maintenance_plist_payload(args: argparse.Namespace) -> dict[str, Any]:
-    installed = args.installed_script.expanduser().resolve()
-    repo = args.repo.expanduser().resolve()
-    state_dir = args.state_dir.expanduser().resolve()
-    logs = Path.home() / ".hermes" / "logs"
-    return {
-        "Label": MAINTENANCE_LABEL,
-        "ProgramArguments": [
-            str(installed),
-            "--run",
-            "--repo",
-            str(repo),
-            "--state-dir",
-            str(state_dir),
-        ],
-        "WorkingDirectory": str(repo),
-        "RunAtLoad": False,
-        "KeepAlive": False,
-        "ProcessType": "Background",
-        "StandardOutPath": str(logs / "hermes-maintenance-update.log"),
-        "StandardErrorPath": str(logs / "hermes-maintenance-update.error.log"),
-        "EnvironmentVariables": {
-            "HOME": str(Path.home()),
-            "HERMES_HOME": str(Path.home() / ".hermes"),
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        },
-    }
-
-
-def _fsync_directory(path: Path) -> None:
-    directory_fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-
-
-def _atomic_copy(source: Path, destination: Path, mode: int = 0o755) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.tmp")
-    shutil.copy2(source, temporary)
-    temporary.chmod(mode)
-    with temporary.open("rb") as handle:
-        os.fsync(handle.fileno())
-    os.replace(temporary, destination)
-    _fsync_directory(destination.parent)
-
-
-def _install_transaction_dir(args: argparse.Namespace) -> Path:
-    return args.state_dir.expanduser().resolve() / "install-transaction"
-
-
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-    directory_fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-
-
-def _recover_install_transaction(args: argparse.Namespace) -> None:
-    transaction = _install_transaction_dir(args)
-    journal_path = transaction / "journal.json"
-    if not journal_path.is_file():
-        if transaction.exists():
-            shutil.rmtree(transaction)
-        return
-    payload = json.loads(journal_path.read_text(encoding="utf-8"))
-    if payload.get("phase") == "complete":
-        shutil.rmtree(transaction)
-        return
-
-    repo = args.repo.expanduser().resolve()
-    service = str(payload["service"])
-    domain = str(payload["domain"])
-    errors: list[str] = []
-    _run(("launchctl", "bootout", service), cwd=repo, check=False)
-    for item in payload["items"]:
-        target = Path(item["target"])
-        try:
-            if item["existed"]:
-                backup = transaction / item["backup"]
-                if not backup.is_file():
-                    raise RuntimeError(f"backup is missing: {backup}")
-                _atomic_copy(backup, target, mode=int(item["mode"]))
-            else:
-                target.unlink(missing_ok=True)
-        except Exception as exc:
-            errors.append(f"could not restore {target}: {exc}")
-
-    if payload.get("was_loaded"):
-        plist = Path(payload["plist"])
-        restored = _run(("launchctl", "bootstrap", domain, str(plist)), cwd=repo)
-        verified = _run(("launchctl", "print", service), cwd=repo)
-        if restored.returncode or verified.returncode:
-            errors.append("previous maintenance LaunchAgent could not be restored")
-    elif _run(("launchctl", "print", service), cwd=repo).returncode == 0:
-        errors.append("replacement maintenance LaunchAgent remained loaded during rollback")
-    if errors:
-        raise RuntimeError("; ".join(errors))
-    shutil.rmtree(transaction)
-
-
-def _install_unlocked(args: argparse.Namespace) -> int:
-    installed = args.installed_script.expanduser().resolve()
-    plist = args.maintenance_plist.expanduser().resolve()
-    wrapperctl = args.wrapperctl.expanduser().resolve()
-    source = Path(__file__).resolve()
-    wrapper_source = source.with_name("restart-hermes-wrapper.sh")
-    args.state_dir.expanduser().resolve().mkdir(parents=True, exist_ok=True)
-    domain = f"gui/{os.getuid()}"
-    service = f"{domain}/{MAINTENANCE_LABEL}"
-    try:
-        _recover_install_transaction(args)
+        with _signal_guard(), _lock(state_dir):
+            _assert_checkout(repo, "diatche")
+            _wrapper(args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout)
+            main_old = _oid(repo, "refs/heads/main")
+            integration_old = _oid(repo, "refs/heads/diatche")
+            fetch_ref, upstream_oid = _fetch_private(repo, args.remote, args.upstream_branch, run_id)
+            _check_merge(repo, integration_old, upstream_oid)
+            candidate_ref, candidate_oid = _build_candidate(
+                repo, state_dir, run_id, integration_old, upstream_oid
+            )
+            journal = _journal_payload(
+                repo, run_id, main_old, integration_old, upstream_oid,
+                candidate_oid, "prepared",
+            )
+            journal.update(
+                fetch_ref=fetch_ref,
+                candidate_ref=candidate_ref,
+                request_id=request_id,
+                drain_marker=str(marker),
+            )
+            _write_journal(state_dir, journal)
+            journal["phase"] = "stopping"; journal["updated_at"] = _now(); _write_journal(state_dir, journal)
+            # Treat a stop attempt as potentially destructive even when the
+            # controller returns non-zero: it may have partially unloaded the
+            # supervisor. Recovery must therefore reassert the old wrapper.
+            wrapper_stopped = True
+            _wrapper(args.wrapperctl.resolve(), repo, "--force-stop", args.wrapper_timeout)
+            _wrapper(args.wrapperctl.resolve(), repo, "--assert-update-quiescence", args.wrapper_timeout)
+            journal["phase"] = "stopped"; journal["updated_at"] = _now(); _write_journal(state_dir, journal)
+            _publish_refs(
+                repo, main_old=main_old, main_new=upstream_oid,
+                integration_branch="diatche", integration_old=integration_old,
+                integration_new=candidate_oid,
+            )
+            published = True
+            journal["phase"] = "published"; journal["updated_at"] = _now(); _write_journal(state_dir, journal)
+            _restore_checkout(repo, "diatche", candidate_oid)
+            _wrapper(
+                args.wrapperctl.resolve(), repo, "--foreground",
+                args.wrapper_timeout, maintenance_start=True,
+            )
+            wrapper_started = True
+            _wrapper(args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout)
+            _health(args.health_script.resolve(), repo, args.health_timeout)
+            wrapper_stopped = False
+            _assert_checkout(repo, "diatche")
+            if _oid(repo, "HEAD") != candidate_oid:
+                raise RuntimeError("runtime checkout moved during startup")
+            journal.update(phase="complete", upstream_sha=upstream_oid, completed_at=_now(), updated_at=_now())
+            _write_journal(state_dir, journal)
+            print(f"Hermes maintenance complete at {candidate_oid[:12]}")
+            return 0
     except Exception as exc:
-        print(f"ERROR: could not recover interrupted prior install: {exc}", file=sys.stderr)
-        return 1
-    if not wrapper_source.is_file():
-        print(f"ERROR: wrapper controller source is missing: {wrapper_source}", file=sys.stderr)
-        return 2
-
-    installed.parent.mkdir(parents=True, exist_ok=True)
-    plist.parent.mkdir(parents=True, exist_ok=True)
-    (Path.home() / ".hermes" / "logs").mkdir(parents=True, exist_ok=True)
-
-    # Validate a complete replacement set before touching installed files.
-    with tempfile.TemporaryDirectory(
-        prefix="hermes-maintenance-install-",
-        dir=args.state_dir.expanduser().resolve(),
-    ) as staging_text:
-        staging = Path(staging_text)
-        staged_updater = staging / "hermes-maintenance-update"
-        staged_wrapper = staging / "hermes-gateway-wrapperctl"
-        staged_plist = staging / plist.name
-        shutil.copy2(source, staged_updater)
-        staged_updater.chmod(0o755)
-        shutil.copy2(wrapper_source, staged_wrapper)
-        staged_wrapper.chmod(0o755)
-        with staged_plist.open("wb") as handle:
-            plistlib.dump(_maintenance_plist_payload(args), handle, sort_keys=True)
-
-        checks = (
-            _run((sys.executable, "-m", "py_compile", str(staged_updater)), cwd=args.repo.expanduser().resolve()),
-            _run(("bash", "-n", str(staged_wrapper)), cwd=args.repo.expanduser().resolve()),
-            _run(("plutil", "-lint", str(staged_plist)), cwd=args.repo.expanduser().resolve()),
-        )
-        failed = next((result for result in checks if result.returncode), None)
-        if failed is not None:
-            print(failed.stderr.strip() or failed.stdout.strip(), file=sys.stderr)
-            return 1
-
-        targets = {
-            installed: staged_updater,
-            wrapperctl: staged_wrapper,
-            plist: staged_plist,
-        }
-        transaction = _install_transaction_dir(args)
-        transaction.mkdir(parents=True)
-        # Publish the rollback transaction directory durably before any installed
-        # target can be replaced, so a crash cannot lose the journal namespace.
-        _fsync_directory(transaction.parent)
-        backups = transaction / "backups"
-        backups.mkdir()
-        items: list[dict[str, Any]] = []
-        for index, target in enumerate(targets):
-            existed = target.exists()
-            mode = target.stat().st_mode & 0o777 if existed else 0o755
-            backup_name = f"backups/{index}"
-            if existed:
-                backup_path = transaction / backup_name
-                shutil.copy2(target, backup_path)
-                with backup_path.open("rb") as handle:
-                    os.fsync(handle.fileno())
-            items.append(
-                {
-                    "target": str(target),
-                    "existed": existed,
-                    "mode": mode,
-                    "backup": backup_name,
-                }
-            )
-
-        backups_fd = os.open(backups, os.O_RDONLY)
-        try:
-            os.fsync(backups_fd)
-        finally:
-            os.close(backups_fd)
-        was_loaded = (
-            _run(("launchctl", "print", service), cwd=args.repo.expanduser().resolve()).returncode == 0
-        )
-        journal_path = transaction / "journal.json"
-        journal: dict[str, Any] = {
-            "phase": "prepared",
-            "domain": domain,
-            "service": service,
-            "plist": str(plist),
-            "was_loaded": was_loaded,
-            "items": items,
-        }
-        _write_json_atomic(journal_path, journal)
-        try:
-            for target, staged in targets.items():
-                _atomic_copy(staged, target)
-            journal["phase"] = "files-replaced"
-            _write_json_atomic(journal_path, journal)
-            if args.no_load:
-                journal["phase"] = "complete"
-                _write_json_atomic(journal_path, journal)
-                shutil.rmtree(transaction)
-                print(f"Installed without loading LaunchAgent: {installed}")
-                return 0
-
-            _run(("launchctl", "bootout", service), cwd=args.repo.expanduser().resolve(), check=False)
-            journal["phase"] = "old-job-stopped"
-            _write_json_atomic(journal_path, journal)
-            loaded = _run(("launchctl", "bootstrap", domain, str(plist)), cwd=args.repo.expanduser().resolve())
-            verified = _run(("launchctl", "print", service), cwd=args.repo.expanduser().resolve())
-            if loaded.returncode or verified.returncode:
-                detail = loaded.stderr.strip() or verified.stderr.strip() or "could not load maintenance LaunchAgent"
-                raise RuntimeError(detail)
-            journal["phase"] = "complete"
-            _write_json_atomic(journal_path, journal)
-            shutil.rmtree(transaction)
-        except BaseException as exc:
-            rollback_error = ""
+        recovery_error = ""
+        if marker_owned:
+            _remove_owned_marker(marker, request_id)
+        if journal is not None and (wrapper_stopped or published):
             try:
-                _recover_install_transaction(args)
-            except Exception as recovery_exc:
-                rollback_error = f"; rollback remains journaled and failed: {recovery_exc}"
-            if rollback_error:
-                message = f"ERROR: install failed; rollback was attempted: {exc}{rollback_error}"
-            else:
-                message = f"ERROR: install failed and prior files were restored: {exc}"
-            print(message, file=sys.stderr)
-            return 1
-
-    print(f"Installed: {installed}")
-    print(f"Loaded one-shot LaunchAgent: {domain}/{MAINTENANCE_LABEL}")
-    return 0
-
-
-def _install(args: argparse.Namespace) -> int:
-    try:
-        with _maintenance_signal_guard(), _exclusive_lock(args.state_dir.expanduser().resolve()):
-            _assert_no_active_lifecycle(args.state_dir.expanduser().resolve())
-            return _install_unlocked(args)
-    except MaintenanceBusyError as exc:
-        print(f"ERROR: cannot install while maintenance is active: {exc}", file=sys.stderr)
-        return 1
-
-
-def _detach(args: argparse.Namespace) -> int:
-    repo = args.repo.expanduser().resolve()
-    try:
-        _require_clean_integration_checkout(repo, args.integration_branch)
-    except RuntimeError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
-    domain = f"gui/{os.getuid()}"
-    service = f"{domain}/{MAINTENANCE_LABEL}"
-    if _run(("launchctl", "print", service), cwd=repo).returncode:
-        print(f"ERROR: maintenance LaunchAgent is not loaded; run {Path(__file__).name} --install", file=sys.stderr)
-        return 1
-    try:
-        state_dir = args.state_dir.expanduser().resolve()
-        with _exclusive_lock(state_dir):
-            _assert_no_active_lifecycle(state_dir)
-            state_path = state_dir / "state.json"
-            if state_path.is_file():
-                try:
-                    existing = json.loads(state_path.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    existing = {}
-                if existing.get("phase") in {
-                    "queued",
-                    "preflight",
-                    "validating-candidate",
-                    "updating",
-                    "restarting-wrapper",
-                }:
-                    raise MaintenanceBusyError(
-                        f"maintenance is already {existing.get('phase')}"
+                if wrapper_started:
+                    _wrapper(args.wrapperctl.resolve(), repo, "--force-stop", args.wrapper_timeout)
+                if published:
+                    _restore_refs(
+                        repo, main_old=journal["main_old"], main_new=journal["main_new"],
+                        integration_branch="diatche", integration_old=journal["integration_old"],
+                        integration_new=journal["integration_new"],
                     )
-            queue_token = uuid.uuid4().hex
-            _write_state(
-                state_dir,
-                {
-                    "ok": False,
-                    "phase": "queued",
-                    "queue_token": queue_token,
-                    "queued_at": datetime.now(timezone.utc).isoformat(),
-                    "repo": str(repo),
-                },
+                _restore_checkout(repo, "diatche", journal["integration_old"])
+                _wrapper(
+                    args.wrapperctl.resolve(), repo, "--foreground",
+                    args.wrapper_timeout, maintenance_start=True,
+                )
+                _wrapper(args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout)
+                _health(args.health_script.resolve(), repo, args.health_timeout)
+                wrapper_stopped = False
+                journal["recovered"] = True
+            except Exception as recovery_exc:
+                recovery_error = str(recovery_exc)
+        if journal is not None:
+            journal.update(phase="failed", error=str(exc), recovery_error=recovery_error, updated_at=_now())
+            _write_journal(state_dir, journal)
+        print(f"ERROR: {exc}", file=sys.stderr)
+        if recovery_error:
+            print(f"RECOVERY ERROR: {recovery_error}", file=sys.stderr)
+        return 1
+
+
+def _recover(args: argparse.Namespace) -> int:
+    repo, state_dir = args.repo.resolve(), args.state_dir.resolve()
+    try:
+        with _lock(state_dir):
+            run_id = args.run_id
+            if not run_id:
+                candidates: list[str] = []
+                for path in (state_dir / "runs").glob("*.json"):
+                    if not RUN_ID_RE.fullmatch(path.stem):
+                        continue
+                    try:
+                        payload = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if isinstance(payload, dict) and payload.get("phase") not in TERMINAL_PHASES:
+                        candidates.append(path.stem)
+                if len(candidates) != 1:
+                    raise RuntimeError("--recover requires --run-id when there is not exactly one interrupted run")
+                run_id = candidates[0]
+            path = _journal_path(state_dir, run_id)
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError("malformed or missing recovery journal") from exc
+            payload = _validate_journal(raw, repo, run_id)
+            _recover_payload(
+                payload, repo, args.wrapperctl.resolve(), args.health_script.resolve(),
+                wrapper_timeout=args.wrapper_timeout, health_timeout=args.health_timeout,
             )
-    except MaintenanceBusyError as exc:
+            payload.update(phase="recovered", recovered_at=_now(), updated_at=_now(), owner_pid=os.getpid())
+            _write_journal(state_dir, payload)
+            print(f"Recovered maintenance run {run_id}")
+            return 0
+    except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    started = _run(("launchctl", "kickstart", service), cwd=repo, timeout=15)
-    if started.returncode:
-        _write_state(
-            state_dir,
-            {
-                "ok": False,
-                "phase": "failed",
-                "queue_token": queue_token,
-                "error": started.stderr.strip() or "could not start maintenance job",
-            },
-        )
-        print(started.stderr.strip() or "ERROR: could not start maintenance job", file=sys.stderr)
+
+
+def _check(args: argparse.Namespace) -> int:
+    repo = args.repo.resolve()
+    try:
+        _assert_checkout(repo, "diatche")
+        integration = _oid(repo, "refs/heads/diatche")
+        if args.no_fetch:
+            upstream = _oid(repo, f"refs/heads/{args.upstream_branch}")
+            fetch_ref = ""
+        else:
+            run_id = "check-" + uuid.uuid4().hex
+            fetch_ref, upstream = _fetch_private(repo, args.remote, args.upstream_branch, run_id)
+        _check_merge(repo, integration, upstream)
+        payload = {"ok": True, "mergeable": True, "integration_sha": integration,
+                   "upstream_sha": upstream, "fetch_ref": fetch_ref}
+        print(json.dumps(payload, indent=2, sort_keys=True) if args.json else "OK: mergeable")
+        return 0
+    except Exception as exc:
+        payload = {"ok": False, "mergeable": False, "error": str(exc)}
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(f"BLOCKED: {exc}", file=sys.stderr)
         return 1
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline:
-        try:
-            claimed = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            claimed = {}
-        if claimed.get("queue_token") != queue_token:
-            print("ERROR: queued maintenance token was replaced before claim", file=sys.stderr)
-            return 1
-        phase = str(claimed.get("phase") or "")
-        if phase == "failed":
-            detail = str(claimed.get("error") or "maintenance worker failed after claiming the queue")
-            print(f"ERROR: {detail}", file=sys.stderr)
-            return 1
-        if claimed.get("claimed_at") and phase in {
-            "preflight",
-            "validating-candidate",
-            "updating",
-            "restarting-wrapper",
-            "complete",
-        }:
-            break
-        time.sleep(0.1)
-    else:
-        print("ERROR: maintenance worker did not acknowledge the queued token", file=sys.stderr)
-        return 1
-    print("Hermes maintenance update queued in its independent LaunchAgent.")
-    print("The gateway will stop only after merge simulation and focused tests pass.")
-    return 0
 
 
 def _status(args: argparse.Namespace) -> int:
-    repo = args.repo.expanduser().resolve()
-    state_path = args.state_dir.expanduser().resolve() / "state.json"
-    if state_path.is_file():
-        print(state_path.read_text(encoding="utf-8").rstrip())
+    state = args.state_dir.resolve() / "state.json"
+    if state.is_file():
+        print(state.read_text(encoding="utf-8").rstrip())
     else:
         print("No maintenance run has been recorded.")
-    branch = _git(repo, "branch", "--show-current", check=False).stdout.strip()
-    main_sha = _rev_parse(repo, args.upstream_branch)
-    upstream_ref = f"{args.remote}/{args.upstream_branch}"
-    upstream_sha = _rev_parse(repo, upstream_ref)
-    contains = _git(
-        repo,
-        "merge-base",
-        "--is-ancestor",
-        upstream_sha,
-        args.integration_branch,
-        check=False,
-    ).returncode == 0
-    print(f"checkout_branch: {branch or 'detached HEAD'}")
-    print(f"main_matches_upstream: {main_sha == upstream_sha}")
-    print(f"{args.integration_branch}_contains_upstream: {contains}")
     return 0
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=DEFAULT_REPO)
-    parser.add_argument("--integration-branch", default="diatche")
-    parser.add_argument("--upstream-branch", default="main")
+    parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
+    parser.add_argument("--wrapperctl", type=Path, default=DEFAULT_WRAPPERCTL)
+    parser.add_argument("--health-script", type=Path, default=DEFAULT_HEALTH_SCRIPT)
+    parser.add_argument("--drain-marker", type=Path, default=DEFAULT_DRAIN_MARKER)
+    parser.add_argument("--gateway-status", type=Path, default=DEFAULT_GATEWAY_STATUS)
     parser.add_argument("--remote", default="origin")
-    modes = parser.add_mutually_exclusive_group(required=True)
-    modes.add_argument("--check", action="store_true", help="read-only compatibility preflight")
-    modes.add_argument("--run", action="store_true", help="run maintenance in the foreground")
-    parser.add_argument("--no-fetch", action="store_true", help="do not refresh the remote ref")
+    parser.add_argument("--upstream-branch", default="main")
+    parser.add_argument("--drain-timeout", type=float, default=300)
+    parser.add_argument("--drain-interval", type=float, default=.25)
+    parser.add_argument("--sample-interval", type=float, default=.5)
+    parser.add_argument("--stable-drain-samples", type=int, default=3)
+    parser.add_argument("--wrapper-timeout", type=float, default=60)
+    parser.add_argument("--health-timeout", type=float, default=120)
+    parser.add_argument("--run-id")
     parser.add_argument("--json", action="store_true")
-    modes.add_argument("--install", action="store_true")
-    modes.add_argument("--detach", action="store_true")
+    parser.add_argument("--no-fetch", action="store_true")
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--run", action="store_true")
+    modes.add_argument("--recover", action="store_true")
+    modes.add_argument("--check", action="store_true")
     modes.add_argument("--status", action="store_true")
-    parser.add_argument("--no-load", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--update-timeout", type=int, default=1800, help=argparse.SUPPRESS)
-    parser.add_argument(
-        "--hermes",
-        type=Path,
-        default=DEFAULT_REPO / "venv" / "bin" / "hermes",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--wrapperctl",
-        type=Path,
-        default=DEFAULT_WRAPPERCTL,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--state-dir",
-        type=Path,
-        default=DEFAULT_STATE_DIR,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--health-script",
-        type=Path,
-        default=DEFAULT_HEALTH_SCRIPT,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--installed-script",
-        type=Path,
-        default=DEFAULT_INSTALLED_SCRIPT,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--maintenance-plist",
-        type=Path,
-        default=DEFAULT_MAINTENANCE_PLIST,
-        help=argparse.SUPPRESS,
-    )
+    modes.add_argument("--detach", action="store_true")
+    modes.add_argument("--install", action="store_true")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    args = _parser().parse_args(argv)
     repo = args.repo.expanduser().resolve()
-    if not (repo / ".git").exists():
+    args.repo = repo
+    if not _git(repo, "rev-parse", "--is-inside-work-tree", check=False).stdout.strip() == "true":
         print(f"ERROR: not a Git checkout: {repo}", file=sys.stderr)
         return 2
-
-    if args.check:
-        if not args.no_fetch:
-            fetch = _git(repo, "fetch", args.remote, args.upstream_branch, check=False)
-            if fetch.returncode:
-                print(fetch.stderr.strip() or "ERROR: fetch failed", file=sys.stderr)
-                return fetch.returncode or 1
-        result = check_mergeability(
-            repo,
-            integration_branch=args.integration_branch,
-            upstream_ref=f"{args.remote}/{args.upstream_branch}",
-        )
-        if args.json:
-            print(json.dumps(result, indent=2, sort_keys=True))
-        elif result["mergeable"]:
-            print(
-                f"OK: {args.integration_branch} can merge "
-                f"{args.remote}/{args.upstream_branch} cleanly"
-            )
-        else:
-            print(
-                f"BLOCKED: {args.integration_branch} conflicts with "
-                f"{args.remote}/{args.upstream_branch}",
-                file=sys.stderr,
-            )
-        return 0 if result["ok"] else 1
-
-    if args.run:
-        return _run_maintenance(args)
     if args.install:
-        return _install(args)
+        print("Installation is unsupported by the narrow maintenance command (no-op).")
+        return 0
     if args.detach:
-        return _detach(args)
+        print("Detached launch is unsupported by the narrow maintenance command (no-op).")
+        return 0
     if args.status:
         return _status(args)
-
-    print("ERROR: choose --check, --run, --install, --detach, or --status", file=sys.stderr)
-    return 2
+    if args.check:
+        return _check(args)
+    if args.recover:
+        return _recover(args)
+    return _run_maintenance(args)
 
 
 if __name__ == "__main__":

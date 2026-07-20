@@ -5,6 +5,7 @@
 #   scripts/restart-hermes-wrapper.sh --foreground  # restart now
 #   scripts/restart-hermes-wrapper.sh --detach      # delayed chat-safe restart
 #   scripts/restart-hermes-wrapper.sh --stop        # stop and verify unloaded
+#   scripts/restart-hermes-wrapper.sh --force-stop  # stop, then kill survivors
 #   scripts/restart-hermes-wrapper.sh --enforce-exclusivity
 #   scripts/restart-hermes-wrapper.sh --status      # read-only health/status
 #   scripts/restart-hermes-wrapper.sh --assert-update-quiescence
@@ -24,7 +25,7 @@ REPO="${HERMES_REPO:-$HOME/.hermes/hermes-agent}"
 MAINTENANCE_ACTIVE="${HERMES_MAINTENANCE_ACTIVE:-$HOME/.hermes/local/update/active.json}"
 
 usage() {
-  printf 'Usage: %s [--foreground|--detach|--stop|--enforce-exclusivity|--status|--assert-update-quiescence|--help]\n' "$0"
+  printf 'Usage: %s [--foreground|--detach|--stop|--force-stop|--enforce-exclusivity|--status|--assert-update-quiescence|--help]\n' "$0"
 }
 
 require_restart_permission() {
@@ -227,6 +228,32 @@ stop_foreground() {
   return 1
 }
 
+force_stop_foreground() {
+  if stop_foreground; then
+    return 0
+  fi
+  echo "Force-stopping surviving wrapper processes" >&2
+  local pid pids
+  pids="$(printf '%s\n%s\n' "$(wrapper_app_pids)" "$(listener_pids)" | awk 'NF && !seen[$0]++')"
+  for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
+  sleep 1
+  for pid in $pids; do kill -KILL "$pid" 2>/dev/null || true; done
+  launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
+  launchctl bootout "$DOMAIN" "$PLIST" >/dev/null 2>&1 || true
+  for _ in {1..10}; do
+    if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 \
+      && [[ -z "$(wrapper_app_pids)" ]] \
+      && [[ -z "$(listener_pids)" ]]; then
+      echo "Force-stopped and quiescent: $DOMAIN/$LABEL"
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "ERROR: wrapper processes survived forced stop" >&2
+  return 1
+}
+
+
 loaded_official_gateway_labels() {
   launchctl list 2>/dev/null | awk '$3 ~ /^ai[.]hermes[.]gateway($|-)/ { print $3 }'
 }
@@ -376,6 +403,7 @@ case "${1:---foreground}" in
   --foreground) restart_foreground ;;
   --detach) detach_restart ;;
   --stop) stop_foreground ;;
+  --force-stop) force_stop_foreground ;;
   --enforce-exclusivity) enforce_exclusivity ;;
   --assert-update-quiescence) assert_update_quiescence ;;
   --status) status ;;
