@@ -19737,6 +19737,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if bot is None or not hasattr(bot, "pin_chat_message"):
                         return
                     try:
+                        chat_id = int(source.chat_id)
+                        # The in-memory pointer is lost when the gateway restarts or
+                        # a turn stalls before cleanup. Telegram exposes the latest
+                        # pin via getChat, so peel off consecutive bot-authored todo
+                        # checklists in this topic while stopping at any user pin.
+                        # The text prefix deliberately identifies our checklist
+                        # without risking unrelated bot pins.
+                        seen_pins = set()
+                        if hasattr(bot, "get_chat"):
+                            while True:
+                                chat = await bot.get_chat(chat_id=chat_id)
+                                pinned_message = getattr(chat, "pinned_message", None)
+                                stale_message_id = getattr(pinned_message, "message_id", None)
+                                if stale_message_id is None or stale_message_id in seen_pins:
+                                    break
+                                seen_pins.add(stale_message_id)
+                                pinned_text = (
+                                    getattr(pinned_message, "text", None)
+                                    or getattr(pinned_message, "caption", None)
+                                    or ""
+                                )
+                                pinned_author = getattr(pinned_message, "from_user", None)
+                                pinned_thread_id = getattr(
+                                    pinned_message, "message_thread_id", None
+                                )
+                                if (
+                                    not pinned_text.startswith("Working on ")
+                                    or not getattr(pinned_author, "is_bot", False)
+                                    or str(pinned_thread_id or "")
+                                    != str(_progress_thread_id or "")
+                                ):
+                                    break
+                                unpinned = await bot.unpin_chat_message(
+                                    chat_id=chat_id,
+                                    message_id=stale_message_id,
+                                )
+                                if unpinned is False:
+                                    return
+                                if str(
+                                    self._pinned_todo_messages.get(_todo_pin_key)
+                                ) == str(stale_message_id):
+                                    self._pinned_todo_messages.pop(_todo_pin_key, None)
+
                         prior_message_id = self._pinned_todo_messages.get(_todo_pin_key)
                         if prior_message_id is not None and prior_message_id != message_id:
                             prior_telegram_message_id = (
@@ -19745,7 +19788,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 else prior_message_id
                             )
                             unpinned = await bot.unpin_chat_message(
-                                chat_id=int(source.chat_id),
+                                chat_id=chat_id,
                                 message_id=prior_telegram_message_id,
                             )
                             if unpinned is False:
