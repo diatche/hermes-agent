@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Narrow, crash-recoverable Git + wrapper maintenance transaction.
+"""Run the guarded foreground update for the local Hermes integration checkout.
 
-Usage: ``hermes-maintenance-update.py --run|--recover|--check|--status``.
-The command requests the gateway's existing external-drain protocol, fetches an
-immutable upstream tip into a private ref, creates a merge commit in an isolated
-worktree, and atomically publishes refs.  It never runs ``hermes update``, a
-general dependency update, a build, a backup, or profile/config/cache
-synchronization.  It does enforce the one compatibility constraint required by
-the configured local Hindsight embedding stack before starting the new runtime.
+This command replaces ``hermes update`` for Pavel's local branch/runtime model;
+it never invokes that broad updater. With no arguments, it fetches an immutable
+upstream tip, preflights and builds the merge in isolation, atomically publishes
+``main`` and ``diatche``, then restarts and health-checks the custom wrapper.
+``--check`` performs only the read-only checkout and merge preflight.
+Interrupted journals are recovered automatically.
 """
 from __future__ import annotations
 
@@ -15,14 +14,13 @@ import argparse
 import fcntl
 import json
 import os
-import plistlib
 import re
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
-import time
+
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -33,15 +31,7 @@ DEFAULT_REPO = Path.home() / ".hermes" / "hermes-agent"
 DEFAULT_STATE_DIR = Path.home() / ".hermes" / "local" / "update"
 DEFAULT_WRAPPERCTL = Path.home() / ".hermes" / "local" / "bin" / "hermes-gateway-wrapperctl"
 DEFAULT_HEALTH_SCRIPT = Path.home() / ".hermes" / "local" / "health" / "hermes_core_health.py"
-DEFAULT_DRAIN_MARKER = Path.home() / ".hermes" / ".drain_request.json"
-DEFAULT_GATEWAY_STATUS = Path.home() / ".hermes" / "gateway_state.json"
-MAINTENANCE_LABEL = "nz.diatche.hermes-maintenance-update"
-DEFAULT_INSTALLED_SCRIPT = (
-    Path.home() / ".hermes" / "local" / "bin" / "hermes-maintenance-update"
-)
-DEFAULT_MAINTENANCE_PLIST = (
-    Path.home() / "Library" / "LaunchAgents" / f"{MAINTENANCE_LABEL}.plist"
-)
+
 ZERO_OID = "0" * 40
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 OID_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -78,6 +68,11 @@ class MaintenanceInterruptedError(RuntimeError):
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _progress(message: str) -> None:
+    """Emit immediate operator feedback without polluting structured stdout."""
+    print(f"==> {message}", file=sys.stderr, flush=True)
 
 
 def _run(
@@ -270,86 +265,6 @@ def _ensure_hindsight_embeddings(repo: Path, timeout: float) -> None:
         )
 
 
-def _create_drain_marker(marker: Path, request_id: str) -> int:
-    """Create the external marker without adopting an existing request."""
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "action": "drain", "requested_at": _now(),
-        "principal": "hermes-maintenance", "request_id": request_id,
-        "suppress_notification": True,
-    }
-    try:
-        descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError as exc:
-        raise BusyError(f"drain marker already exists: {marker}") from exc
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    _fsync_dir(marker.parent)
-    return marker.stat().st_mtime_ns
-
-
-def _owned_marker(marker: Path, request_id: str) -> bool:
-    try:
-        payload = json.loads(marker.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return False
-    return isinstance(payload, dict) and payload.get("request_id") == request_id
-
-
-def _remove_owned_marker(marker: Path, request_id: str) -> bool:
-    if not _owned_marker(marker, request_id):
-        return False
-    # Re-read immediately before unlink; replacement by a cooperating writer is
-    # detected. Atomic ownership+unlink is not available for ordinary files.
-    if not _owned_marker(marker, request_id):
-        return False
-    marker.unlink()
-    _fsync_dir(marker.parent)
-    return True
-
-
-def _wait_for_drain(
-    marker: Path, status: Path, request_id: str, marker_mtime_ns: int,
-    *, timeout: float, interval: float, sample_interval: float,
-    stable_samples: int,
-) -> None:
-    deadline = time.monotonic() + timeout
-    stable: list[tuple[int, str]] = []
-    while time.monotonic() < deadline:
-        if not _owned_marker(marker, request_id):
-            raise RuntimeError("drain marker ownership was lost")
-        try:
-            stat = status.stat()
-            raw = status.read_text(encoding="utf-8")
-            payload = json.loads(raw)
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            stable.clear()
-            time.sleep(interval)
-            continue
-        signature = (stat.st_mtime_ns, raw)
-        fresh = stat.st_mtime_ns > marker_mtime_ns
-        valid = (
-            fresh and isinstance(payload, dict)
-            and payload.get("gateway_state") == "draining"
-            and type(payload.get("active_agents")) is int
-            and payload.get("active_agents") == 0
-        )
-        if valid and (not stable or signature != stable[-1]):
-            stable.append(signature)
-            if len(stable) >= stable_samples:
-                return
-            time.sleep(sample_interval)
-        else:
-            if not valid:
-                stable.clear()
-            time.sleep(interval)
-    raise RuntimeError(
-        f"drain timed out without {stable_samples} fresh acknowledged stable samples"
-    )
-
 
 def _fetch_private(repo: Path, remote: str, upstream_branch: str, run_id: str) -> tuple[str, str]:
     ref = f"refs/hermes-maintenance/fetches/{run_id}/upstream"
@@ -363,7 +278,13 @@ def _fetch_private(repo: Path, remote: str, upstream_branch: str, run_id: str) -
 
 
 def _check_merge(repo: Path, integration_oid: str, upstream_oid: str) -> None:
-    result = _git(repo, "merge-tree", "--write-tree", integration_oid, upstream_oid, check=False)
+    # merge-tree may leave harmless unreachable temporary objects, but it does
+    # not move refs or alter the checkout. Avoid a second disposable repository
+    # merely to isolate garbage that normal Git maintenance can reclaim.
+    result = _git(
+        repo, "merge-tree", "--write-tree", integration_oid, upstream_oid,
+        check=False,
+    )
     if result.returncode:
         raise RuntimeError("upstream conflicts with diatche; refs and checkout were not changed")
 
@@ -422,6 +343,21 @@ def _publish_refs(
     ])
 
 
+def _assert_pre_stop_snapshot(
+    repo: Path, *, main_oid: str, integration_oid: str, upstream_ref: str,
+    upstream_oid: str,
+) -> None:
+    _assert_checkout(repo, "diatche")
+    expected = (
+        ("refs/heads/main", main_oid),
+        ("refs/heads/diatche", integration_oid),
+        (upstream_ref, upstream_oid),
+    )
+    for ref, oid in expected:
+        if _oid(repo, ref) != oid:
+            raise RuntimeError(f"Git snapshot moved before stop: {ref}")
+
+
 def _restore_refs(
     repo: Path, *, main_old: str, main_new: str, integration_branch: str,
     integration_old: str, integration_new: str,
@@ -450,6 +386,27 @@ def _restore_checkout(repo: Path, integration_branch: str, expected_oid: str) ->
         raise RuntimeError("restored checkout identity does not match the expected OID")
 
 
+def _assert_transaction_checkout(
+    repo: Path, *, integration_old: str, integration_new: str,
+) -> None:
+    if _git(repo, "branch", "--show-current").stdout.strip() != "diatche":
+        raise RuntimeError("cannot recover after concurrent checkout movement")
+    if _oid(repo, "HEAD") != integration_new:
+        raise RuntimeError("cannot recover after concurrent checkout movement")
+    if _git(repo, "diff", "--quiet", check=False).returncode:
+        raise RuntimeError("cannot recover after concurrent checkout changes")
+    if _git(repo, "ls-files", "--others", "--exclude-standard").stdout.strip():
+        raise RuntimeError("cannot recover after concurrent checkout changes")
+    index_is_old = not _git(
+        repo, "diff", "--cached", "--quiet", integration_old, check=False
+    ).returncode
+    index_is_new = not _git(
+        repo, "diff", "--cached", "--quiet", integration_new, check=False
+    ).returncode
+    if not (index_is_old or index_is_new):
+        raise RuntimeError("cannot recover after concurrent index changes")
+
+
 def _journal_payload(
     repo: Path, run_id: str, main_old: str, integration_old: str,
     main_new: str, integration_new: str, phase: str, *, owner_pid: int | None = None,
@@ -471,7 +428,7 @@ def _validate_journal(payload: Any, repo: Path, run_id: str) -> dict[str, Any]:
     required = {
         "run_id", "repo", "common_git_dir", "integration_branch", "main_ref",
         "integration_ref", "main_old", "integration_old", "main_new",
-        "integration_new", "phase", "owner_pid", "request_id", "drain_marker",
+        "integration_new", "phase", "owner_pid",
     }
     if not required.issubset(payload):
         raise RuntimeError("malformed recovery journal")
@@ -481,8 +438,7 @@ def _validate_journal(payload: Any, repo: Path, run_id: str) -> dict[str, Any]:
         raise RuntimeError("foreign recovery journal refs")
     if not all(OID_RE.fullmatch(str(payload[key])) for key in ("main_old", "integration_old", "main_new", "integration_new")):
         raise RuntimeError("malformed recovery journal OID")
-    if not RUN_ID_RE.fullmatch(str(payload["request_id"])):
-        raise RuntimeError("malformed recovery journal request id")
+
     owner = payload["owner_pid"]
     if type(owner) is not int or owner <= 0:
         raise RuntimeError("malformed recovery journal owner")
@@ -513,14 +469,8 @@ def _write_journal(state_dir: Path, payload: dict[str, Any]) -> None:
 
 def _recover_payload(
     payload: dict[str, Any], repo: Path, wrapper: Path, health_script: Path,
-    marker: Path, *, wrapper_timeout: float, health_timeout: float,
+    *, wrapper_timeout: float, health_timeout: float,
 ) -> None:
-    if payload["drain_marker"] != str(marker.resolve()):
-        raise RuntimeError("foreign recovery journal drain marker")
-    request_id = str(payload["request_id"])
-    if marker.exists() and not _owned_marker(marker, request_id):
-        raise RuntimeError("drain marker is owned by another operation")
-
     refs_are_original = (
         _oid(repo, "refs/heads/main") == payload["main_old"]
         and _oid(repo, "refs/heads/diatche") == payload["integration_old"]
@@ -538,12 +488,26 @@ def _recover_payload(
             wrapper_healthy = False
 
     if not wrapper_healthy:
-        _restore_refs(
-            repo, main_old=payload["main_old"], main_new=payload["main_new"],
-            integration_branch="diatche", integration_old=payload["integration_old"],
-            integration_new=payload["integration_new"],
-        )
-        _restore_checkout(repo, "diatche", payload["integration_old"])
+        # A hard crash may have left a candidate runtime alive. Quiesce it
+        # before changing refs or checkout files underneath that process.
+        _wrapper(wrapper, repo, "--force-stop", wrapper_timeout)
+        if refs_are_original:
+            _assert_checkout(repo, "diatche")
+            if _oid(repo, "HEAD") != payload["integration_old"]:
+                raise RuntimeError("cannot recover after concurrent checkout movement")
+        else:
+            _assert_transaction_checkout(
+                repo,
+                integration_old=payload["integration_old"],
+                integration_new=payload["integration_new"],
+            )
+            _restore_refs(
+                repo, main_old=payload["main_old"], main_new=payload["main_new"],
+                integration_branch="diatche",
+                integration_old=payload["integration_old"],
+                integration_new=payload["integration_new"],
+            )
+            _restore_checkout(repo, "diatche", payload["integration_old"])
         _ensure_hindsight_embeddings(repo, health_timeout)
         _wrapper(
             wrapper, repo, "--foreground", wrapper_timeout, maintenance_start=True
@@ -551,101 +515,140 @@ def _recover_payload(
         _wrapper(wrapper, repo, "--status", wrapper_timeout)
         _health(health_script, repo, health_timeout)
 
-    if marker.exists() and not _remove_owned_marker(marker, request_id):
-        raise RuntimeError("could not remove owned drain marker after recovery")
-
-
-def _run_maintenance(args: argparse.Namespace) -> int:
-    repo, state_dir = args.repo.resolve(), args.state_dir.resolve()
-    run_id = uuid.uuid4().hex
-    request_id = uuid.uuid4().hex
-    marker = args.drain_marker.resolve()
+def _run_maintenance_locked(
+    args: argparse.Namespace, repo: Path, state_dir: Path, run_id: str,
+) -> int:
     journal: dict[str, Any] | None = None
-    marker_owned = False
     wrapper_stopped = False
     wrapper_started = False
     published = False
     try:
-        with _signal_guard(), _lock(state_dir):
-            _assert_checkout(repo, "diatche")
-            _wrapper(args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout)
-            main_old = _oid(repo, "refs/heads/main")
-            integration_old = _oid(repo, "refs/heads/diatche")
-            fetch_ref, upstream_oid = _fetch_private(repo, args.remote, args.upstream_branch, run_id)
-            _check_merge(repo, integration_old, upstream_oid)
-            candidate_ref, candidate_oid = _build_candidate(
-                repo, state_dir, run_id, integration_old, upstream_oid
-            )
-            journal = _journal_payload(
-                repo, run_id, main_old, integration_old, upstream_oid,
-                candidate_oid, "prepared",
-            )
-            journal.update(
-                fetch_ref=fetch_ref,
-                candidate_ref=candidate_ref,
-                request_id=request_id,
-                drain_marker=str(marker),
-            )
-            _write_journal(state_dir, journal)
-            journal["phase"] = "stopping"; journal["updated_at"] = _now(); _write_journal(state_dir, journal)
-            # Treat a stop attempt as potentially destructive even when the
-            # controller returns non-zero: it may have partially unloaded the
-            # supervisor. Recovery must therefore reassert the old wrapper.
-            wrapper_stopped = True
-            _wrapper(args.wrapperctl.resolve(), repo, "--force-stop", args.wrapper_timeout)
-            journal["phase"] = "stopped"; journal["updated_at"] = _now(); _write_journal(state_dir, journal)
-            _publish_refs(
-                repo, main_old=main_old, main_new=upstream_oid,
-                integration_branch="diatche", integration_old=integration_old,
-                integration_new=candidate_oid,
-            )
-            published = True
-            journal["phase"] = "published"; journal["updated_at"] = _now(); _write_journal(state_dir, journal)
-            _restore_checkout(repo, "diatche", candidate_oid)
-            _ensure_hindsight_embeddings(repo, args.health_timeout)
-            _wrapper(
-                args.wrapperctl.resolve(), repo, "--foreground",
-                args.wrapper_timeout, maintenance_start=True,
-            )
-            wrapper_started = True
-            _wrapper(args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout)
-            _health(args.health_script.resolve(), repo, args.health_timeout)
-            wrapper_stopped = False
-            _assert_checkout(repo, "diatche")
-            if _oid(repo, "HEAD") != candidate_oid:
-                raise RuntimeError("runtime checkout moved during startup")
-            journal.update(phase="complete", upstream_sha=upstream_oid, completed_at=_now(), updated_at=_now())
-            _write_journal(state_dir, journal)
-            print(f"Hermes maintenance complete at {candidate_oid[:12]}")
-            return 0
+        _progress("Checking for interrupted maintenance to recover")
+        _recover_interrupted(args, repo, state_dir)
+        _progress("Validating the diatche checkout and gateway wrapper")
+        _assert_checkout(repo, "diatche")
+        _wrapper(args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout)
+        main_old = _oid(repo, "refs/heads/main")
+        integration_old = _oid(repo, "refs/heads/diatche")
+        _progress(f"Fetching {args.remote}/{args.upstream_branch}")
+        fetch_ref, upstream_oid = _fetch_private(
+            repo, args.remote, args.upstream_branch, run_id
+        )
+        _progress("Checking mergeability without changing refs or checkout")
+        _check_merge(repo, integration_old, upstream_oid)
+        _progress("Building and validating the isolated merge candidate")
+        candidate_ref, candidate_oid = _build_candidate(
+            repo, state_dir, run_id, integration_old, upstream_oid
+        )
+        journal = _journal_payload(
+            repo, run_id, main_old, integration_old, upstream_oid,
+            candidate_oid, "prepared",
+        )
+        journal.update(fetch_ref=fetch_ref, candidate_ref=candidate_ref)
+        _write_journal(state_dir, journal)
+        _assert_pre_stop_snapshot(
+            repo,
+            main_oid=main_old,
+            integration_oid=integration_old,
+            upstream_ref=fetch_ref,
+            upstream_oid=upstream_oid,
+        )
+        journal.update(phase="stopping", updated_at=_now())
+        _write_journal(state_dir, journal)
+        # A failed stop may still have partially unloaded the supervisor.
+        wrapper_stopped = True
+        _progress("Stopping the custom Hermes gateway wrapper")
+        _wrapper(args.wrapperctl.resolve(), repo, "--force-stop", args.wrapper_timeout)
+        journal.update(phase="stopped", updated_at=_now())
+        _write_journal(state_dir, journal)
+        _progress("Publishing validated main and diatche refs atomically")
+        _publish_refs(
+            repo, main_old=main_old, main_new=upstream_oid,
+            integration_branch="diatche", integration_old=integration_old,
+            integration_new=candidate_oid,
+        )
+        published = True
+        journal.update(phase="published", updated_at=_now())
+        _write_journal(state_dir, journal)
+        _progress("Restoring the validated diatche checkout")
+        _restore_checkout(repo, "diatche", candidate_oid)
+        _progress("Checking Hindsight embedding compatibility")
+        _ensure_hindsight_embeddings(repo, args.health_timeout)
+        _progress("Starting the custom Hermes gateway wrapper")
+        _wrapper(
+            args.wrapperctl.resolve(), repo, "--foreground",
+            args.wrapper_timeout, maintenance_start=True,
+        )
+        wrapper_started = True
+        _progress("Verifying wrapper ownership and live Hermes health")
+        _wrapper(args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout)
+        _health(args.health_script.resolve(), repo, args.health_timeout)
+        wrapper_stopped = False
+        _assert_checkout(repo, "diatche")
+        if _oid(repo, "HEAD") != candidate_oid:
+            raise RuntimeError("runtime checkout moved during startup")
+        journal.update(
+            phase="complete", upstream_sha=upstream_oid,
+            completed_at=_now(), updated_at=_now(),
+        )
+        _write_journal(state_dir, journal)
+        print(f"Hermes maintenance complete at {candidate_oid[:12]}")
+        return 0
     except Exception as exc:
         recovery_error = ""
-        if marker_owned:
-            _remove_owned_marker(marker, request_id)
         if journal is not None and (wrapper_stopped or published):
             try:
+                _progress("Update failed after gateway interruption; recovering the previous runtime")
                 if wrapper_started:
-                    _wrapper(args.wrapperctl.resolve(), repo, "--force-stop", args.wrapper_timeout)
+                    _wrapper(
+                        args.wrapperctl.resolve(), repo, "--force-stop",
+                        args.wrapper_timeout,
+                    )
                 if published:
-                    _restore_refs(
-                        repo, main_old=journal["main_old"], main_new=journal["main_new"],
-                        integration_branch="diatche", integration_old=journal["integration_old"],
+                    _assert_transaction_checkout(
+                        repo,
+                        integration_old=journal["integration_old"],
                         integration_new=journal["integration_new"],
                     )
-                _restore_checkout(repo, "diatche", journal["integration_old"])
+                    _restore_refs(
+                        repo, main_old=journal["main_old"],
+                        main_new=journal["main_new"],
+                        integration_branch="diatche",
+                        integration_old=journal["integration_old"],
+                        integration_new=journal["integration_new"],
+                    )
+                    _restore_checkout(repo, "diatche", journal["integration_old"])
+                else:
+                    if (
+                        _oid(repo, "refs/heads/main") != journal["main_old"]
+                        or _oid(repo, "refs/heads/diatche")
+                        != journal["integration_old"]
+                    ):
+                        raise RuntimeError("cannot recover after concurrent ref movement")
+                    _assert_checkout(repo, "diatche")
+                    if _oid(repo, "HEAD") != journal["integration_old"]:
+                        raise RuntimeError(
+                            "cannot recover after concurrent checkout movement"
+                        )
                 _ensure_hindsight_embeddings(repo, args.health_timeout)
                 _wrapper(
                     args.wrapperctl.resolve(), repo, "--foreground",
                     args.wrapper_timeout, maintenance_start=True,
                 )
-                _wrapper(args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout)
+                _wrapper(
+                    args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout
+                )
                 _health(args.health_script.resolve(), repo, args.health_timeout)
                 wrapper_stopped = False
                 journal["recovered"] = True
+                _progress("Previous Hermes runtime recovered and healthy")
             except Exception as recovery_exc:
                 recovery_error = str(recovery_exc)
         if journal is not None:
-            journal.update(phase="failed", error=str(exc), recovery_error=recovery_error, updated_at=_now())
+            journal.update(
+                phase="failed", error=str(exc), recovery_error=recovery_error,
+                updated_at=_now(),
+            )
             _write_journal(state_dir, journal)
         print(f"ERROR: {exc}", file=sys.stderr)
         if recovery_error:
@@ -653,42 +656,49 @@ def _run_maintenance(args: argparse.Namespace) -> int:
         return 1
 
 
-def _recover(args: argparse.Namespace) -> int:
+def _run_maintenance(args: argparse.Namespace) -> int:
     repo, state_dir = args.repo.resolve(), args.state_dir.resolve()
+    with _signal_guard(), _lock(state_dir):
+        return _run_maintenance_locked(args, repo, state_dir, uuid.uuid4().hex)
+
+
+def _recover_interrupted(
+    args: argparse.Namespace, repo: Path, state_dir: Path
+) -> None:
+    """Recover only the latest state pointer; run files are historical records."""
+    state = state_dir / "state.json"
+    if not state.exists():
+        return
     try:
-        with _lock(state_dir):
-            run_id = args.run_id
-            if not run_id:
-                candidates: list[str] = []
-                for path in (state_dir / "runs").glob("*.json"):
-                    if not RUN_ID_RE.fullmatch(path.stem):
-                        continue
-                    try:
-                        payload = json.loads(path.read_text(encoding="utf-8"))
-                    except (OSError, json.JSONDecodeError):
-                        continue
-                    if isinstance(payload, dict) and payload.get("phase") not in TERMINAL_PHASES:
-                        candidates.append(path.stem)
-                if len(candidates) != 1:
-                    raise RuntimeError("--recover requires --run-id when there is not exactly one interrupted run")
-                run_id = candidates[0]
-            path = _journal_path(state_dir, run_id)
-            try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError("malformed or missing recovery journal") from exc
-            payload = _validate_journal(raw, repo, run_id)
-            _recover_payload(
-                payload, repo, args.wrapperctl.resolve(), args.health_script.resolve(),
-                wrapper_timeout=args.wrapper_timeout, health_timeout=args.health_timeout,
-            )
-            payload.update(phase="recovered", recovered_at=_now(), updated_at=_now(), owner_pid=os.getpid())
-            _write_journal(state_dir, payload)
-            print(f"Recovered maintenance run {run_id}")
-            return 0
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+        raw = json.loads(state.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("malformed current maintenance journal") from exc
+    terminal = isinstance(raw, dict) and (
+        raw.get("phase") in TERMINAL_PHASES
+        or (raw.get("phase") == "failed" and raw.get("recovered") is True)
+    )
+    if terminal:
+        return
+    if not isinstance(raw, dict) or not RUN_ID_RE.fullmatch(str(raw.get("run_id", ""))):
+        raise RuntimeError("malformed current maintenance journal")
+    run_id = str(raw["run_id"])
+    payload = _validate_journal(raw, repo, run_id)
+    _recover_payload(
+        payload,
+        repo,
+        args.wrapperctl.resolve(),
+        args.health_script.resolve(),
+        wrapper_timeout=args.wrapper_timeout,
+        health_timeout=args.health_timeout,
+    )
+    payload.update(
+        phase="recovered",
+        recovered_at=_now(),
+        updated_at=_now(),
+        owner_pid=os.getpid(),
+    )
+    _write_journal(state_dir, payload)
+    print(f"Recovered interrupted maintenance run {run_id}")
 
 
 def _check(args: argparse.Namespace) -> int:
@@ -696,15 +706,12 @@ def _check(args: argparse.Namespace) -> int:
     try:
         _assert_checkout(repo, "diatche")
         integration = _oid(repo, "refs/heads/diatche")
-        if args.no_fetch:
-            upstream = _oid(repo, f"refs/heads/{args.upstream_branch}")
-            fetch_ref = ""
-        else:
-            run_id = "check-" + uuid.uuid4().hex
-            fetch_ref, upstream = _fetch_private(repo, args.remote, args.upstream_branch, run_id)
+        upstream = _oid(
+            repo, f"refs/remotes/{args.remote}/{args.upstream_branch}"
+        )
         _check_merge(repo, integration, upstream)
         payload = {"ok": True, "mergeable": True, "integration_sha": integration,
-                   "upstream_sha": upstream, "fetch_ref": fetch_ref}
+                   "upstream_sha": upstream}
         print(json.dumps(payload, indent=2, sort_keys=True) if args.json else "OK: mergeable")
         return 0
     except Exception as exc:
@@ -716,64 +723,19 @@ def _check(args: argparse.Namespace) -> int:
         return 1
 
 
-def _status(args: argparse.Namespace) -> int:
-    state = args.state_dir.resolve() / "state.json"
-    if state.is_file():
-        print(state.read_text(encoding="utf-8").rstrip())
-    else:
-        print("No maintenance run has been recorded.")
-    return 0
-
-
-def _detach(args: argparse.Namespace) -> int:
-    """Queue the already-loaded one-shot LaunchAgent without running inline."""
-    state_dir = args.state_dir.resolve()
-    domain = f"gui/{os.getuid()}/{MAINTENANCE_LABEL}"
-    try:
-        with _lock(state_dir):
-            loaded = _run(("launchctl", "print", domain), cwd=args.repo.resolve())
-            if loaded.returncode:
-                raise RuntimeError("maintenance LaunchAgent is not loaded")
-            _write_json(
-                state_dir / "state.json",
-                {"phase": "queued", "queued_at": _now(), "repo": str(args.repo.resolve())},
-            )
-            started = _run(("launchctl", "kickstart", domain), cwd=args.repo.resolve())
-            if started.returncode:
-                raise RuntimeError("could not start maintenance LaunchAgent")
-        print("Hermes maintenance update queued; active sessions will be interrupted.")
-        return 0
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo", type=Path, default=DEFAULT_REPO)
-    parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
-    parser.add_argument("--wrapperctl", type=Path, default=DEFAULT_WRAPPERCTL)
-    parser.add_argument("--health-script", type=Path, default=DEFAULT_HEALTH_SCRIPT)
-    parser.add_argument("--drain-marker", type=Path, default=DEFAULT_DRAIN_MARKER)
-    parser.add_argument("--gateway-status", type=Path, default=DEFAULT_GATEWAY_STATUS)
-    parser.add_argument("--remote", default="origin")
-    parser.add_argument("--upstream-branch", default="main")
-    parser.add_argument("--drain-timeout", type=float, default=300)
-    parser.add_argument("--drain-interval", type=float, default=.25)
-    parser.add_argument("--sample-interval", type=float, default=.5)
-    parser.add_argument("--stable-drain-samples", type=int, default=3)
-    parser.add_argument("--wrapper-timeout", type=float, default=60)
-    parser.add_argument("--health-timeout", type=float, default=120)
-    parser.add_argument("--run-id")
-    parser.add_argument("--json", action="store_true")
-    parser.add_argument("--no-fetch", action="store_true")
-    modes = parser.add_mutually_exclusive_group(required=True)
-    modes.add_argument("--run", action="store_true")
-    modes.add_argument("--recover", action="store_true")
-    modes.add_argument("--check", action="store_true")
-    modes.add_argument("--status", action="store_true")
-    modes.add_argument("--detach", action="store_true")
-    modes.add_argument("--install", action="store_true")
+    hidden = argparse.SUPPRESS
+    parser.add_argument("--check", action="store_true", help="check checkout cleanliness and mergeability only")
+    parser.add_argument("--repo", type=Path, default=DEFAULT_REPO, help=hidden)
+    parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR, help=hidden)
+    parser.add_argument("--wrapperctl", type=Path, default=DEFAULT_WRAPPERCTL, help=hidden)
+    parser.add_argument("--health-script", type=Path, default=DEFAULT_HEALTH_SCRIPT, help=hidden)
+    parser.add_argument("--remote", default="origin", help=hidden)
+    parser.add_argument("--upstream-branch", default="main", help=hidden)
+    parser.add_argument("--wrapper-timeout", type=float, default=60, help=hidden)
+    parser.add_argument("--health-timeout", type=float, default=120, help=hidden)
+    parser.add_argument("--json", action="store_true", help=hidden)
     return parser
 
 
@@ -784,17 +746,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not _git(repo, "rev-parse", "--is-inside-work-tree", check=False).stdout.strip() == "true":
         print(f"ERROR: not a Git checkout: {repo}", file=sys.stderr)
         return 2
-    if args.install:
-        print("Installation is unsupported by the narrow maintenance command (no-op).")
-        return 0
-    if args.detach:
-        return _detach(args)
-    if args.status:
-        return _status(args)
     if args.check:
         return _check(args)
-    if args.recover:
-        return _recover(args)
     return _run_maintenance(args)
 
 
