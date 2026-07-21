@@ -35,7 +35,7 @@ The printed command is equivalent to:
 
 ```bash
 cd ~/.hermes/hermes-agent && \
-  ./venv/bin/hermes update --branch main --backup --yes --no-gateway-restart
+  ./venv/bin/hermes update --branch main --no-backup --yes --no-gateway-restart
 ```
 
 Run it directly. Its stdout/stderr and any terminal interaction are therefore

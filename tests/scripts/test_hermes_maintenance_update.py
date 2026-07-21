@@ -144,6 +144,7 @@ def _emulate_official_update(repo: Path) -> None:
     _git(repo, "update-ref", "refs/heads/main", "refs/remotes/origin/main")
     _git(repo, "switch", "main")
     _git(repo, "reset", "--hard", "refs/remotes/origin/main")
+    _git(repo, "switch", "diatche")
 
 
 def _run(
@@ -233,7 +234,7 @@ def test_pre_stops_runtime_prints_handoff_and_never_runs_updater(tmp_path: Path)
     assert not (tmp_path / "official-updater-calls.log").exists()
     assert f"cd {repo}" in result.stdout
     assert (
-        f"{repo}/venv/bin/hermes update --branch main --backup --yes "
+        f"{repo}/venv/bin/hermes update --branch main --no-backup --yes "
         "--no-gateway-restart"
     ) in result.stdout
     assert f"{SCRIPT} --post" in result.stdout

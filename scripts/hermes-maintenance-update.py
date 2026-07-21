@@ -59,7 +59,7 @@ import sentence_transformers
 import transformers
 """
 OFFICIAL_UPDATE_ARGUMENTS = (
-    "update", "--branch", "main", "--backup", "--yes", "--no-gateway-restart"
+    "update", "--branch", "main", "--no-backup", "--yes", "--no-gateway-restart"
 )
 
 
@@ -360,13 +360,16 @@ def _assert_official_update_result(
         ("refs/remotes/origin/main", upstream_oid),
         (upstream_ref, upstream_oid),
         ("refs/heads/diatche", integration_old),
-        ("HEAD", upstream_oid),
     )
     for ref, oid in expected:
         if _oid(repo, ref) != oid:
             raise RuntimeError(f"official updater left unexpected Git state: {ref}")
-    if _git(repo, "branch", "--show-current").stdout.strip() != "main":
-        raise RuntimeError("official updater did not leave the checkout on main")
+    branch = _git(repo, "branch", "--show-current").stdout.strip()
+    expected_head = {"main": upstream_oid, "diatche": integration_old}.get(branch)
+    if expected_head is None:
+        raise RuntimeError("official updater left the checkout on an unexpected branch")
+    if _oid(repo, "HEAD") != expected_head:
+        raise RuntimeError("official updater left unexpected Git state: HEAD")
     if _git(repo, "status", "--porcelain").stdout.strip():
         raise RuntimeError("official updater left a dirty checkout")
 
