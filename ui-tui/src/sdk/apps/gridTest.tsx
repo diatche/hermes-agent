@@ -198,7 +198,7 @@ export const gridTestApp = defineWidgetApp<GridTestState>({
     return (
       <Overlay zone="center">
         <FloatBox color={t.color.border}>
-          <GridTestOverlay cols={Math.max(24, Math.min(cols - 6, 120))} state={state} t={t} />
+          <GridTestOverlay cols={Math.max(1, Math.min(cols - 6, 120))} state={state} t={t} />
         </FloatBox>
       </Overlay>
     )
