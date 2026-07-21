@@ -1,90 +1,101 @@
 # Hermes maintenance update
 
-`scripts/hermes-maintenance-update.py` is a single foreground updater for the
-local Hermes branch model:
+`scripts/hermes-maintenance-update.py` provides a guarded three-step update for
+the local Hermes branch model:
 
-- `main` mirrors the fetched immutable `origin/main` tip;
-- `diatche` remains the local integration branch;
-- feature branches are not changed.
+- `main` mirrors the pinned `origin/main` tip;
+- `diatche` remains the validated local integration/runtime branch;
+- feature branches are not changed;
+- the official updater runs directly in the operator's terminal, with its normal
+  output and input handling.
 
 ## Usage
 
-Run the update in a terminal and wait for it to finish:
+### 1. Prepare
+
+Run the command with no arguments (equivalent to `--pre`):
 
 ```bash
 python3 scripts/hermes-maintenance-update.py
 ```
 
-The command prints each major phase immediately while it runs, including fetch,
-isolated candidate construction, the official update, gateway stop/start, ref
-publication, Hindsight compatibility, and live health verification. Its managed
-installation step is exactly:
+The pre step:
 
-```text
-<repo>/venv/bin/hermes update --branch main --backup --yes --no-gateway-restart
+1. validates the clean `diatche` checkout and custom gateway wrapper;
+2. fetches and pins `origin/main`;
+3. checks mergeability and validates an isolated candidate;
+4. rechecks checkout/ref invariants;
+5. stops the custom gateway wrapper;
+6. records an `awaiting-official-update` journal;
+7. prints the exact update and post commands.
+
+### 2. Run the printed official update command
+
+The printed command is equivalent to:
+
+```bash
+cd ~/.hermes/hermes-agent && \
+  ./venv/bin/hermes update --branch main --backup --yes --no-gateway-restart
 ```
 
-The official updater owns dependency synchronization, assets, bundled skills,
-configuration migration, caches, and backups. The wrapper supplies the local
-Git-branch and custom-supervisor policy around it rather than imitating those
-internals.
+Run it directly. Its stdout/stderr and any terminal interaction are therefore
+visible and connected to your terminal rather than captured by the maintenance
+wrapper.
 
-Optionally run the preflight without stopping or restarting Hermes:
+### 3. Run the printed post command
+
+The printed command is equivalent to:
+
+```bash
+python3 scripts/hermes-maintenance-update.py --post
+```
+
+Run `--post` even if the official updater failed or was interrupted. The post
+step validates the resulting Git state. If valid, it atomically publishes the
+prevalidated candidate to `diatche`, restores that checkout, applies the narrow
+Hindsight compatibility guard, starts the custom wrapper, and runs live health
+checks. If the updater left partial or invalid Git state, post attempts the
+bounded owned-state recovery and restarts the previous runtime when safe.
+
+The post step cannot observe the separate updater process's exit code. It judges
+success from the required resulting Git state. A nonzero updater exit that still
+produced the complete required state may therefore proceed; a partial or
+unexpected state is rejected.
+
+## Preflight only
+
+To check the current checkout and recorded upstream state without stopping
+Hermes:
 
 ```bash
 python3 scripts/hermes-maintenance-update.py --check
 ```
 
-`--check` reads the currently recorded `origin/main` remote-tracking ref; it does
-not fetch, write Git refs or `FETCH_HEAD`, alter the checkout, or stop/restart
-Hermes. Git's `merge-tree --write-tree` may leave harmless unreachable temporary
-objects in the repository; normal Git maintenance can reclaim them. The
-foreground update itself always fetches and pins the current remote tip before
-preflight.
+`--check` does not fetch, write refs or `FETCH_HEAD`, alter the checkout, or
+stop/restart Hermes. Git's `merge-tree --write-tree` may leave harmless
+unreachable temporary objects; normal Git maintenance can reclaim them.
 
-`-h` and `--help` describe this public interface. Path, timeout, and output
-overrides used by isolated tests are intentionally hidden.
+`-h` and `--help` describe the public `--pre`, `--post`, and `--check`
+interface. Path, timeout, and structured-output overrides used by isolated tests
+are intentionally hidden.
 
-## Safety sequence
+## Safety and recovery boundaries
 
-1. Acquire an exclusive maintenance lock and automatically recover a valid
-   interrupted current journal before starting a new transaction. Historical
-   run files are retained as records but are not replayed.
-2. Require the working checkout to be clean, on `diatche`, and free of an
-   unfinished Git operation.
-3. Fetch `origin/main` without writing `FETCH_HEAD`, pin its exact object ID,
-   and prove the merge is conflict-free before stopping the runtime.
-4. Build and validate the merge candidate in a temporary detached worktree, then
-   immediately re-prove checkout cleanliness and all pinned refs before stop.
-5. Force-stop through the custom wrapper, then invoke the official updater with
-   gateway restart disabled. Require it to leave the clean checkout on `main`,
-   with `main`, `origin/main`, and the private fetch ref all equal to the pinned
-   upstream SHA while `diatche` is still at its old SHA.
-6. Atomically compare-and-swap only `diatche` to the prebuilt candidate while
-   verifying `main`, `origin/main`, the private fetch ref, and old `diatche` in
-   the same ref transaction.
-7. Restore the exact `diatche` checkout, enforce the Hindsight
-   `huggingface-hub>=1.5.0,<2.0` compatibility guard, restart through the custom
-   wrapper, and verify wrapper status plus the health probe.
-8. On ordinary failure, keep the original lock and one-shot signal guard through
-   recovery and final state publication. Roll back only a ref/checkout state
-   proven to have been produced by this transaction; concurrent ref, index, or
-   file changes fail closed and are preserved.
-9. Before hard-crash recovery mutates refs or checkout files, force-stop any
-   runtime that cannot be proven to be the healthy original runtime.
-
-Every child command is bounded and runs in its own process group so timeout or
-interruption terminates descendants. Git refs and checkout files owned by the
-orchestration transaction are recovered only when their identity and clean
-state are safely provable. Official-updater external state is deliberately not
-transactional: dependency/environment changes, generated assets, bundled skill
-or config synchronization, caches, and updater backups may remain after updater
-or later orchestration failure. Recovery restores the prior Git runtime and
-restarts it when safe; it does not claim to restore the whole installation.
-
-The Hindsight compatibility repair uses `pip --no-deps` and is deliberately
-outside the Git rollback boundary: once repaired, that shared-venv invariant is
-retained even if a later runtime check requires source rollback.
+- Every pre/post phase acquires the exclusive maintenance lock.
+- Only the current `state.json` journal drives interrupted recovery; historical
+  `runs/*.json` files remain records and are not replayed.
+- Publication uses compare-and-swap checks for `main`, `origin/main`, the pinned
+  private fetch ref, and the old `diatche` ref.
+- Recovery changes only Git refs/checkout state proven to be owned by the
+  transaction. Concurrent ref, index, worktree, or untracked changes fail closed
+  and are preserved.
+- Official-updater external state is not transactional: dependencies, generated
+  assets, bundled skills, config migrations, caches, and backups may remain
+  after updater or post failure.
+- The Hindsight `huggingface-hub>=1.5.0,<2.0` repair uses `pip --no-deps` and is
+  intentionally outside the Git rollback boundary.
+- The stock Hermes gateway service remains disabled; lifecycle control stays
+  with the custom HermesGateway wrapper.
 
 ## State
 
@@ -94,5 +105,6 @@ Transaction journals and the exclusive lock live under:
 ~/.hermes/local/update/
 ```
 
-A successful run prints the resulting `diatche` commit. A blocked preflight or
-failed update writes the reason to standard error and exits nonzero.
+After pre, the gateway intentionally remains stopped until the operator runs the
+printed update and post commands. Starting another pre while a stale handoff is
+present invokes interrupted-state recovery rather than silently replacing it.

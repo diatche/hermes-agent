@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Run the guarded foreground update for the local Hermes integration checkout.
+"""Coordinate Pavel's guarded three-step Hermes maintenance update.
 
-This command wraps the official ``hermes update`` for Pavel's local
-branch/runtime model. With no arguments, it fetches an immutable upstream tip,
-preflights and builds the merge in isolation, stops the custom supervisor, lets
-the official updater synchronize the managed installation without restarting
-the gateway, publishes only ``diatche``, then restores and health-checks it.
-``--check`` performs only a no-fetch, no-ref/no-checkout merge preflight.
-Interrupted journals are recovered automatically.
+``--pre`` (also the no-argument default) prepares and validates an immutable
+merge candidate, stops the custom gateway wrapper, and prints the exact
+official update and ``--post`` commands. The updater then runs directly in the
+operator's terminal. ``--post`` verifies its pinned Git result, publishes
+``diatche``, restores the checkout, and restarts and health-checks the wrapper.
+Run ``--post`` even if the official update fails so the previous runtime can be
+recovered. ``--check`` is a no-fetch, no-ref/no-checkout merge preflight.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -212,21 +213,6 @@ def _health(health_script: Path, repo: Path, timeout: float) -> None:
     result = _run((sys.executable, str(health_script)), cwd=repo, timeout=timeout)
     if result.returncode:
         raise RuntimeError("wrapper health validation failed")
-
-
-def _official_update(executable: Path, repo: Path, timeout: float) -> None:
-    if not executable.is_file() or not os.access(executable, os.X_OK):
-        raise RuntimeError(f"official Hermes updater is missing: {executable}")
-    result = _run(
-        (str(executable), *OFFICIAL_UPDATE_ARGUMENTS),
-        cwd=repo,
-        timeout=timeout,
-    )
-    if result.returncode:
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(
-            "official Hermes updater failed" + (f": {detail}" if detail else "")
-        )
 
 
 def _ensure_hindsight_embeddings(repo: Path, timeout: float) -> None:
@@ -611,12 +597,11 @@ def _recover_payload(
         _wrapper(wrapper, repo, "--status", wrapper_timeout)
         _health(health_script, repo, health_timeout)
 
-def _run_maintenance_locked(
+def _run_pre_locked(
     args: argparse.Namespace, repo: Path, state_dir: Path, run_id: str,
 ) -> int:
     journal: dict[str, Any] | None = None
     wrapper_stopped = False
-    wrapper_started = False
     try:
         _progress("Checking for interrupted maintenance to recover")
         _recover_interrupted(args, repo, state_dir)
@@ -652,6 +637,10 @@ def _run_maintenance_locked(
             ),
         )
         _write_journal(state_dir, journal)
+        updater = getattr(args, "updater_executable", None)
+        updater = updater.resolve() if updater else repo / "venv" / "bin" / "hermes"
+        if not updater.is_file() or not os.access(updater, os.X_OK):
+            raise RuntimeError(f"official Hermes updater is missing: {updater}")
         _assert_pre_stop_snapshot(
             repo,
             main_oid=main_old,
@@ -665,73 +654,26 @@ def _run_maintenance_locked(
         wrapper_stopped = True
         _progress("Stopping the custom Hermes gateway wrapper")
         _wrapper(args.wrapperctl.resolve(), repo, "--force-stop", args.wrapper_timeout)
-        journal.update(phase="stopped", updated_at=_now())
+        journal.update(phase="awaiting-official-update", updated_at=_now())
         _write_journal(state_dir, journal)
-        updater = getattr(args, "updater_executable", None)
-        updater = updater.resolve() if updater else repo / "venv" / "bin" / "hermes"
-        journal.update(phase="official-update", updated_at=_now())
-        _write_journal(state_dir, journal)
-        _progress("Running the official Hermes updater without gateway restart")
-        _official_update(
-            updater,
-            repo,
-            getattr(args, "updater_timeout", 900),
+        update_command = " ".join(
+            shlex.quote(str(part)) for part in (updater, *OFFICIAL_UPDATE_ARGUMENTS)
         )
-        _assert_official_update_result(
-            repo,
-            upstream_ref=fetch_ref,
-            upstream_oid=upstream_oid,
-            integration_old=integration_old,
-        )
-        journal.update(phase="official-updated", updated_at=_now())
-        _write_journal(state_dir, journal)
-        _progress("Publishing the validated diatche ref atomically")
-        _publish_integration(
-            repo,
-            main_oid=upstream_oid,
-            origin_main_oid=upstream_oid,
-            upstream_ref=fetch_ref,
-            upstream_oid=upstream_oid,
-            integration_branch="diatche",
-            integration_old=integration_old,
-            integration_new=candidate_oid,
-        )
-        journal.update(phase="published", updated_at=_now())
-        _write_journal(state_dir, journal)
-        _progress("Restoring the validated diatche checkout")
-        _restore_checkout(repo, "diatche", candidate_oid)
-        _progress("Checking Hindsight embedding compatibility")
-        _ensure_hindsight_embeddings(repo, args.health_timeout)
-        _progress("Starting the custom Hermes gateway wrapper")
-        _wrapper(
-            args.wrapperctl.resolve(), repo, "--foreground",
-            args.wrapper_timeout, maintenance_start=True,
-        )
-        wrapper_started = True
-        _progress("Verifying wrapper ownership and live Hermes health")
-        _wrapper(args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout)
-        _health(args.health_script.resolve(), repo, args.health_timeout)
-        wrapper_stopped = False
-        _assert_checkout(repo, "diatche")
-        if _oid(repo, "HEAD") != candidate_oid:
-            raise RuntimeError("runtime checkout moved during startup")
-        journal.update(
-            phase="complete", upstream_sha=upstream_oid,
-            completed_at=_now(), updated_at=_now(),
-        )
-        _write_journal(state_dir, journal)
-        print(f"Hermes maintenance complete at {candidate_oid[:12]}")
+        post_command = Path(sys.argv[0]).resolve()
+        print()
+        print("Pre-update checks passed and the gateway is stopped.")
+        print("Run these commands in order:")
+        print()
+        print(f"  cd {shlex.quote(str(repo))} && {update_command}")
+        print(f"  {shlex.quote(str(post_command))} --post")
+        print()
+        print("Run the post command even if the official update fails or is interrupted.")
         return 0
     except Exception as exc:
         recovery_error = ""
         if journal is not None and wrapper_stopped:
             try:
-                _progress("Update failed after gateway interruption; recovering the previous runtime")
-                if wrapper_started:
-                    _wrapper(
-                        args.wrapperctl.resolve(), repo, "--force-stop",
-                        args.wrapper_timeout,
-                    )
+                _progress("Pre-update failed after gateway interruption; recovering the previous runtime")
                 _recover_owned_git_state(repo, journal)
                 _ensure_hindsight_embeddings(repo, args.health_timeout)
                 _wrapper(
@@ -759,10 +701,127 @@ def _run_maintenance_locked(
         return 1
 
 
-def _run_maintenance(args: argparse.Namespace) -> int:
+def _run_pre(args: argparse.Namespace) -> int:
     repo, state_dir = args.repo.resolve(), args.state_dir.resolve()
     with _signal_guard(), _lock(state_dir):
-        return _run_maintenance_locked(args, repo, state_dir, uuid.uuid4().hex)
+        return _run_pre_locked(args, repo, state_dir, uuid.uuid4().hex)
+
+
+def _load_post_handoff(repo: Path, state_dir: Path) -> dict[str, Any]:
+    state = state_dir / "state.json"
+    try:
+        raw = json.loads(state.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeError("no prepared maintenance handoff; run --pre first") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("malformed current maintenance journal") from exc
+    if not isinstance(raw, dict) or raw.get("phase") != "awaiting-official-update":
+        raise RuntimeError("no prepared maintenance handoff; run --pre first")
+    run_id = str(raw.get("run_id", ""))
+    if not RUN_ID_RE.fullmatch(run_id):
+        raise RuntimeError("malformed current maintenance journal")
+    return _validate_journal(raw, repo, run_id)
+
+
+def _run_post_locked(
+    args: argparse.Namespace, repo: Path, state_dir: Path,
+) -> int:
+    journal: dict[str, Any] | None = None
+    wrapper_started = False
+    try:
+        _progress("Loading the prepared maintenance handoff")
+        journal = _load_post_handoff(repo, state_dir)
+        upstream_oid = str(journal["main_new"])
+        integration_old = str(journal["integration_old"])
+        candidate_oid = str(journal["integration_new"])
+        fetch_ref = str(journal["fetch_ref"])
+        _progress("Verifying the official Hermes update result")
+        _assert_official_update_result(
+            repo,
+            upstream_ref=fetch_ref,
+            upstream_oid=upstream_oid,
+            integration_old=integration_old,
+        )
+        journal.update(
+            phase="official-updated", owner_pid=os.getpid(), updated_at=_now()
+        )
+        _write_journal(state_dir, journal)
+        _progress("Publishing the validated diatche ref atomically")
+        _publish_integration(
+            repo,
+            main_oid=upstream_oid,
+            origin_main_oid=upstream_oid,
+            upstream_ref=fetch_ref,
+            upstream_oid=upstream_oid,
+            integration_branch="diatche",
+            integration_old=integration_old,
+            integration_new=candidate_oid,
+        )
+        journal.update(phase="published", updated_at=_now())
+        _write_journal(state_dir, journal)
+        _progress("Restoring the validated diatche checkout")
+        _restore_checkout(repo, "diatche", candidate_oid)
+        _progress("Checking Hindsight embedding compatibility")
+        _ensure_hindsight_embeddings(repo, args.health_timeout)
+        _progress("Starting the custom Hermes gateway wrapper")
+        _wrapper(
+            args.wrapperctl.resolve(), repo, "--foreground",
+            args.wrapper_timeout, maintenance_start=True,
+        )
+        wrapper_started = True
+        _progress("Verifying wrapper ownership and live Hermes health")
+        _wrapper(args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout)
+        _health(args.health_script.resolve(), repo, args.health_timeout)
+        _assert_checkout(repo, "diatche")
+        if _oid(repo, "HEAD") != candidate_oid:
+            raise RuntimeError("runtime checkout moved during startup")
+        journal.update(
+            phase="complete", upstream_sha=upstream_oid,
+            completed_at=_now(), updated_at=_now(),
+        )
+        _write_journal(state_dir, journal)
+        print(f"Hermes maintenance complete at {candidate_oid[:12]}")
+        return 0
+    except Exception as exc:
+        recovery_error = ""
+        if journal is not None:
+            try:
+                _progress("Post-update verification failed; recovering the previous runtime")
+                if wrapper_started:
+                    _wrapper(
+                        args.wrapperctl.resolve(), repo, "--force-stop",
+                        args.wrapper_timeout,
+                    )
+                _recover_owned_git_state(repo, journal)
+                _ensure_hindsight_embeddings(repo, args.health_timeout)
+                _wrapper(
+                    args.wrapperctl.resolve(), repo, "--foreground",
+                    args.wrapper_timeout, maintenance_start=True,
+                )
+                _wrapper(
+                    args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout
+                )
+                _health(args.health_script.resolve(), repo, args.health_timeout)
+                journal["recovered"] = True
+                _progress("Previous Hermes runtime recovered and healthy")
+            except Exception as recovery_exc:
+                recovery_error = str(recovery_exc)
+        if journal is not None:
+            journal.update(
+                phase="failed", error=str(exc), recovery_error=recovery_error,
+                updated_at=_now(),
+            )
+            _write_journal(state_dir, journal)
+        print(f"ERROR: {exc}", file=sys.stderr)
+        if recovery_error:
+            print(f"RECOVERY ERROR: {recovery_error}", file=sys.stderr)
+        return 1
+
+
+def _run_post(args: argparse.Namespace) -> int:
+    repo, state_dir = args.repo.resolve(), args.state_dir.resolve()
+    with _signal_guard(), _lock(state_dir):
+        return _run_post_locked(args, repo, state_dir)
 
 
 def _recover_interrupted(
@@ -829,7 +888,22 @@ def _check(args: argparse.Namespace) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     hidden = argparse.SUPPRESS
-    parser.add_argument("--check", action="store_true", help="check checkout cleanliness and mergeability only")
+    phase = parser.add_mutually_exclusive_group()
+    phase.add_argument(
+        "--pre",
+        action="store_true",
+        help="prepare the update, stop Hermes, and print the next commands",
+    )
+    phase.add_argument(
+        "--post",
+        action="store_true",
+        help="verify the official update, publish diatche, and restart Hermes",
+    )
+    phase.add_argument(
+        "--check",
+        action="store_true",
+        help="check checkout cleanliness and mergeability only",
+    )
     parser.add_argument("--repo", type=Path, default=DEFAULT_REPO, help=hidden)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR, help=hidden)
     parser.add_argument("--wrapperctl", type=Path, default=DEFAULT_WRAPPERCTL, help=hidden)
@@ -839,7 +913,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--upstream-branch", default="main", help=hidden)
     parser.add_argument("--wrapper-timeout", type=float, default=60, help=hidden)
     parser.add_argument("--health-timeout", type=float, default=120, help=hidden)
-    parser.add_argument("--updater-timeout", type=float, default=900, help=hidden)
     parser.add_argument("--json", action="store_true", help=hidden)
     return parser
 
@@ -853,7 +926,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if args.check:
         return _check(args)
-    return _run_maintenance(args)
+    if args.post:
+        return _run_post(args)
+    return _run_pre(args)
 
 
 if __name__ == "__main__":

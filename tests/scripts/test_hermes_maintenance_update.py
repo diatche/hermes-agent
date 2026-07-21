@@ -192,7 +192,7 @@ def _args(repo: Path, state_dir: Path, wrapper: Path, health: Path) -> Namespace
     )
 
 
-def test_public_help_exposes_only_check_and_help() -> None:
+def test_public_help_exposes_pre_post_check_and_help() -> None:
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--help"],
         text=True,
@@ -200,10 +200,86 @@ def test_public_help_exposes_only_check_and_help() -> None:
     )
 
     assert result.returncode == 0
-    option_lines = [line.strip() for line in result.stdout.splitlines() if line.startswith("  -")]
-    assert len(option_lines) == 2
-    assert option_lines[0].startswith("-h, --help")
-    assert option_lines[1].startswith("--check")
+    assert "--pre" in result.stdout
+    assert "--post" in result.stdout
+    assert "--check" in result.stdout
+    assert "--run" not in result.stdout
+
+
+def test_pre_stops_runtime_prints_handoff_and_never_runs_updater(tmp_path: Path) -> None:
+    repo, _ = _make_repo(tmp_path)
+    wrapper, health, calls = _fake_runtime(tmp_path)
+    state_dir = tmp_path / "state"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--pre",
+            "--repo", str(repo),
+            "--state-dir", str(state_dir),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        "--status",
+        "--force-stop",
+    ]
+    assert not (tmp_path / "official-updater-calls.log").exists()
+    assert f"cd {repo}" in result.stdout
+    assert (
+        f"{repo}/venv/bin/hermes update --branch main --backup --yes "
+        "--no-gateway-restart"
+    ) in result.stdout
+    assert f"{SCRIPT} --post" in result.stdout
+    state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["phase"] == "awaiting-official-update"
+
+
+def test_post_finishes_prepared_handoff_after_direct_official_update(
+    tmp_path: Path,
+) -> None:
+    repo, upstream_sha = _make_repo(tmp_path)
+    wrapper, health, calls = _fake_runtime(tmp_path)
+    state_dir = tmp_path / "state"
+    common = [
+        "--repo", str(repo),
+        "--state-dir", str(state_dir),
+        "--wrapperctl", str(wrapper),
+        "--health-script", str(health),
+    ]
+    prepared = subprocess.run(
+        [sys.executable, str(SCRIPT), "--pre", *common],
+        text=True,
+        capture_output=True,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+
+    _emulate_official_update(repo)
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--post", *common],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _git(repo, "branch", "--show-current") == "diatche"
+    assert _git(repo, "rev-parse", "main") == upstream_sha
+    assert _git(repo, "merge-base", "--is-ancestor", upstream_sha, "diatche") == ""
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        "--status",
+        "--force-stop",
+        "--foreground",
+        "--status",
+    ]
+    state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["phase"] == "complete"
 
 
 def test_check_is_read_only_and_never_calls_wrapper(tmp_path: Path) -> None:
@@ -229,34 +305,6 @@ def test_check_is_read_only_and_never_calls_wrapper(tmp_path: Path) -> None:
     assert "mergeable" in result.stdout
     assert _git(repo, "for-each-ref", "--format=%(refname) %(objectname)") == refs_before
     assert not calls.exists()
-
-
-def test_success_force_stops_merges_and_restarts(tmp_path: Path) -> None:
-    repo, upstream_sha = _make_repo(tmp_path)
-
-    result, calls, state_dir = _run(repo, tmp_path)
-
-    assert result.returncode == 0, result.stderr
-    assert _git(repo, "branch", "--show-current") == "diatche"
-    assert _git(repo, "rev-parse", "main") == upstream_sha
-    assert _git(repo, "rev-parse", "origin/main") == upstream_sha
-    assert _git(repo, "merge-base", "--is-ancestor", upstream_sha, "diatche") == ""
-    assert _git(repo, "status", "--porcelain") == ""
-    assert calls.read_text(encoding="utf-8").splitlines() == [
-        "--status",
-        "--force-stop",
-        "--foreground",
-        "--status",
-    ]
-    state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
-    assert state["phase"] == "complete"
-    assert state["upstream_sha"] == upstream_sha
-    assert _git(repo, "rev-parse", state["fetch_ref"]) == upstream_sha
-    assert "official updater" not in result.stdout.lower()
-    assert "Fetching origin/main" in result.stderr
-    assert "Building and validating the isolated merge candidate" in result.stderr
-    assert "Stopping the custom Hermes gateway wrapper" in result.stderr
-    assert "Verifying wrapper ownership and live Hermes health" in result.stderr
 
 
 def test_single_interrupted_journal_is_recovered_before_update(tmp_path: Path) -> None:
@@ -443,6 +491,30 @@ def test_conflict_fails_before_forced_stop(tmp_path: Path) -> None:
     assert calls.read_text(encoding="utf-8").splitlines() == ["--status"]
 
 
+def test_missing_updater_fails_before_forced_stop(tmp_path: Path) -> None:
+    repo, _ = _make_repo(tmp_path)
+    wrapper, health, calls = _fake_runtime(tmp_path)
+    missing = tmp_path / "missing-hermes"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--pre",
+            "--repo", str(repo),
+            "--state-dir", str(tmp_path / "state"),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+            "--updater-executable", str(missing),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert "official Hermes updater is missing" in result.stderr
+    assert calls.read_text(encoding="utf-8").splitlines() == ["--status"]
+
+
 def test_dirty_checkout_fails_before_wrapper_call(tmp_path: Path) -> None:
     repo, _ = _make_repo(tmp_path)
     _write(repo, "dirty.txt", "dirty\n")
@@ -470,7 +542,7 @@ def test_checkout_is_rechecked_immediately_before_stop(
 
     monkeypatch.setattr(module, "_build_candidate", build_then_dirty)
 
-    result = module._run_maintenance(_args(repo, state_dir, wrapper, health))
+    result = module._run_pre(_args(repo, state_dir, wrapper, health))
 
     assert result == 1
     assert calls.read_text().splitlines() == ["--status"]
@@ -493,14 +565,12 @@ def test_cas_failure_does_not_reset_concurrent_ref_or_checkout_changes(
         _git(repo, "update-ref", "refs/heads/diatche", moved_to)
         raise RuntimeError("ref compare-and-swap transaction failed")
 
+    prepared = module._run_pre(_args(repo, state_dir, wrapper, health))
+    assert prepared == 0
+    _emulate_official_update(repo)
     monkeypatch.setattr(module, "_publish_integration", concurrent_cas_failure)
-    monkeypatch.setattr(
-        module,
-        "_official_update",
-        lambda _executable, target_repo, _timeout: _emulate_official_update(target_repo),
-    )
 
-    result = module._run_maintenance(_args(repo, state_dir, wrapper, health))
+    result = module._run_post(_args(repo, state_dir, wrapper, health))
 
     assert result == 1
     assert _git(repo, "rev-parse", "diatche") == moved_to
@@ -515,7 +585,27 @@ def test_health_failure_rolls_back_refs_and_restarts_old_runtime(tmp_path: Path)
     old_main = _git(repo, "rev-parse", "main")
     old_diatche = _git(repo, "rev-parse", "diatche")
 
-    result, calls, state_dir = _run(repo, tmp_path, fail_health_call=1)
+    wrapper, health, calls = _fake_runtime(tmp_path, fail_health_call=1)
+    state_dir = tmp_path / "state"
+    common = [
+        "--repo", str(repo),
+        "--state-dir", str(state_dir),
+        "--wrapperctl", str(wrapper),
+        "--health-script", str(health),
+    ]
+    prepared = subprocess.run(
+        [sys.executable, str(SCRIPT), "--pre", *common],
+        text=True,
+        capture_output=True,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    _emulate_official_update(repo)
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--post", *common],
+        text=True,
+        capture_output=True,
+    )
 
     assert result.returncode == 1
     assert _git(repo, "rev-parse", "main") == old_main
@@ -563,14 +653,12 @@ def test_failure_recovery_retains_original_lock_and_signal_guard(
         observed["signal_handler"] = signal.getsignal(signal.SIGTERM)
         return original_recover(*args, **kwargs)
 
+    prepared = module._run_pre(_args(repo, state_dir, wrapper, health))
+    assert prepared == 0
+    _emulate_official_update(repo)
     monkeypatch.setattr(module, "_recover_owned_git_state", probe_guard)
-    monkeypatch.setattr(
-        module,
-        "_official_update",
-        lambda _executable, target_repo, _timeout: _emulate_official_update(target_repo),
-    )
 
-    result = module._run_maintenance(_args(repo, state_dir, wrapper, health))
+    result = module._run_post(_args(repo, state_dir, wrapper, health))
 
     assert result == 1
     assert observed["lock_returncode"] == 23
@@ -585,40 +673,32 @@ def test_official_updater_failure_restores_owned_git_state_and_old_runtime(
     old_origin_main = _git(repo, "rev-parse", "origin/main")
     old_diatche = _git(repo, "rev-parse", "diatche")
     wrapper, health, calls = _fake_runtime(tmp_path)
-    updater_calls = tmp_path / "failing-updater-calls.log"
-    updater = _write(
-        tmp_path,
-        "failing-hermes",
-        "#!/bin/sh\nset -eu\n"
-        f"printf '%s\\n' \"$*\" >> {updater_calls!s}\n"
-        "git fetch origin main\n"
-        "git update-ref refs/heads/main refs/remotes/origin/main\n"
-        "git switch main\n"
-        "git reset --hard refs/remotes/origin/main\n"
-        "exit 42\n",
-    )
-    updater.chmod(0o755)
     state_dir = tmp_path / "state"
 
+    common = [
+        "--repo", str(repo),
+        "--state-dir", str(state_dir),
+        "--wrapperctl", str(wrapper),
+        "--health-script", str(health),
+    ]
+    prepared = subprocess.run(
+        [sys.executable, str(SCRIPT), "--pre", *common],
+        text=True,
+        capture_output=True,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    # Model an interrupted updater that switched to main before publishing the
+    # pinned upstream commit. The post phase must reject and recover this state.
+    _git(repo, "switch", "main")
+
     result = subprocess.run(
-        [
-            sys.executable,
-            str(SCRIPT),
-            "--repo", str(repo),
-            "--state-dir", str(state_dir),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
-            "--updater-executable", str(updater),
-        ],
+        [sys.executable, str(SCRIPT), "--post", *common],
         text=True,
         capture_output=True,
     )
 
     assert result.returncode == 1
-    assert "official Hermes updater failed" in result.stderr
-    assert updater_calls.read_text().splitlines() == [
-        "update --branch main --backup --yes --no-gateway-restart"
-    ]
+    assert "official updater" in result.stderr.lower()
     assert _git(repo, "branch", "--show-current") == "diatche"
     assert _git(repo, "rev-parse", "main") == old_main
     assert _git(repo, "rev-parse", "origin/main") == old_origin_main
@@ -648,29 +728,6 @@ def test_stop_failure_keeps_refs_and_restarts_old_runtime(tmp_path: Path) -> Non
         "--force-stop",
         "--foreground",
         "--status",
-    ]
-
-
-def test_invokes_only_official_updater_with_exact_managed_arguments(tmp_path: Path) -> None:
-    repo, _ = _make_repo(tmp_path)
-    forbidden = tmp_path / "forbidden-bin"
-    called = tmp_path / "forbidden-called"
-    forbidden.mkdir()
-    for name in ("npm", "pip", "pip3", "uv", "yarn", "pnpm", "make"):
-        command = forbidden / name
-        command.write_text(
-            f"#!/bin/sh\nprintf '%s\\n' '{name}' >> {called!s}\nexit 97\n",
-            encoding="utf-8",
-        )
-        command.chmod(0o755)
-    env = {**os.environ, "PATH": f"{forbidden}:{os.environ['PATH']}"}
-
-    result, _, _ = _run(repo, tmp_path, env=env)
-
-    assert result.returncode == 0, result.stderr
-    assert not called.exists()
-    assert (tmp_path / "official-updater-calls.log").read_text().splitlines() == [
-        "update --branch main --backup --yes --no-gateway-restart"
     ]
 
 
