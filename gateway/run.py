@@ -19060,6 +19060,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config, platform_key, "todo_progress", False
             ))
         )
+        todo_progress_pin_enabled = (
+            todo_progress_enabled
+            and source.platform == Platform.TELEGRAM
+            and bool(resolve_display_setting(
+                user_config, platform_key, "todo_progress_pin", False
+            ))
+        )
         delegated_tasks_mode = resolve_display_setting(
             user_config, platform_key, "delegated_tasks", "off"
         )
@@ -19512,6 +19519,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
             progress_msg_id = None   # ID of the current progress message to edit
             todo_msg_id = None       # Dedicated live checklist message
+            pinned_todo_msg_id = None  # Checklist pinned by this run
             last_todo_text = None    # Last successfully delivered checklist text
             can_edit = progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
@@ -19625,11 +19633,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             async def _deliver_todo_checklist(text: str) -> None:
                 """Send/edit a checklist, or delete its bubble when cleared."""
-                nonlocal todo_msg_id, last_todo_text
+                nonlocal todo_msg_id, pinned_todo_msg_id, last_todo_text
+
+                async def _pin_todo(message_id) -> None:
+                    nonlocal pinned_todo_msg_id
+                    if not todo_progress_pin_enabled:
+                        return
+                    bot = getattr(adapter, "_bot", None)
+                    if bot is None or not hasattr(bot, "pin_chat_message"):
+                        return
+                    try:
+                        telegram_message_id = (
+                            int(message_id) if str(message_id).isdigit() else message_id
+                        )
+                        pinned = await bot.pin_chat_message(
+                            chat_id=int(source.chat_id),
+                            message_id=telegram_message_id,
+                            disable_notification=True,
+                        )
+                        if pinned is not False:
+                            pinned_todo_msg_id = message_id
+                    except Exception:
+                        logger.debug("Failed to pin Telegram todo checklist", exc_info=True)
+
+                async def _unpin_todo(message_id) -> None:
+                    nonlocal pinned_todo_msg_id
+                    if pinned_todo_msg_id != message_id:
+                        return
+                    bot = getattr(adapter, "_bot", None)
+                    if bot is None or not hasattr(bot, "unpin_chat_message"):
+                        return
+                    try:
+                        telegram_message_id = (
+                            int(message_id) if str(message_id).isdigit() else message_id
+                        )
+                        unpinned = await bot.unpin_chat_message(
+                            chat_id=int(source.chat_id),
+                            message_id=telegram_message_id,
+                        )
+                        if unpinned is not False:
+                            pinned_todo_msg_id = None
+                    except Exception:
+                        logger.debug("Failed to unpin Telegram todo checklist", exc_info=True)
+
                 if not text:
                     if todo_msg_id is None:
                         last_todo_text = None
                         return
+                    await _unpin_todo(todo_msg_id)
                     delete_task = asyncio.create_task(
                         adapter.delete_message(
                             chat_id=source.chat_id,
@@ -19703,6 +19754,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await asyncio.sleep(min(float(result.retry_after or 0.5), 3.0))
                     # A permanently uneditable/deleted message, or a transient
                     # edit that exhausted retry, gets a fresh checklist bubble.
+                    await _unpin_todo(todo_msg_id)
                     todo_msg_id = None
 
                 result = None
@@ -19715,6 +19767,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if result is not None and result.success:
                         if result.message_id:
                             todo_msg_id = result.message_id
+                            await _pin_todo(todo_msg_id)
                         last_todo_text = text
                         return
                     if not (result is not None and getattr(result, "retryable", False)):

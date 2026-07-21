@@ -33,6 +33,7 @@ from typing import Any
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "todo_progress": False,  # Dedicated live checklist; independent of ordinary tool chrome.
+    "todo_progress_pin": False,  # Telegram-only opt-in for pinning the live checklist.
     # Delegated work inside the live checklist: off | count | goal.
     "delegated_tasks": "off",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
@@ -277,6 +278,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "busy_steer_ack_enabled",
         "thinking_progress",
         "todo_progress",
+        "todo_progress_pin",
     }:
         if isinstance(value, str):
             val = value.strip().lower()
