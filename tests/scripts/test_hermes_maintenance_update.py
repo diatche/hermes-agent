@@ -5,8 +5,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
@@ -124,7 +126,6 @@ def _run(
         [
             sys.executable,
             str(SCRIPT),
-            "--run",
             "--repo", str(repo),
             "--state-dir", str(state_dir),
             "--wrapperctl", str(wrapper),
@@ -135,6 +136,58 @@ def _run(
         env=env,
     )
     return result, calls, state_dir
+
+
+def _args(repo: Path, state_dir: Path, wrapper: Path, health: Path) -> Namespace:
+    return Namespace(
+        repo=repo,
+        state_dir=state_dir,
+        wrapperctl=wrapper,
+        health_script=health,
+        remote="origin",
+        upstream_branch="main",
+        wrapper_timeout=30,
+        health_timeout=30,
+    )
+
+
+def test_public_help_exposes_only_check_and_help() -> None:
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--help"],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0
+    option_lines = [line.strip() for line in result.stdout.splitlines() if line.startswith("  -")]
+    assert len(option_lines) == 2
+    assert option_lines[0].startswith("-h, --help")
+    assert option_lines[1].startswith("--check")
+
+
+def test_check_is_read_only_and_never_calls_wrapper(tmp_path: Path) -> None:
+    repo, _ = _make_repo(tmp_path)
+    wrapper, health, calls = _fake_runtime(tmp_path)
+    refs_before = _git(repo, "for-each-ref", "--format=%(refname) %(objectname)")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--check",
+            "--repo", str(repo),
+            "--state-dir", str(tmp_path / "state"),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "mergeable" in result.stdout
+    assert _git(repo, "for-each-ref", "--format=%(refname) %(objectname)") == refs_before
+    assert not calls.exists()
 
 
 def test_success_force_stops_merges_and_restarts(tmp_path: Path) -> None:
@@ -157,6 +210,180 @@ def test_success_force_stops_merges_and_restarts(tmp_path: Path) -> None:
     assert state["phase"] == "complete"
     assert state["upstream_sha"] == upstream_sha
     assert "official updater" not in result.stdout.lower()
+    assert "Fetching origin/main" in result.stderr
+    assert "Building and validating the isolated merge candidate" in result.stderr
+    assert "Stopping the custom Hermes gateway wrapper" in result.stderr
+    assert "Verifying wrapper ownership and live Hermes health" in result.stderr
+
+
+def test_single_interrupted_journal_is_recovered_before_update(tmp_path: Path) -> None:
+    repo, upstream_sha = _make_repo(tmp_path)
+    wrapper, health, calls = _fake_runtime(tmp_path)
+    state_dir = tmp_path / "state"
+    run_id = "interrupted"
+    main_old = _git(repo, "rev-parse", "main")
+    integration_old = _git(repo, "rev-parse", "diatche")
+    common_git_dir = Path(_git(repo, "rev-parse", "--git-common-dir"))
+    if not common_git_dir.is_absolute():
+        common_git_dir = repo / common_git_dir
+    payload = {
+        "version": 2,
+        "run_id": run_id,
+        "repo": str(repo.resolve()),
+        "common_git_dir": str(common_git_dir.resolve()),
+        "integration_branch": "diatche",
+        "main_ref": "refs/heads/main",
+        "integration_ref": "refs/heads/diatche",
+        "main_old": main_old,
+        "integration_old": integration_old,
+        "main_new": upstream_sha,
+        "integration_new": integration_old,
+        "phase": "stopped",
+        "owner_pid": 99_999_999,
+    }
+    _write(state_dir, f"runs/{run_id}.json", json.dumps(payload))
+    _write(state_dir, "state.json", json.dumps(payload))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo", str(repo),
+            "--state-dir", str(state_dir),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    recovered = json.loads((state_dir / "runs" / f"{run_id}.json").read_text())
+    assert recovered["phase"] == "recovered"
+    assert calls.read_text().splitlines()[:2] == ["--status", "--status"]
+
+
+def test_crash_recovery_stops_candidate_runtime_before_restoring_refs(
+    tmp_path: Path,
+) -> None:
+    repo, upstream_sha = _make_repo(tmp_path)
+    wrapper, health, calls = _fake_runtime(tmp_path)
+    state_dir = tmp_path / "state"
+    run_id = "published-crash"
+    main_old = _git(repo, "rev-parse", "main")
+    integration_old = _git(repo, "rev-parse", "diatche")
+    common_git_dir = Path(_git(repo, "rev-parse", "--git-common-dir"))
+    if not common_git_dir.is_absolute():
+        common_git_dir = repo / common_git_dir
+    _git(repo, "fetch", "origin", "main")
+    _git(repo, "update-ref", "refs/heads/main", upstream_sha, main_old)
+    payload = {
+        "version": 2,
+        "run_id": run_id,
+        "repo": str(repo.resolve()),
+        "common_git_dir": str(common_git_dir.resolve()),
+        "integration_branch": "diatche",
+        "main_ref": "refs/heads/main",
+        "integration_ref": "refs/heads/diatche",
+        "main_old": main_old,
+        "integration_old": integration_old,
+        "main_new": upstream_sha,
+        "integration_new": integration_old,
+        "phase": "published",
+        "owner_pid": 99_999_999,
+    }
+    _write(state_dir, f"runs/{run_id}.json", json.dumps(payload))
+    _write(state_dir, "state.json", json.dumps(payload))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo", str(repo),
+            "--state-dir", str(state_dir),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text().splitlines()[0] == "--force-stop"
+
+
+def test_crash_recovery_preserves_nontransactional_dirty_checkout(
+    tmp_path: Path,
+) -> None:
+    repo, upstream_sha = _make_repo(tmp_path)
+    wrapper, health, calls = _fake_runtime(tmp_path)
+    state_dir = tmp_path / "state"
+    run_id = "stopped-dirty"
+    main_old = _git(repo, "rev-parse", "main")
+    integration_old = _git(repo, "rev-parse", "diatche")
+    common_git_dir = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    payload = {
+        "version": 2,
+        "run_id": run_id,
+        "repo": str(repo.resolve()),
+        "common_git_dir": str(common_git_dir.resolve()),
+        "integration_branch": "diatche",
+        "main_ref": "refs/heads/main",
+        "integration_ref": "refs/heads/diatche",
+        "main_old": main_old,
+        "integration_old": integration_old,
+        "main_new": upstream_sha,
+        "integration_new": integration_old,
+        "phase": "stopped",
+        "owner_pid": 99_999_999,
+    }
+    _write(state_dir, f"runs/{run_id}.json", json.dumps(payload))
+    _write(state_dir, "state.json", json.dumps(payload))
+    _write(repo, "base.txt", "concurrent dirty content\n")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo", str(repo),
+            "--state-dir", str(state_dir),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert (repo / "base.txt").read_text() == "concurrent dirty content\n"
+    assert calls.read_text().splitlines() == ["--force-stop"]
+
+
+def test_completed_current_state_ignores_historical_failed_runs(tmp_path: Path) -> None:
+    repo, _ = _make_repo(tmp_path)
+    wrapper, health, _ = _fake_runtime(tmp_path)
+    state_dir = tmp_path / "state"
+    _write(
+        state_dir,
+        "runs/historical.json",
+        json.dumps({"phase": "failed", "owner_pid": 99_999_999}),
+    )
+    _write(state_dir, "state.json", json.dumps({"phase": "complete"}))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo", str(repo),
+            "--state-dir", str(state_dir),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_conflict_fails_before_forced_stop(tmp_path: Path) -> None:
@@ -182,6 +409,57 @@ def test_dirty_checkout_fails_before_wrapper_call(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert "dirty" in result.stderr.lower()
     assert not calls.exists()
+
+
+def test_checkout_is_rechecked_immediately_before_stop(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _load_script_module()
+    repo, _ = _make_repo(tmp_path)
+    wrapper, health, calls = _fake_runtime(tmp_path)
+    state_dir = tmp_path / "state"
+    original_build = module._build_candidate
+
+    def build_then_dirty(*args, **kwargs):
+        result = original_build(*args, **kwargs)
+        _write(repo, "concurrent.txt", "do not delete\n")
+        return result
+
+    monkeypatch.setattr(module, "_build_candidate", build_then_dirty)
+
+    result = module._run_maintenance(_args(repo, state_dir, wrapper, health))
+
+    assert result == 1
+    assert calls.read_text().splitlines() == ["--status"]
+    assert (repo / "concurrent.txt").read_text() == "do not delete\n"
+
+
+def test_cas_failure_does_not_reset_concurrent_ref_or_checkout_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _load_script_module()
+    repo, _ = _make_repo(tmp_path)
+    wrapper, health, calls = _fake_runtime(tmp_path)
+    state_dir = tmp_path / "state"
+    moved_to = ""
+
+    def concurrent_cas_failure(_repo, **kwargs):
+        nonlocal moved_to
+        moved_to = kwargs["main_new"]
+        _write(repo, "base.txt", "concurrent tracked edit\n")
+        _git(repo, "update-ref", "refs/heads/diatche", moved_to)
+        raise RuntimeError("ref compare-and-swap transaction failed")
+
+    monkeypatch.setattr(module, "_publish_refs", concurrent_cas_failure)
+
+    result = module._run_maintenance(_args(repo, state_dir, wrapper, health))
+
+    assert result == 1
+    assert _git(repo, "rev-parse", "diatche") == moved_to
+    assert (repo / "base.txt").read_text() == "concurrent tracked edit\n"
+    assert calls.read_text().splitlines() == ["--status", "--force-stop"]
+    state = json.loads((state_dir / "state.json").read_text())
+    assert "concurrent" in state["recovery_error"].lower()
 
 
 def test_health_failure_rolls_back_refs_and_restarts_old_runtime(tmp_path: Path) -> None:
@@ -210,6 +488,42 @@ def test_health_failure_rolls_back_refs_and_restarts_old_runtime(tmp_path: Path)
     assert state["recovered"] is True
 
 
+def test_failure_recovery_retains_original_lock_and_signal_guard(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _load_script_module()
+    repo, _ = _make_repo(tmp_path)
+    wrapper, health, _ = _fake_runtime(tmp_path, fail_health_call=1)
+    state_dir = tmp_path / "state"
+    observed: dict[str, object] = {}
+    original_assert = module._assert_transaction_checkout
+
+    def probe_guard(*args, **kwargs):
+        lock_file = state_dir / "maintenance.lock"
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import fcntl,sys; f=open(sys.argv[1], 'a+'); "
+                "\ntry: fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)"
+                "\nexcept BlockingIOError: raise SystemExit(23)",
+                str(lock_file),
+            ],
+            check=False,
+        )
+        observed["lock_returncode"] = probe.returncode
+        observed["signal_handler"] = signal.getsignal(signal.SIGTERM)
+        return original_assert(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_assert_transaction_checkout", probe_guard)
+
+    result = module._run_maintenance(_args(repo, state_dir, wrapper, health))
+
+    assert result == 1
+    assert observed["lock_returncode"] == 23
+    assert callable(observed["signal_handler"]) or observed["signal_handler"] is signal.SIG_IGN
+
+
 def test_stop_failure_keeps_refs_and_restarts_old_runtime(tmp_path: Path) -> None:
     repo, _ = _make_repo(tmp_path)
     old_main = _git(repo, "rev-parse", "main")
@@ -218,7 +532,7 @@ def test_stop_failure_keeps_refs_and_restarts_old_runtime(tmp_path: Path) -> Non
     result, calls, _ = _run(repo, tmp_path, fail_stop=True)
 
     assert result.returncode == 1
-    assert "wrapper --stop failed" in result.stderr
+    assert "wrapper --force-stop failed" in result.stderr
     assert _git(repo, "rev-parse", "main") == old_main
     assert _git(repo, "rev-parse", "diatche") == old_diatche
     assert calls.read_text(encoding="utf-8").splitlines() == [
@@ -352,71 +666,3 @@ def test_hindsight_embedding_guard_does_not_repair_version_probe_crash(
 
     assert len(commands) == 1
     assert "pip" not in commands[0]
-
-
-def test_install_writes_command_and_one_shot_job_without_running_update(tmp_path: Path) -> None:
-    repo, _ = _make_repo(tmp_path)
-    installed = tmp_path / "bin" / "hermes-maintenance-update"
-    plist = tmp_path / "maintenance.plist"
-
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(SCRIPT),
-            "--install",
-            "--no-load",
-            "--repo", str(repo),
-            "--state-dir", str(tmp_path / "state"),
-            "--installed-script", str(installed),
-            "--maintenance-plist", str(plist),
-        ],
-        text=True,
-        capture_output=True,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert installed.read_bytes() == SCRIPT.read_bytes()
-    assert installed.stat().st_mode & 0o111
-    body = plist.read_text(encoding="utf-8")
-    assert "nz.diatche.hermes-maintenance-update" in body
-    assert "<false/>" in body
-    assert "--run" in body
-
-
-def test_detach_queues_installed_launchagent(tmp_path: Path) -> None:
-    repo, _ = _make_repo(tmp_path)
-    fake_bin = tmp_path / "fake-bin"
-    fake_bin.mkdir()
-    calls = tmp_path / "launchctl-calls"
-    launchctl = _write(
-        fake_bin,
-        "launchctl",
-        "#!/bin/sh\n"
-        f"printf '%s\\n' \"$*\" >> {calls!s}\n"
-        "exit 0\n",
-    )
-    launchctl.chmod(0o755)
-    env = os.environ.copy()
-    env["PATH"] = f"{fake_bin}:{env['PATH']}"
-    state_dir = tmp_path / "state"
-
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(SCRIPT),
-            "--detach",
-            "--repo", str(repo),
-            "--state-dir", str(state_dir),
-        ],
-        text=True,
-        capture_output=True,
-        env=env,
-    )
-
-    assert result.returncode == 0, result.stderr
-    domain = f"gui/{os.getuid()}/nz.diatche.hermes-maintenance-update"
-    assert calls.read_text().splitlines() == [
-        f"print {domain}",
-        f"kickstart {domain}",
-    ]
-    assert json.loads((state_dir / "state.json").read_text())["phase"] == "queued"
