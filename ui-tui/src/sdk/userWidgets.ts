@@ -1,7 +1,7 @@
 import { watch } from 'fs'
 import { readdir } from 'fs/promises'
 import { homedir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import { pathToFileURL } from 'url'
 
 import { Box, Text } from '@hermes/ink'
@@ -12,7 +12,7 @@ import { GridAreas, WidgetGrid } from '../components/widgetGrid.js'
 import { recordParentLifecycle } from '../lib/parentLog.js'
 
 import { openWidget, updateWidget } from './host.js'
-import { defineWidgetApp, listWidgetApps } from './registry.js'
+import { defineWidgetApp, listWidgetApps, removeWidgetApp } from './registry.js'
 import { isCtrl } from './types.js'
 
 /**
@@ -50,28 +50,58 @@ export type WidgetSdk = typeof widgetSdk
 const widgetsDir = () => join(process.env.HERMES_HOME?.trim() || join(homedir(), '.hermes'), 'tui-widgets')
 
 export interface UserWidgetLoadResult {
+  /** App ids newly registered by this scan. */
+  added: string[]
   errors: { file: string; message: string }[]
   loaded: string[]
+  /** App ids unregistered because their file disappeared. */
+  removed: string[]
 }
 
-/** Scan + import + register. Cache-busted so `/widgets-reload` picks up
- *  edits without restarting the TUI (the old module stays in memory — its
- *  re-`defineWidgetApp` is last-writer-wins, so the fresh definition shadows
- *  the stale one). */
-export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoadResult> {
-  const result: UserWidgetLoadResult = { errors: [], loaded: [] }
+/** Which app ids each user file registered — the delete-sync source of
+ *  truth (file gone on the next scan ⇒ its apps unregister). */
+const fileApps = new Map<string, string[]>()
 
-  let files: string[]
+const listeners = new Set<(result: UserWidgetLoadResult) => void>()
+
+/** Subscribe to scan results — the app layer announces loads in the
+ *  transcript so a hot-loaded widget is VISIBLY live (silent success is
+ *  indistinguishable from failure). */
+export function onUserWidgets(listener: (result: UserWidgetLoadResult) => void): () => void {
+  listeners.add(listener)
+
+  return () => listeners.delete(listener)
+}
+
+/** Scan + import + register, diffing the registry per file. Cache-busted so
+ *  edits reload without restarting the TUI (last-writer-wins shadows stale
+ *  definitions). Files that vanished unregister their apps. */
+export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoadResult> {
+  const result: UserWidgetLoadResult = { added: [], errors: [], loaded: [], removed: [] }
+
+  let files: string[] = []
 
   try {
     files = (await readdir(dir)).filter(f => f.endsWith('.mjs')).sort()
   } catch {
-    return result // no directory = no user widgets, not an error
+    // No directory: fall through so previously-loaded files still delete-sync.
   }
 
-  const before = new Set(listWidgetApps().map(app => app.id))
+  for (const [file, ids] of fileApps) {
+    if (!files.includes(file)) {
+      fileApps.delete(file)
+
+      for (const id of ids) {
+        if (removeWidgetApp(id)) {
+          result.removed.push(id)
+        }
+      }
+    }
+  }
 
   for (const file of files) {
+    const before = new Set(listWidgetApps().map(app => app.id))
+
     try {
       const mod = (await import(`${pathToFileURL(join(dir, file)).href}?t=${Date.now()}`)) as {
         default?: (sdk: WidgetSdk) => void
@@ -83,6 +113,16 @@ export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoa
 
       mod.default(widgetSdk)
       result.loaded.push(file)
+
+      const ids = listWidgetApps()
+        .map(app => app.id)
+        .filter(id => !before.has(id))
+
+      // Re-registrations of existing ids keep their prior file attribution.
+      if (ids.length) {
+        fileApps.set(file, ids)
+        result.added.push(...ids)
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
 
@@ -91,12 +131,12 @@ export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoa
     }
   }
 
-  const added = listWidgetApps()
-    .map(app => app.id)
-    .filter(id => !before.has(id))
+  if (result.added.length) {
+    recordParentLifecycle(`user widgets registered: ${result.added.join(', ')}`)
+  }
 
-  if (added.length) {
-    recordParentLifecycle(`user widgets registered: ${added.join(', ')}`)
+  for (const listener of listeners) {
+    listener(result)
   }
 
   return result
@@ -135,13 +175,28 @@ export function watchUserWidgets(dir = widgetsDir()): void {
   }
 
   if (!attach()) {
-    const poll = setInterval(() => {
-      if (attach()) {
-        clearInterval(poll)
-        void loadUserWidgets(dir)
-      }
-    }, 10_000)
+    // Event-driven first-creation: watch the PARENT for the widgets dir to
+    // appear, attach + scan the instant it does. The very first widget a
+    // user (or Hermes) ever writes must hot-load too — a 10s poll here read
+    // as "requires a restart" in live use.
+    try {
+      const parent = watch(dirname(dir), () => {
+        if (attach()) {
+          parent.close()
+          void loadUserWidgets(dir)
+        }
+      })
 
-    poll.unref?.()
+      parent.unref?.()
+    } catch {
+      const poll = setInterval(() => {
+        if (attach()) {
+          clearInterval(poll)
+          void loadUserWidgets(dir)
+        }
+      }, 2_000)
+
+      poll.unref?.()
+    }
   }
 }
