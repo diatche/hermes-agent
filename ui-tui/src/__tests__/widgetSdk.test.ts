@@ -52,6 +52,29 @@ describe('widget SDK host', () => {
     expect(getOverlayState().widget).toBeNull()
   })
 
+  it('a widget that throws in render shows an error chip, not a dead TUI', async () => {
+    const { defineWidgetApp } = await import('../sdk/registry.js')
+    const { AmbientDock } = await import('../sdk/host.js')
+    const { renderToScreen } = await import('../../packages/hermes-ink/src/ink/render-to-screen.js')
+    const { createElement } = await import('react')
+
+    defineWidgetApp({
+      help: 'crash test',
+      id: 'crash-test',
+      mode: 'ambient',
+      init: () => ({}),
+      reduce: state => state,
+      render: () => {
+        throw new Error('boom')
+      }
+    })
+
+    launchWidget('crash-test', 'x')
+
+    // Renders the boundary chip instead of propagating the throw.
+    expect(() => renderToScreen(createElement(AmbientDock, { placement: 'dock-bottom' }), 60)).not.toThrow()
+  })
+
   it('openWidget is a typed direct launch', () => {
     openWidget(dialogTestApp, { body: 'hi', zone: 'top-right' })
     expect(getOverlayState().widget).toMatchObject({ appId: 'dialog-test', state: { zone: 'top-right' } })

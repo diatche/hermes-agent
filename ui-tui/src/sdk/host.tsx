@@ -1,10 +1,10 @@
-import { useStdout } from '@hermes/ink'
-import { Box } from '@hermes/ink'
+import { Box, Text, useStdout } from '@hermes/ink'
 import { useStore } from '@nanostores/react'
-import type { ReactNode } from 'react'
+import { Component, type ReactNode } from 'react'
 
 import { $overlayState, patchOverlayState } from '../app/overlayStore.js'
 import { $uiTheme } from '../app/uiStore.js'
+import { recordParentLifecycle } from '../lib/parentLog.js'
 
 import { getWidgetApp } from './registry.js'
 import type { ActiveWidget, AmbientZone, WidgetApp, WidgetInput } from './types.js'
@@ -130,10 +130,53 @@ export function dispatchWidgetInput(input: WidgetInput): boolean {
   return true
 }
 
+/** Crash isolation: a widget throwing in render must NEVER take the TUI
+ *  down (user widgets are agent-generated code). The boundary swaps the
+ *  card for a compact error chip and logs; the app stays registered so a
+ *  hot-reloaded fix re-renders on the next state change. */
+class WidgetBoundary extends Component<
+  { appId: string; children: ReactNode; errorColor: string },
+  { message: null | string }
+> {
+  override state: { message: null | string } = { message: null }
+
+  static getDerivedStateFromError(error: unknown) {
+    return { message: error instanceof Error ? error.message : String(error) }
+  }
+
+  override componentDidCatch(error: unknown) {
+    recordParentLifecycle(
+      `widget /${this.props.appId} crashed in render: ${error instanceof Error ? error.message : String(error)}`
+    )
+  }
+
+  override render() {
+    if (this.state.message !== null) {
+      return (
+        <Text color={this.props.errorColor} wrap="truncate-end">
+          ⚠ /{this.props.appId}: {this.state.message}
+        </Text>
+      )
+    }
+
+    return this.props.children
+  }
+}
+
 const renderApp = (active: ActiveWidget, ctx: { cols: number; rows: number; t: never }) => {
   const app = getWidgetApp(active.appId)
 
-  return app ? app.render({ ...ctx, state: active.state as never }) : null
+  if (!app) {
+    return null
+  }
+
+  const t = ctx.t as { color: { error: string } }
+
+  return (
+    <WidgetBoundary appId={active.appId} errorColor={t.color.error} key={active.appId}>
+      {app.render({ ...ctx, state: active.state as never })}
+    </WidgetBoundary>
+  )
 }
 
 /** Render slot for the MODAL app — viewport-level, so it can anchor
