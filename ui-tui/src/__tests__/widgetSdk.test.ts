@@ -13,7 +13,7 @@ beforeEach(() => resetOverlayState())
 
 describe('widget SDK host', () => {
   it('registers the reference apps', () => {
-    expect(listWidgetApps()).toEqual(expect.arrayContaining(['dialog-test', 'grid-test']))
+    expect(listWidgetApps().map(app => app.id)).toEqual(expect.arrayContaining(['dialog-test', 'grid-test', 'weather']))
     expect(getWidgetApp('grid-test')).toBe(gridTestApp)
   })
 

@@ -120,6 +120,8 @@ function load(location: string): void {
 
 export const weatherApp = defineWidgetApp<WeatherState>({
   id: 'weather',
+  help: 'current conditions with themed ASCII art (wttr.in)',
+  mode: 'ambient',
   usage: USAGE,
 
   init(arg) {
@@ -144,13 +146,15 @@ export const weatherApp = defineWidgetApp<WeatherState>({
     return state
   },
 
+  // Ambient: a glanceable card on the right edge — no backdrop, no input
+  // capture, the composer stays live. /weather again dismisses it.
   render({ cols, state, t }) {
     const { phase } = state
     const title = phase.kind === 'ready' ? phase.report.area : 'Weather'
 
     return (
-      <Overlay backdrop zone="center">
-        <Dialog hint="r refresh · Esc/q close" title={title} width={Math.min(46, cols - 8)}>
+      <Overlay zone="right">
+        <Dialog hint="/weather to close" title={title} width={Math.min(46, cols - 8)}>
           {phase.kind === 'loading' && <Text color={t.color.muted}>fetching wttr.in…</Text>}
           {phase.kind === 'error' && <Text color={t.color.error}>{phase.message}</Text>}
           {phase.kind === 'ready' && <ReadyBody report={phase.report} t={t} />}
