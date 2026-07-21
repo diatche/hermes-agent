@@ -225,49 +225,58 @@ export function AmbientDock({ placement }: { placement: 'dock-bottom' | 'dock-to
   )
 }
 
-const FLOAT_ZONES: readonly { align: 'flex-end' | 'flex-start'; anchor: 'bottom' | 'top'; zone: AmbientZone }[] = [
-  { align: 'flex-start', anchor: 'top', zone: 'top-left' },
-  { align: 'flex-end', anchor: 'top', zone: 'top-right' },
-  { align: 'flex-start', anchor: 'bottom', zone: 'bottom-left' },
-  { align: 'flex-end', anchor: 'bottom', zone: 'bottom-right' }
-]
+const DEFAULT_RAIL_WIDTH = 44
 
-/** The float layer: corner-anchored widgets overlaying the transcript
- *  margins (absolute, no reserved rows — GUI-corner style). Same-corner
- *  floats stack vertically. Mounted inside the transcript's relative
- *  container so corners track the content area, not the whole screen. */
-export function AmbientFloats(): ReactNode {
+const railSide = (zone: AmbientZone): 'left' | 'right' | null =>
+  zone === 'top-left' || zone === 'bottom-left' ? 'left' : zone === 'top-right' || zone === 'bottom-right' ? 'right' : null
+
+const railApps = (ambient: ActiveWidget[], side: 'left' | 'right') =>
+  ambient.filter(active => railSide(zoneOf(active)) === side)
+
+/** Columns a rail RESERVES (0 when empty) — the transcript's width budget
+ *  subtracts this, so widgets genuinely take up space and text reflows
+ *  beside them instead of being painted over. */
+export function ambientRailWidth(side: 'left' | 'right', ambient = $overlayState.get().ambient): number {
+  const apps = railApps(ambient, side)
+
+  return apps.length ? Math.max(...apps.map(active => getWidgetApp(active.appId)?.width ?? DEFAULT_RAIL_WIDTH)) : 0
+}
+
+/** Live rail width for layout math (re-renders on dock changes). */
+export function useAmbientRailWidth(side: 'left' | 'right'): number {
+  const overlay = useStore($overlayState)
+
+  return ambientRailWidth(side, overlay.ambient)
+}
+
+/** A side rail: a RESERVED column beside the transcript holding corner
+ *  widgets — `top-*` zones anchor to its top, `bottom-*` to its bottom.
+ *  Widgets take real space; nothing overlays content. */
+export function AmbientRail({ side }: { side: 'left' | 'right' }): ReactNode {
   const overlay = useStore($overlayState)
   const ctx = useAmbientCtx()
+  const apps = railApps(overlay.ambient, side)
 
-  const corners = FLOAT_ZONES.map(spec => ({
-    ...spec,
-    apps: overlay.ambient.filter(active => zoneOf(active) === spec.zone)
-  })).filter(corner => corner.apps.length)
-
-  if (!corners.length) {
+  if (!apps.length) {
     return null
   }
 
+  const top = apps.filter(active => zoneOf(active).startsWith('top'))
+  const bottom = apps.filter(active => zoneOf(active).startsWith('bottom'))
+  const width = ambientRailWidth(side, overlay.ambient)
+
   return (
-    <>
-      {corners.map(({ align, anchor, apps, zone }) => (
-        <Box
-          alignItems={align}
-          flexDirection="column"
-          key={zone}
-          left={0}
-          paddingX={2}
-          position="absolute"
-          rowGap={1}
-          width="100%"
-          {...(anchor === 'top' ? { top: 0 } : { bottom: 0 })}
-        >
-          {apps.map(active => (
-            <Box key={active.appId}>{renderApp(active, ctx)}</Box>
-          ))}
-        </Box>
-      ))}
-    </>
+    <Box flexDirection="column" flexShrink={0} justifyContent="space-between" paddingX={1} width={width}>
+      <Box flexDirection="column" rowGap={1}>
+        {top.map(active => (
+          <Box key={active.appId}>{renderApp(active, ctx)}</Box>
+        ))}
+      </Box>
+      <Box flexDirection="column" rowGap={1}>
+        {bottom.map(active => (
+          <Box key={active.appId}>{renderApp(active, ctx)}</Box>
+        ))}
+      </Box>
+    </Box>
   )
 }

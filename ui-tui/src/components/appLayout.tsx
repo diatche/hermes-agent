@@ -22,7 +22,7 @@ import {
 } from '../lib/inputMetrics.js'
 import { PerfPane } from '../lib/perfPane.js'
 import { composerPromptText } from '../lib/prompt.js'
-import { ActiveWidgetSlot, AmbientDock, AmbientFloats } from '../sdk/host.js'
+import { ActiveWidgetSlot, AmbientDock, AmbientRail, useAmbientRailWidth } from '../sdk/host.js'
 
 import { AgentsOverlay } from './agentsOverlay.js'
 import { GoodVibesHeart, StatusRule, StickyPromptTracker, TranscriptScrollbar } from './appChrome.js'
@@ -143,14 +143,15 @@ const TranscriptPane = memo(function TranscriptPane({
 }: Pick<AppLayoutProps, 'actions' | 'composer' | 'progress' | 'transcript'>) {
   const ui = useStore($uiState)
   const petBox = useStore($petBox)
+  const railCols = useAmbientRailWidth('left') + useAmbientRailWidth('right')
 
   // Keep transcript text clear of the floating pet, responsively:
   //  - wide terminals: reserve a right gutter so lines wrap to the pet's left
   //    (as long as enough width is left for comfortable reading);
   //  - narrow terminals: keep full width and reserve bottom rows instead, so
   //    the newest lines sit above the pet rather than getting cramped.
-  const useGutter = !!petBox && composer.cols - petBox.width >= MIN_GUTTER_BODY_COLS
-  const bodyCols = useGutter && petBox ? composer.cols - petBox.width : composer.cols
+  const useGutter = !!petBox && composer.cols - railCols - petBox.width >= MIN_GUTTER_BODY_COLS
+  const bodyCols = Math.max(28, (useGutter && petBox ? composer.cols - petBox.width : composer.cols) - railCols)
   const petBandRows = petBox && !useGutter ? petBox.height : 0
 
   // LiveTodoPanel rides as a child of the latest user-message row so it
@@ -530,8 +531,8 @@ export const AppLayout = memo(function AppLayout({
   return (
     <Shell {...shellProps}>
       <Box flexDirection="column" flexGrow={1} position="relative">
-        <Box flexDirection="row" flexGrow={1} position="relative">
-          {!overlay.agents && !overlay.journey && <AmbientFloats />}
+        <Box flexDirection="row" flexGrow={1}>
+          {!overlay.agents && !overlay.journey && <AmbientRail side="left" />}
           {overlay.agents ? (
             <PerfPane id="agents">
               <AgentsOverlayPane />
@@ -545,6 +546,7 @@ export const AppLayout = memo(function AppLayout({
               <TranscriptPane actions={actions} composer={composer} progress={progress} transcript={transcript} />
             </PerfPane>
           )}
+          {!overlay.agents && !overlay.journey && <AmbientRail side="right" />}
         </Box>
 
         {!overlay.agents && !overlay.journey && (

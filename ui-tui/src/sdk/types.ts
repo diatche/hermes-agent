@@ -45,6 +45,9 @@ export interface WidgetApp<S = unknown> {
   mode?: 'ambient' | 'modal'
   /** Ambient placement — see AmbientZone. Default `dock-bottom`. */
   zone?: AmbientZone
+  /** Card width in cells (ambient). Floats RESERVE this as a transcript
+   *  rail, so match your Dialog width. Default 44. */
+  width?: number
   init(arg: string): null | S
   reduce(state: S, input: WidgetInput): null | S
   render(ctx: WidgetRenderCtx<S>): ReactNode

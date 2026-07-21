@@ -49,7 +49,8 @@ export type { Theme, ThemeColors } from '../theme.js'
 export {
   ActiveWidgetSlot,
   AmbientDock,
-  AmbientFloats,
+  AmbientRail,
+  ambientRailWidth,
   closeWidget,
   dispatchWidgetInput,
   launchWidget,

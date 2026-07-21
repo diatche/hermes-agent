@@ -118,6 +118,32 @@ describe('widget SDK host', () => {
     ])
   })
 
+  it('rails reserve the widest railed app; docks reserve nothing sideways', async () => {
+    const { ambientRailWidth } = await import('../sdk/host.js')
+    const { defineWidgetApp } = await import('../sdk/registry.js')
+    const { Text } = await import('@hermes/ink')
+    const { createElement } = await import('react')
+
+    defineWidgetApp({
+      help: 'wide rail app',
+      id: 'rail-wide',
+      mode: 'ambient',
+      width: 52,
+      zone: 'top-right',
+      init: () => ({}),
+      reduce: state => state,
+      render: () => createElement(Text, null, 'wide')
+    })
+
+    expect(ambientRailWidth('right')).toBe(0)
+    launchWidget('corner-test', 'x') // top-right, default width 44
+    launchWidget('rail-wide', 'x')
+    launchWidget('ticker', 'x') // dock-bottom — no rail contribution
+
+    expect(ambientRailWidth('right')).toBe(52)
+    expect(ambientRailWidth('left')).toBe(0)
+  })
+
   it('ambient apps dock together and toggle independently', () => {
     expect(launchWidget('ticker', 'eurusd')).toBeNull()
     expect(launchWidget('weather', '')).toBeNull()
