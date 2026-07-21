@@ -278,8 +278,10 @@ function StreamPanel({
       paddingX={1}
       width={cell.width}
     >
+      {/* No phantom icon column: unfocused titles sit flush left — the ▸
+          appears (and shifts the title) only while focused. */}
       <Text bold={focused} color={focused ? t.color.primary : t.color.label} wrap="truncate">
-        {focused ? '▸ ' : '  '}
+        {focused ? '▸ ' : ''}
         {title}
         {main ? ' ·' : ''}
       </Text>
