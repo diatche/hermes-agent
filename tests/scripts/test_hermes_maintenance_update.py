@@ -63,6 +63,18 @@ def _make_repo(tmp_path: Path, *, conflict: bool = False) -> tuple[Path, str]:
     _git(repo, "switch", "-c", "diatche")
     python = _write(repo, "venv/bin/python", "#!/bin/sh\nexit 0\n")
     python.chmod(0o755)
+    updater_calls = tmp_path / "official-updater-calls.log"
+    updater = _write(
+        repo,
+        "venv/bin/hermes",
+        "#!/bin/sh\nset -eu\n"
+        f"printf '%s\\n' \"$*\" >> {updater_calls!s}\n"
+        "git fetch origin main\n"
+        "git update-ref refs/heads/main refs/remotes/origin/main\n"
+        "git switch main\n"
+        "git reset --hard refs/remotes/origin/main\n",
+    )
+    updater.chmod(0o755)
     _write(repo, ".git/info/exclude", "venv/\n")
     _write(repo, "base.txt" if conflict else "local.txt", "local\n")
     _commit(repo, "local")
@@ -110,6 +122,30 @@ def _fake_runtime(
     return wrapper, health, calls
 
 
+def _fake_official_updater(tmp_path: Path) -> tuple[Path, Path]:
+    """Emulate only the updater's documented Git result inside the fixture repo."""
+    calls = tmp_path / "official-updater-calls.log"
+    updater = _write(
+        tmp_path,
+        "fake-hermes",
+        "#!/bin/sh\nset -eu\n"
+        f"printf '%s\\n' \"$*\" >> {calls!s}\n"
+        "git fetch origin main\n"
+        "git update-ref refs/heads/main refs/remotes/origin/main\n"
+        "git switch main\n"
+        "git reset --hard refs/remotes/origin/main\n",
+    )
+    updater.chmod(0o755)
+    return updater, calls
+
+
+def _emulate_official_update(repo: Path) -> None:
+    _git(repo, "fetch", "origin", "main")
+    _git(repo, "update-ref", "refs/heads/main", "refs/remotes/origin/main")
+    _git(repo, "switch", "main")
+    _git(repo, "reset", "--hard", "refs/remotes/origin/main")
+
+
 def _run(
     repo: Path,
     tmp_path: Path,
@@ -121,6 +157,7 @@ def _run(
     wrapper, health, calls = _fake_runtime(
         tmp_path, fail_health_call=fail_health_call, fail_stop=fail_stop
     )
+    updater, _ = _fake_official_updater(tmp_path)
     state_dir = tmp_path / "state"
     result = subprocess.run(
         [
@@ -130,6 +167,7 @@ def _run(
             "--state-dir", str(state_dir),
             "--wrapperctl", str(wrapper),
             "--health-script", str(health),
+            "--updater-executable", str(updater),
         ],
         text=True,
         capture_output=True,
@@ -139,15 +177,18 @@ def _run(
 
 
 def _args(repo: Path, state_dir: Path, wrapper: Path, health: Path) -> Namespace:
+    updater, _ = _fake_official_updater(repo.parent)
     return Namespace(
         repo=repo,
         state_dir=state_dir,
         wrapperctl=wrapper,
         health_script=health,
+        updater_executable=updater,
         remote="origin",
         upstream_branch="main",
         wrapper_timeout=30,
         health_timeout=30,
+        updater_timeout=30,
     )
 
 
@@ -198,6 +239,7 @@ def test_success_force_stops_merges_and_restarts(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert _git(repo, "branch", "--show-current") == "diatche"
     assert _git(repo, "rev-parse", "main") == upstream_sha
+    assert _git(repo, "rev-parse", "origin/main") == upstream_sha
     assert _git(repo, "merge-base", "--is-ancestor", upstream_sha, "diatche") == ""
     assert _git(repo, "status", "--porcelain") == ""
     assert calls.read_text(encoding="utf-8").splitlines() == [
@@ -209,6 +251,7 @@ def test_success_force_stops_merges_and_restarts(tmp_path: Path) -> None:
     state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
     assert state["phase"] == "complete"
     assert state["upstream_sha"] == upstream_sha
+    assert _git(repo, "rev-parse", state["fetch_ref"]) == upstream_sha
     assert "official updater" not in result.stdout.lower()
     assert "Fetching origin/main" in result.stderr
     assert "Building and validating the isolated merge candidate" in result.stderr
@@ -445,12 +488,17 @@ def test_cas_failure_does_not_reset_concurrent_ref_or_checkout_changes(
 
     def concurrent_cas_failure(_repo, **kwargs):
         nonlocal moved_to
-        moved_to = kwargs["main_new"]
+        moved_to = kwargs["integration_new"]
         _write(repo, "base.txt", "concurrent tracked edit\n")
         _git(repo, "update-ref", "refs/heads/diatche", moved_to)
         raise RuntimeError("ref compare-and-swap transaction failed")
 
-    monkeypatch.setattr(module, "_publish_refs", concurrent_cas_failure)
+    monkeypatch.setattr(module, "_publish_integration", concurrent_cas_failure)
+    monkeypatch.setattr(
+        module,
+        "_official_update",
+        lambda _executable, target_repo, _timeout: _emulate_official_update(target_repo),
+    )
 
     result = module._run_maintenance(_args(repo, state_dir, wrapper, health))
 
@@ -496,7 +544,7 @@ def test_failure_recovery_retains_original_lock_and_signal_guard(
     wrapper, health, _ = _fake_runtime(tmp_path, fail_health_call=1)
     state_dir = tmp_path / "state"
     observed: dict[str, object] = {}
-    original_assert = module._assert_transaction_checkout
+    original_recover = module._recover_owned_git_state
 
     def probe_guard(*args, **kwargs):
         lock_file = state_dir / "maintenance.lock"
@@ -513,15 +561,75 @@ def test_failure_recovery_retains_original_lock_and_signal_guard(
         )
         observed["lock_returncode"] = probe.returncode
         observed["signal_handler"] = signal.getsignal(signal.SIGTERM)
-        return original_assert(*args, **kwargs)
+        return original_recover(*args, **kwargs)
 
-    monkeypatch.setattr(module, "_assert_transaction_checkout", probe_guard)
+    monkeypatch.setattr(module, "_recover_owned_git_state", probe_guard)
+    monkeypatch.setattr(
+        module,
+        "_official_update",
+        lambda _executable, target_repo, _timeout: _emulate_official_update(target_repo),
+    )
 
     result = module._run_maintenance(_args(repo, state_dir, wrapper, health))
 
     assert result == 1
     assert observed["lock_returncode"] == 23
     assert callable(observed["signal_handler"]) or observed["signal_handler"] is signal.SIG_IGN
+
+
+def test_official_updater_failure_restores_owned_git_state_and_old_runtime(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _make_repo(tmp_path)
+    old_main = _git(repo, "rev-parse", "main")
+    old_origin_main = _git(repo, "rev-parse", "origin/main")
+    old_diatche = _git(repo, "rev-parse", "diatche")
+    wrapper, health, calls = _fake_runtime(tmp_path)
+    updater_calls = tmp_path / "failing-updater-calls.log"
+    updater = _write(
+        tmp_path,
+        "failing-hermes",
+        "#!/bin/sh\nset -eu\n"
+        f"printf '%s\\n' \"$*\" >> {updater_calls!s}\n"
+        "git fetch origin main\n"
+        "git update-ref refs/heads/main refs/remotes/origin/main\n"
+        "git switch main\n"
+        "git reset --hard refs/remotes/origin/main\n"
+        "exit 42\n",
+    )
+    updater.chmod(0o755)
+    state_dir = tmp_path / "state"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo", str(repo),
+            "--state-dir", str(state_dir),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+            "--updater-executable", str(updater),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert "official Hermes updater failed" in result.stderr
+    assert updater_calls.read_text().splitlines() == [
+        "update --branch main --backup --yes --no-gateway-restart"
+    ]
+    assert _git(repo, "branch", "--show-current") == "diatche"
+    assert _git(repo, "rev-parse", "main") == old_main
+    assert _git(repo, "rev-parse", "origin/main") == old_origin_main
+    assert _git(repo, "rev-parse", "diatche") == old_diatche
+    assert _git(repo, "rev-parse", "HEAD") == old_diatche
+    assert calls.read_text().splitlines() == [
+        "--status", "--force-stop", "--foreground", "--status"
+    ]
+    state = json.loads((state_dir / "state.json").read_text())
+    assert state["recovered"] is True
+    assert "not rolled back" in state["rollback_scope"]
 
 
 def test_stop_failure_keeps_refs_and_restarts_old_runtime(tmp_path: Path) -> None:
@@ -543,12 +651,12 @@ def test_stop_failure_keeps_refs_and_restarts_old_runtime(tmp_path: Path) -> Non
     ]
 
 
-def test_never_invokes_updater_package_or_build_commands(tmp_path: Path) -> None:
+def test_invokes_only_official_updater_with_exact_managed_arguments(tmp_path: Path) -> None:
     repo, _ = _make_repo(tmp_path)
     forbidden = tmp_path / "forbidden-bin"
     called = tmp_path / "forbidden-called"
     forbidden.mkdir()
-    for name in ("hermes", "npm", "pip", "pip3", "uv", "yarn", "pnpm", "make"):
+    for name in ("npm", "pip", "pip3", "uv", "yarn", "pnpm", "make"):
         command = forbidden / name
         command.write_text(
             f"#!/bin/sh\nprintf '%s\\n' '{name}' >> {called!s}\nexit 97\n",
@@ -561,6 +669,9 @@ def test_never_invokes_updater_package_or_build_commands(tmp_path: Path) -> None
 
     assert result.returncode == 0, result.stderr
     assert not called.exists()
+    assert (tmp_path / "official-updater-calls.log").read_text().splitlines() == [
+        "update --branch main --backup --yes --no-gateway-restart"
+    ]
 
 
 def test_hindsight_embedding_guard_repairs_only_incompatible_hub(

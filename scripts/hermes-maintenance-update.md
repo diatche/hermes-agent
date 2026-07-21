@@ -16,10 +16,18 @@ python3 scripts/hermes-maintenance-update.py
 ```
 
 The command prints each major phase immediately while it runs, including fetch,
-isolated candidate construction, gateway stop/start, ref publication, Hindsight
-compatibility, and live health verification. It does not call the broad
-`hermes update` command, so there is no hidden updater subprocess or buffered
-updater output behind these messages.
+isolated candidate construction, the official update, gateway stop/start, ref
+publication, Hindsight compatibility, and live health verification. Its managed
+installation step is exactly:
+
+```text
+<repo>/venv/bin/hermes update --branch main --backup --yes --no-gateway-restart
+```
+
+The official updater owns dependency synchronization, assets, bundled skills,
+configuration migration, caches, and backups. The wrapper supplies the local
+Git-branch and custom-supervisor policy around it rather than imitating those
+internals.
 
 Optionally run the preflight without stopping or restarting Hermes:
 
@@ -48,22 +56,31 @@ overrides used by isolated tests are intentionally hidden.
    and prove the merge is conflict-free before stopping the runtime.
 4. Build and validate the merge candidate in a temporary detached worktree, then
    immediately re-prove checkout cleanliness and all pinned refs before stop.
-5. Force-stop through the custom wrapper, then atomically compare-and-swap both
-   `main` and `diatche` refs.
-6. Restore the exact `diatche` checkout, enforce the Hindsight
+5. Force-stop through the custom wrapper, then invoke the official updater with
+   gateway restart disabled. Require it to leave the clean checkout on `main`,
+   with `main`, `origin/main`, and the private fetch ref all equal to the pinned
+   upstream SHA while `diatche` is still at its old SHA.
+6. Atomically compare-and-swap only `diatche` to the prebuilt candidate while
+   verifying `main`, `origin/main`, the private fetch ref, and old `diatche` in
+   the same ref transaction.
+7. Restore the exact `diatche` checkout, enforce the Hindsight
    `huggingface-hub>=1.5.0,<2.0` compatibility guard, restart through the custom
    wrapper, and verify wrapper status plus the health probe.
-7. On ordinary failure, keep the original lock and one-shot signal guard through
+8. On ordinary failure, keep the original lock and one-shot signal guard through
    recovery and final state publication. Roll back only a ref/checkout state
    proven to have been produced by this transaction; concurrent ref, index, or
    file changes fail closed and are preserved.
-8. Before hard-crash recovery mutates refs or checkout files, force-stop any
+9. Before hard-crash recovery mutates refs or checkout files, force-stop any
    runtime that cannot be proven to be the healthy original runtime.
 
 Every child command is bounded and runs in its own process group so timeout or
-interruption terminates descendants. The script does not invoke the broad
-`hermes update` flow, build the application, synchronize profile/config/cache
-state, or install itself.
+interruption terminates descendants. Git refs and checkout files owned by the
+orchestration transaction are recovered only when their identity and clean
+state are safely provable. Official-updater external state is deliberately not
+transactional: dependency/environment changes, generated assets, bundled skill
+or config synchronization, caches, and updater backups may remain after updater
+or later orchestration failure. Recovery restores the prior Git runtime and
+restarts it when safe; it does not claim to restore the whole installation.
 
 The Hindsight compatibility repair uses `pip --no-deps` and is deliberately
 outside the Git rollback boundary: once repaired, that shared-venv invariant is

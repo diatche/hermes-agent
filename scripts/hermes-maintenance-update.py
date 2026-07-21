@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Run the guarded foreground update for the local Hermes integration checkout.
 
-This command replaces ``hermes update`` for Pavel's local branch/runtime model;
-it never invokes that broad updater. With no arguments, it fetches an immutable
-upstream tip, preflights and builds the merge in isolation, atomically publishes
-``main`` and ``diatche``, then restarts and health-checks the custom wrapper.
-``--check`` performs only the read-only checkout and merge preflight.
+This command wraps the official ``hermes update`` for Pavel's local
+branch/runtime model. With no arguments, it fetches an immutable upstream tip,
+preflights and builds the merge in isolation, stops the custom supervisor, lets
+the official updater synchronize the managed installation without restarting
+the gateway, publishes only ``diatche``, then restores and health-checks it.
+``--check`` performs only a no-fetch, no-ref/no-checkout merge preflight.
 Interrupted journals are recovered automatically.
 """
 from __future__ import annotations
@@ -56,6 +57,9 @@ import huggingface_hub
 import sentence_transformers
 import transformers
 """
+OFFICIAL_UPDATE_ARGUMENTS = (
+    "update", "--branch", "main", "--backup", "--yes", "--no-gateway-restart"
+)
 
 
 class BusyError(RuntimeError):
@@ -210,6 +214,21 @@ def _health(health_script: Path, repo: Path, timeout: float) -> None:
         raise RuntimeError("wrapper health validation failed")
 
 
+def _official_update(executable: Path, repo: Path, timeout: float) -> None:
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise RuntimeError(f"official Hermes updater is missing: {executable}")
+    result = _run(
+        (str(executable), *OFFICIAL_UPDATE_ARGUMENTS),
+        cwd=repo,
+        timeout=timeout,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            "official Hermes updater failed" + (f": {detail}" if detail else "")
+        )
+
+
 def _ensure_hindsight_embeddings(repo: Path, timeout: float) -> None:
     """Repair the known shared-venv HF downgrade, then prove imports work."""
     python = repo / "venv" / "bin" / "python"
@@ -333,14 +352,37 @@ def _update_ref_transaction(repo: Path, commands: list[str]) -> None:
         )
 
 
-def _publish_refs(
-    repo: Path, *, main_old: str, main_new: str, integration_branch: str,
-    integration_old: str, integration_new: str,
+def _publish_integration(
+    repo: Path, *, main_oid: str, origin_main_oid: str, upstream_ref: str,
+    upstream_oid: str, integration_branch: str, integration_old: str,
+    integration_new: str,
 ) -> None:
+    """CAS only the local integration ref while verifying updater-owned refs."""
     _update_ref_transaction(repo, [
-        f"update refs/heads/main {main_new} {main_old}",
+        f"verify refs/heads/main {main_oid}",
+        f"verify refs/remotes/origin/main {origin_main_oid}",
+        f"verify {upstream_ref} {upstream_oid}",
         f"update refs/heads/{integration_branch} {integration_new} {integration_old}",
     ])
+
+
+def _assert_official_update_result(
+    repo: Path, *, upstream_ref: str, upstream_oid: str, integration_old: str,
+) -> None:
+    expected = (
+        ("refs/heads/main", upstream_oid),
+        ("refs/remotes/origin/main", upstream_oid),
+        (upstream_ref, upstream_oid),
+        ("refs/heads/diatche", integration_old),
+        ("HEAD", upstream_oid),
+    )
+    for ref, oid in expected:
+        if _oid(repo, ref) != oid:
+            raise RuntimeError(f"official updater left unexpected Git state: {ref}")
+    if _git(repo, "branch", "--show-current").stdout.strip() != "main":
+        raise RuntimeError("official updater did not leave the checkout on main")
+    if _git(repo, "status", "--porcelain").stdout.strip():
+        raise RuntimeError("official updater left a dirty checkout")
 
 
 def _assert_pre_stop_snapshot(
@@ -405,6 +447,58 @@ def _assert_transaction_checkout(
     ).returncode
     if not (index_is_old or index_is_new):
         raise RuntimeError("cannot recover after concurrent index changes")
+
+
+def _recover_owned_git_state(repo: Path, payload: dict[str, Any]) -> None:
+    """Restore only Git states provably produced by this orchestration run."""
+    main_old = str(payload["main_old"])
+    upstream = str(payload["main_new"])
+    integration_old = str(payload["integration_old"])
+    integration_new = str(payload["integration_new"])
+    origin_ref = str(payload.get("origin_ref", "refs/remotes/origin/main"))
+    origin_old = payload.get("origin_old")
+    fetch_ref = payload.get("fetch_ref")
+
+    current_main = _oid(repo, "refs/heads/main")
+    current_integration = _oid(repo, "refs/heads/diatche")
+    if current_main not in {main_old, upstream}:
+        raise RuntimeError("cannot recover after concurrent main movement")
+    if current_integration not in {integration_old, integration_new}:
+        raise RuntimeError("cannot recover after concurrent diatche movement")
+    current_origin = _oid(repo, origin_ref) if origin_old is not None else None
+    if origin_old is not None and current_origin not in {str(origin_old), upstream}:
+        raise RuntimeError("cannot recover after concurrent origin/main movement")
+    if fetch_ref is not None and _oid(repo, str(fetch_ref)) != upstream:
+        raise RuntimeError("cannot recover after private fetch ref movement")
+
+    branch = _git(repo, "branch", "--show-current").stdout.strip()
+    head = _oid(repo, "HEAD")
+    expected_head = current_main if branch == "main" else current_integration
+    if branch not in {"main", "diatche"} or head != expected_head:
+        raise RuntimeError("cannot recover after concurrent checkout movement")
+    if _git(repo, "status", "--porcelain").stdout.strip():
+        raise RuntimeError("cannot recover after concurrent checkout changes")
+
+    commands: list[str] = []
+    if fetch_ref is not None:
+        commands.append(f"verify {fetch_ref} {upstream}")
+    if current_main != main_old:
+        commands.append(f"update refs/heads/main {main_old} {current_main}")
+    else:
+        commands.append(f"verify refs/heads/main {main_old}")
+    if origin_old is not None:
+        if current_origin != str(origin_old):
+            commands.append(f"update {origin_ref} {origin_old} {current_origin}")
+        else:
+            commands.append(f"verify {origin_ref} {origin_old}")
+    if current_integration != integration_old:
+        commands.append(
+            f"update refs/heads/diatche {integration_old} {current_integration}"
+        )
+    else:
+        commands.append(f"verify refs/heads/diatche {integration_old}")
+    _update_ref_transaction(repo, commands)
+    _restore_checkout(repo, "diatche", integration_old)
 
 
 def _journal_payload(
@@ -491,7 +585,9 @@ def _recover_payload(
         # A hard crash may have left a candidate runtime alive. Quiesce it
         # before changing refs or checkout files underneath that process.
         _wrapper(wrapper, repo, "--force-stop", wrapper_timeout)
-        if refs_are_original:
+        if "origin_old" in payload:
+            _recover_owned_git_state(repo, payload)
+        elif refs_are_original:
             _assert_checkout(repo, "diatche")
             if _oid(repo, "HEAD") != payload["integration_old"]:
                 raise RuntimeError("cannot recover after concurrent checkout movement")
@@ -521,7 +617,6 @@ def _run_maintenance_locked(
     journal: dict[str, Any] | None = None
     wrapper_stopped = False
     wrapper_started = False
-    published = False
     try:
         _progress("Checking for interrupted maintenance to recover")
         _recover_interrupted(args, repo, state_dir)
@@ -529,6 +624,8 @@ def _run_maintenance_locked(
         _assert_checkout(repo, "diatche")
         _wrapper(args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout)
         main_old = _oid(repo, "refs/heads/main")
+        origin_ref = f"refs/remotes/{args.remote}/{args.upstream_branch}"
+        origin_old = _oid(repo, origin_ref)
         integration_old = _oid(repo, "refs/heads/diatche")
         _progress(f"Fetching {args.remote}/{args.upstream_branch}")
         fetch_ref, upstream_oid = _fetch_private(
@@ -544,7 +641,16 @@ def _run_maintenance_locked(
             repo, run_id, main_old, integration_old, upstream_oid,
             candidate_oid, "prepared",
         )
-        journal.update(fetch_ref=fetch_ref, candidate_ref=candidate_ref)
+        journal.update(
+            fetch_ref=fetch_ref,
+            candidate_ref=candidate_ref,
+            origin_ref=origin_ref,
+            origin_old=origin_old,
+            rollback_scope=(
+                "Git refs and checkout only; official updater dependency, asset, "
+                "skill, config, cache, and backup changes are not rolled back"
+            ),
+        )
         _write_journal(state_dir, journal)
         _assert_pre_stop_snapshot(
             repo,
@@ -561,13 +667,35 @@ def _run_maintenance_locked(
         _wrapper(args.wrapperctl.resolve(), repo, "--force-stop", args.wrapper_timeout)
         journal.update(phase="stopped", updated_at=_now())
         _write_journal(state_dir, journal)
-        _progress("Publishing validated main and diatche refs atomically")
-        _publish_refs(
-            repo, main_old=main_old, main_new=upstream_oid,
-            integration_branch="diatche", integration_old=integration_old,
+        updater = getattr(args, "updater_executable", None)
+        updater = updater.resolve() if updater else repo / "venv" / "bin" / "hermes"
+        journal.update(phase="official-update", updated_at=_now())
+        _write_journal(state_dir, journal)
+        _progress("Running the official Hermes updater without gateway restart")
+        _official_update(
+            updater,
+            repo,
+            getattr(args, "updater_timeout", 900),
+        )
+        _assert_official_update_result(
+            repo,
+            upstream_ref=fetch_ref,
+            upstream_oid=upstream_oid,
+            integration_old=integration_old,
+        )
+        journal.update(phase="official-updated", updated_at=_now())
+        _write_journal(state_dir, journal)
+        _progress("Publishing the validated diatche ref atomically")
+        _publish_integration(
+            repo,
+            main_oid=upstream_oid,
+            origin_main_oid=upstream_oid,
+            upstream_ref=fetch_ref,
+            upstream_oid=upstream_oid,
+            integration_branch="diatche",
+            integration_old=integration_old,
             integration_new=candidate_oid,
         )
-        published = True
         journal.update(phase="published", updated_at=_now())
         _write_journal(state_dir, journal)
         _progress("Restoring the validated diatche checkout")
@@ -596,7 +724,7 @@ def _run_maintenance_locked(
         return 0
     except Exception as exc:
         recovery_error = ""
-        if journal is not None and (wrapper_stopped or published):
+        if journal is not None and wrapper_stopped:
             try:
                 _progress("Update failed after gateway interruption; recovering the previous runtime")
                 if wrapper_started:
@@ -604,32 +732,7 @@ def _run_maintenance_locked(
                         args.wrapperctl.resolve(), repo, "--force-stop",
                         args.wrapper_timeout,
                     )
-                if published:
-                    _assert_transaction_checkout(
-                        repo,
-                        integration_old=journal["integration_old"],
-                        integration_new=journal["integration_new"],
-                    )
-                    _restore_refs(
-                        repo, main_old=journal["main_old"],
-                        main_new=journal["main_new"],
-                        integration_branch="diatche",
-                        integration_old=journal["integration_old"],
-                        integration_new=journal["integration_new"],
-                    )
-                    _restore_checkout(repo, "diatche", journal["integration_old"])
-                else:
-                    if (
-                        _oid(repo, "refs/heads/main") != journal["main_old"]
-                        or _oid(repo, "refs/heads/diatche")
-                        != journal["integration_old"]
-                    ):
-                        raise RuntimeError("cannot recover after concurrent ref movement")
-                    _assert_checkout(repo, "diatche")
-                    if _oid(repo, "HEAD") != journal["integration_old"]:
-                        raise RuntimeError(
-                            "cannot recover after concurrent checkout movement"
-                        )
+                _recover_owned_git_state(repo, journal)
                 _ensure_hindsight_embeddings(repo, args.health_timeout)
                 _wrapper(
                     args.wrapperctl.resolve(), repo, "--foreground",
@@ -731,10 +834,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR, help=hidden)
     parser.add_argument("--wrapperctl", type=Path, default=DEFAULT_WRAPPERCTL, help=hidden)
     parser.add_argument("--health-script", type=Path, default=DEFAULT_HEALTH_SCRIPT, help=hidden)
+    parser.add_argument("--updater-executable", type=Path, default=None, help=hidden)
     parser.add_argument("--remote", default="origin", help=hidden)
     parser.add_argument("--upstream-branch", default="main", help=hidden)
     parser.add_argument("--wrapper-timeout", type=float, default=60, help=hidden)
     parser.add_argument("--health-timeout", type=float, default=120, help=hidden)
+    parser.add_argument("--updater-timeout", type=float, default=900, help=hidden)
     parser.add_argument("--json", action="store_true", help=hidden)
     return parser
 
