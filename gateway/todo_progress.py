@@ -106,7 +106,13 @@ class TodoChecklist:
             completed = [item for item in self._items.values() if item["status"] == "completed"]
             count = len(active)
             noun = "task" if count == 1 else "tasks"
-            lines = [f"Working on {count} {noun}:", ""]
+            if not active:
+                heading = "All tasks complete:"
+            elif completed:
+                heading = f"Working on {count} remaining {noun}:"
+            else:
+                heading = f"Working on {count} {noun}:"
+            lines = [heading, ""]
             lines.extend(
                 f"{_STATUS_ICONS[item['status']]} {item['content']}"
                 for item in (*active, *completed)

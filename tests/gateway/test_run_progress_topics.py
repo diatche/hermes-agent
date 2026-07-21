@@ -1928,7 +1928,7 @@ async def test_run_agent_renders_live_todo_checklist_when_tool_progress_off(monk
     contents = [call["content"] for call in adapter.sent + adapter.edits]
     assert contents
     final_checklist = contents[-1]
-    assert "Working on 1 task:" in final_checklist
+    assert "Working on 1 remaining task:" in final_checklist
     assert "🔄 Run tests" in final_checklist
     assert final_checklist.index("🔄 Run tests") < final_checklist.index("✅ Inspect configuration")
     assert final_checklist.index("✅ Inspect configuration") < final_checklist.index("✅ Implement checklist")

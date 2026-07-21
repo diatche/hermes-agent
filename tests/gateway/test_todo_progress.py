@@ -26,10 +26,25 @@ def test_authoritative_full_result_replaces_state():
         {"id": "ship", "content": "Ship change", "status": "pending"},
     ]))
     assert updated == (
-        "Working on 2 tasks:\n\n"
+        "Working on 2 remaining tasks:\n\n"
         "🔄 Run tests\n"
         "⬜ Ship change\n"
         "✅ Inspect configuration"
+    )
+
+
+def test_completed_tasks_use_completion_heading():
+    checklist = TodoChecklist()
+
+    rendered = checklist.update_from_result(_result([
+        {"id": "inspect", "content": "Inspect configuration", "status": "completed"},
+        {"id": "verify", "content": "Run tests", "status": "completed"},
+    ]))
+
+    assert rendered == (
+        "All tasks complete:\n\n"
+        "✅ Inspect configuration\n"
+        "✅ Run tests"
     )
 
 
