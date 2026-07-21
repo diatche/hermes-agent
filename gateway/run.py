@@ -3121,6 +3121,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("could not set multiplex-active flag", exc_info=True)
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        # Last checklist successfully pinned in each Telegram chat/topic. A
+        # turn-local variable cannot replace a checklist left by an earlier
+        # turn, which can leave multiple task messages pinned in one topic.
+        self._pinned_todo_messages: Dict[tuple[str, str], Any] = {}
         # Multi-profile multiplexing: adapters for NON-default profiles live
         # here, keyed by profile name then Platform. self.adapters stays the
         # default/active profile's map so the ~93 existing self.adapters[...]
@@ -19525,6 +19529,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else {"thread_id": _progress_thread_id}
         ) if _progress_thread_id else None
         _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
+        _todo_pin_key = (str(source.chat_id), str(_progress_thread_id or ""))
         _progress_reply_to = (
             event_message_id
             if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
@@ -19732,6 +19737,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if bot is None or not hasattr(bot, "pin_chat_message"):
                         return
                     try:
+                        prior_message_id = self._pinned_todo_messages.get(_todo_pin_key)
+                        if prior_message_id is not None and prior_message_id != message_id:
+                            prior_telegram_message_id = (
+                                int(prior_message_id)
+                                if str(prior_message_id).isdigit()
+                                else prior_message_id
+                            )
+                            unpinned = await bot.unpin_chat_message(
+                                chat_id=int(source.chat_id),
+                                message_id=prior_telegram_message_id,
+                            )
+                            if unpinned is False:
+                                return
+                            self._pinned_todo_messages.pop(_todo_pin_key, None)
                         telegram_message_id = (
                             int(message_id) if str(message_id).isdigit() else message_id
                         )
@@ -19742,6 +19761,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         if pinned is not False:
                             pinned_todo_msg_id = message_id
+                            self._pinned_todo_messages[_todo_pin_key] = message_id
                     except Exception:
                         logger.debug("Failed to pin Telegram todo checklist", exc_info=True)
 
@@ -19762,6 +19782,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         if unpinned is not False:
                             pinned_todo_msg_id = None
+                            if self._pinned_todo_messages.get(_todo_pin_key) == message_id:
+                                self._pinned_todo_messages.pop(_todo_pin_key, None)
                     except Exception:
                         logger.debug("Failed to unpin Telegram todo checklist", exc_info=True)
 

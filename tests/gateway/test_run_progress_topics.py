@@ -82,6 +82,13 @@ class PinningProgressAdapter(ProgressCaptureAdapter):
     def __init__(self, platform=Platform.TELEGRAM):
         super().__init__(platform=platform)
         self._bot = PinCaptureBot()
+        self._next_message_id = 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self._next_message_id += 1
+        result = await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
+        result.message_id = f"progress-{self._next_message_id}"
+        return result
 
 
 class BlockingDeleteProgressAdapter(ProgressCaptureAdapter):
@@ -516,6 +523,7 @@ def _make_runner(adapter):
 
     runner = object.__new__(GatewayRunner)
     runner.adapters = {adapter.platform: adapter}
+    runner._pinned_todo_messages = {}
     runner._voice_mode = {}
     runner._prefill_messages = []
     runner._ephemeral_system_prompt = ""
@@ -1053,6 +1061,8 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    runner=None,
+    adapter=None,
 ):
     if config_data:
         import yaml
@@ -1067,8 +1077,8 @@ async def _run_with_agent(
     fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
-    adapter = adapter_cls(platform=platform)
-    runner = _make_runner(adapter)
+    adapter = adapter or adapter_cls(platform=platform)
+    runner = runner or _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
         runner.config.streaming = StreamingConfig.from_dict(config_data["streaming"])
@@ -2085,6 +2095,77 @@ async def test_telegram_todo_pin_pins_created_checklist_silently(monkeypatch, tm
         }
     ]
     assert adapter._bot.unpins == []
+
+
+@pytest.mark.asyncio
+async def test_telegram_todo_pin_replaces_prior_checklist_in_same_topic(monkeypatch, tmp_path):
+    adapter = PinningProgressAdapter()
+    runner = _make_runner(adapter)
+    config_data = {
+        "display": {
+            "tool_progress": "off",
+            "todo_progress": True,
+            "platforms": {"telegram": {"todo_progress_pin": True}},
+        }
+    }
+
+    await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TodoChecklistAgent,
+        session_id="sess-todo-pin-first",
+        config_data=config_data,
+        runner=runner,
+        adapter=adapter,
+    )
+    await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TodoChecklistAgent,
+        session_id="sess-todo-pin-second",
+        config_data=config_data,
+        runner=runner,
+        adapter=adapter,
+    )
+
+    assert adapter._bot.unpins == [
+        {"chat_id": -1001, "message_id": "progress-1"}
+    ]
+    assert adapter._bot.pins == [
+        {"chat_id": -1001, "message_id": "progress-1", "disable_notification": True},
+        {"chat_id": -1001, "message_id": "progress-2", "disable_notification": True},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_todo_pin_does_not_unpin_other_topic(monkeypatch, tmp_path):
+    adapter = PinningProgressAdapter()
+    runner = _make_runner(adapter)
+    config_data = {
+        "display": {
+            "tool_progress": "off",
+            "todo_progress": True,
+            "platforms": {"telegram": {"todo_progress_pin": True}},
+        }
+    }
+
+    for thread_id in ("17585", "17586"):
+        await _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            TodoChecklistAgent,
+            session_id=f"sess-todo-pin-{thread_id}",
+            thread_id=thread_id,
+            config_data=config_data,
+            runner=runner,
+            adapter=adapter,
+        )
+
+    assert adapter._bot.unpins == []
+    assert runner._pinned_todo_messages == {
+        ("-1001", "17585"): "progress-1",
+        ("-1001", "17586"): "progress-2",
+    }
 
 
 @pytest.mark.asyncio
