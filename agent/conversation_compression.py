@@ -33,6 +33,7 @@ import inspect
 import logging
 import os
 import tempfile
+import time
 import uuid
 import threading
 from datetime import datetime
@@ -797,6 +798,7 @@ def compress_context(
         f"{approx_tokens:,}" if approx_tokens else "unknown", agent.model,
         focus_topic,
     )
+    _compaction_started_at = time.monotonic()
     agent._emit_status(COMPACTION_STATUS)
 
     # ── Compression lock ────────────────────────────────────────────────
@@ -1063,6 +1065,13 @@ def compress_context(
         # inspection, engine lookup, or compress() — must release the lock so
         # the session isn't permanently blocked from future compression.
         _release_lock()
+        _compaction_elapsed = max(0.0, time.monotonic() - _compaction_started_at)
+        try:
+            agent._emit_status(
+                f"❌ Context compaction failed after {_compaction_elapsed:.1f}s"
+            )
+        except Exception:
+            pass
         raise
 
     try:
@@ -1095,6 +1104,12 @@ def compress_context(
                 _existing_sp = getattr(agent, "_cached_system_prompt", None)
                 if not _existing_sp:
                     _existing_sp = agent._build_system_prompt(system_message)
+                _compaction_elapsed = max(
+                    0.0, time.monotonic() - _compaction_started_at
+                )
+                agent._emit_status(
+                    f"⚠️ Context compaction aborted after {_compaction_elapsed:.1f}s"
+                )
                 return messages, _existing_sp
             finally:
                 _release_lock()
@@ -1113,6 +1128,12 @@ def compress_context(
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:
                 _existing_sp = agent._build_system_prompt(system_message)
+            _compaction_elapsed = max(
+                0.0, time.monotonic() - _compaction_started_at
+            )
+            agent._emit_status(
+                f"ℹ️ No context compaction needed after {_compaction_elapsed:.1f}s"
+            )
             _release_lock()
             return messages, _existing_sp
 
@@ -1547,7 +1568,21 @@ def compress_context(
             agent.session_id or "none", _pre_msg_count, len(compressed),
             f"{_compressed_est:,}",
         )
+        _compaction_elapsed = max(0.0, time.monotonic() - _compaction_started_at)
+        agent._emit_status(
+            f"✅ Context compacted in {_compaction_elapsed:.1f}s — "
+            f"{_pre_msg_count}→{len(compressed)} messages"
+        )
         return compressed, new_system_prompt
+    except BaseException:
+        _compaction_elapsed = max(0.0, time.monotonic() - _compaction_started_at)
+        try:
+            agent._emit_status(
+                f"❌ Context compaction failed after {_compaction_elapsed:.1f}s"
+            )
+        except Exception:
+            pass
+        raise
     finally:
         # Release the lock on the OLD session_id only AFTER rotation completed
         # and all post-rotation bookkeeping (memory manager, context engine,
