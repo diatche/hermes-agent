@@ -1475,6 +1475,7 @@ This controls both the `text_to_speech` tool and spoken replies in voice mode (`
 display:
   tool_progress: all      # off | new | all | verbose
   todo_progress: false    # Gateway: show todo plans as a live checklist, independent of tool_progress
+  delegated_tasks: 'off'  # Checklist delegation detail: off | count | goal (true aliases count)
   tool_progress_command: false  # Enable /verbose slash command in messaging gateway
   platforms: {}           # Per-platform display overrides (see below)
   tool_progress_overrides: {}  # DEPRECATED — use display.platforms instead
@@ -1563,9 +1564,10 @@ display:
     telegram:
       tool_progress: 'off'
       todo_progress: true
+      delegated_tasks: count
 ```
 
-A full todo update replaces the main checklist; a `merge: true` update changes only the supplied task IDs while preserving their order. Goals dispatched through `delegate_task` appear in a **Delegated tasks** section below the main list. The checklist is off by default and requires an adapter with message-editing support.
+A full todo update replaces the main checklist; a `merge: true` update changes only the supplied task IDs while preserving their order. Completed tasks move below unfinished tasks, and the heading counts unfinished tasks only. Set `delegated_tasks` to `count` (or `true`) for a compact `Delegated N tasks 🤖` line, `goal` to show each delegated goal (capped at 80 characters), or `off`/`false` to hide delegated work. `off` is the default. The checklist itself is off by default and requires an adapter with message-editing support.
 
 ### Runtime-metadata footer (gateway only)
 

@@ -68,6 +68,7 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+_TODO_DELETE_SHUTDOWN_TIMEOUT_SECS = 2.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
@@ -19059,6 +19060,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config, platform_key, "todo_progress", False
             ))
         )
+        delegated_tasks_mode = resolve_display_setting(
+            user_config, platform_key, "delegated_tasks", "off"
+        )
         needs_progress_queue = (
             tool_progress_enabled or _thinking_enabled or todo_progress_enabled
         )
@@ -19067,7 +19071,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if needs_progress_queue else None
         from gateway.todo_progress import TodoChecklist
-        todo_checklist = TodoChecklist()
+        todo_checklist = TodoChecklist(delegated_tasks=delegated_tasks_mode)
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -19620,8 +19624,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return text[:low].rstrip() + marker
 
             async def _deliver_todo_checklist(text: str) -> None:
-                """Send the first checklist, then edit that message in place."""
+                """Send/edit a checklist, or delete its bubble when cleared."""
                 nonlocal todo_msg_id, last_todo_text
+                if not text:
+                    if todo_msg_id is None:
+                        last_todo_text = None
+                        return
+                    delete_task = asyncio.create_task(
+                        adapter.delete_message(
+                            chat_id=source.chat_id,
+                            message_id=todo_msg_id,
+                        )
+                    )
+                    cancelled = False
+                    try:
+                        deleted = await asyncio.shield(delete_task)
+                    except asyncio.CancelledError:
+                        # Finalization cancels the progress sender. Once deletion
+                        # has started, give it a bounded chance to finish before
+                        # propagating cancellation so an already-dequeued clear
+                        # does not normally leave stale UI or hang shutdown.
+                        cancelled = True
+                        try:
+                            done, _ = await asyncio.wait(
+                                {delete_task},
+                                timeout=_TODO_DELETE_SHUTDOWN_TIMEOUT_SECS,
+                            )
+                            if delete_task in done:
+                                deleted = delete_task.result()
+                            else:
+                                delete_task.cancel()
+                                # A plugin may suppress cancellation. Observe
+                                # any eventual exception without blocking the
+                                # gateway's remaining finalization work.
+                                def _observe_delete_result(task: asyncio.Task) -> None:
+                                    try:
+                                        task.result()
+                                    except BaseException:
+                                        pass
+
+                                delete_task.add_done_callback(_observe_delete_result)
+                                logger.debug(
+                                    "Todo checklist delete exceeded shutdown timeout"
+                                )
+                                deleted = False
+                        except asyncio.CancelledError:
+                            delete_task.cancel()
+                            raise
+                        except Exception:
+                            logger.debug("Todo checklist delete failed", exc_info=True)
+                            deleted = False
+                    except Exception:
+                        logger.debug("Todo checklist delete failed", exc_info=True)
+                        return
+                    if deleted:
+                        todo_msg_id = None
+                        last_todo_text = None
+                    if cancelled:
+                        raise asyncio.CancelledError
+                    return
                 text = _fit_todo_text(text)
                 if text == last_todo_text:
                     return

@@ -20,6 +20,7 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         super().__init__(PlatformConfig(enabled=True, token="***"), platform)
         self.sent = []
         self.edits = []
+        self.deletes = []
         self.typing = []
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -49,6 +50,10 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         )
         return SendResult(success=True, message_id=message_id)
 
+    async def delete_message(self, chat_id, message_id) -> bool:
+        self.deletes.append({"chat_id": chat_id, "message_id": message_id})
+        return True
+
     async def send_typing(self, chat_id, metadata=None) -> None:
         self.typing.append({"chat_id": chat_id, "metadata": metadata})
 
@@ -57,6 +62,55 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
+
+
+class BlockingDeleteProgressAdapter(ProgressCaptureAdapter):
+    """Hold checklist deletion open to exercise progress-task shutdown."""
+
+    latest = None
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.delete_started = asyncio.Event()
+        self.allow_delete = asyncio.Event()
+        type(self).latest = self
+
+    async def delete_message(self, chat_id, message_id) -> bool:
+        self.delete_started.set()
+        await self.allow_delete.wait()
+        return await super().delete_message(chat_id, message_id)
+
+
+class HangingDeleteProgressAdapter(ProgressCaptureAdapter):
+    """Never finish deletion unless released by test cleanup."""
+
+    latest = None
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.delete_started = asyncio.Event()
+        self.allow_delete = asyncio.Event()
+        self.delete_cancelled = asyncio.Event()
+        type(self).latest = self
+
+    async def delete_message(self, chat_id, message_id) -> bool:
+        self.delete_started.set()
+        try:
+            await self.allow_delete.wait()
+        except asyncio.CancelledError:
+            self.delete_cancelled.set()
+            raise
+        return await super().delete_message(chat_id, message_id)
+
+
+class FailedDeleteProgressAdapter(ProgressCaptureAdapter):
+    async def delete_message(self, chat_id, message_id) -> bool:
+        return False
+
+
+class RaisingDeleteProgressAdapter(ProgressCaptureAdapter):
+    async def delete_message(self, chat_id, message_id) -> bool:
+        raise RuntimeError("delete failed")
 
 
 class SmallLimitProgressAdapter(ProgressCaptureAdapter):
@@ -257,6 +311,106 @@ class TodoChecklistAgent:
             "messages": [],
             "api_calls": 1,
         }
+
+
+class InitiallyEmptyTodoAgent:
+    """Emits an authoritative empty todo list before any checklist exists."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tool_complete_callback = kwargs.get("tool_complete_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        assert self.tool_complete_callback is not None
+        self.tool_complete_callback("todo-empty", "todo", {"merge": False}, '{"todos": []}')
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class TodoClearingAgent(InitiallyEmptyTodoAgent):
+    """Displays one task, then replaces the authoritative state with empty."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        complete = self.tool_complete_callback
+        assert complete is not None
+        complete(
+            "todo-one",
+            "todo",
+            {"merge": False},
+            '{"todos":[{"id":"one","content":"Only task","status":"in_progress"}]}',
+        )
+        time.sleep(0.35)
+        complete("todo-empty", "todo", {"merge": False}, '{"todos": []}')
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class ImmediateTodoClearingAgent(TodoClearingAgent):
+    """Queues create and clear back-to-back immediately before returning."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        complete = self.tool_complete_callback
+        assert complete is not None
+        complete(
+            "todo-one",
+            "todo",
+            {"merge": False},
+            '{"todos":[{"id":"one","content":"Only task","status":"in_progress"}]}',
+        )
+        complete("todo-empty", "todo", {"merge": False}, '{"todos": []}')
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class TodoClearThenRestoreAgent(TodoClearingAgent):
+    """Restores state after a failed clear so the old bubble should be edited."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        complete = self.tool_complete_callback
+        assert complete is not None
+        complete(
+            "todo-one",
+            "todo",
+            {"merge": False},
+            '{"todos":[{"id":"one","content":"First task","status":"in_progress"}]}',
+        )
+        time.sleep(0.35)
+        complete("todo-empty", "todo", {"merge": False}, '{"todos": []}')
+        time.sleep(0.35)
+        complete(
+            "todo-restored",
+            "todo",
+            {"merge": False},
+            '{"todos":[{"id":"two","content":"Restored task","status":"pending"}]}',
+        )
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class TodoClearingWithDelegationAgent(TodoClearingAgent):
+    """Clears ordinary tasks while retaining visible delegated work."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        complete = self.tool_complete_callback
+        progress = self.tool_progress_callback
+        assert complete is not None
+        assert progress is not None
+        complete(
+            "todo-one",
+            "todo",
+            {"merge": False},
+            '{"todos":[{"id":"one","content":"Only task","status":"in_progress"}]}',
+        )
+        time.sleep(0.35)
+        progress(
+            "tool.started",
+            "delegate_task",
+            "delegating 1 task",
+            {"goal": "Review the implementation"},
+        )
+        time.sleep(0.35)
+        complete("todo-empty", "todo", {"merge": False}, '{"todos": []}')
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
 class LongPreviewAgent:
@@ -1744,6 +1898,7 @@ async def test_run_agent_renders_live_todo_checklist_when_tool_progress_off(monk
             "display": {
                 "tool_progress": "off",
                 "todo_progress": True,
+                "delegated_tasks": "count",
                 "interim_assistant_messages": False,
             }
         },
@@ -1753,18 +1908,170 @@ async def test_run_agent_renders_live_todo_checklist_when_tool_progress_off(monk
     contents = [call["content"] for call in adapter.sent + adapter.edits]
     assert contents
     final_checklist = contents[-1]
-    assert "📋 Tasks — 2/3 completed" in final_checklist
-    assert "✅ Inspect configuration" in final_checklist
-    assert "✅ Implement checklist" in final_checklist
+    assert "Working on 1 task:" in final_checklist
     assert "🔄 Run tests" in final_checklist
-    assert "🤖 Delegated tasks" in final_checklist
-    assert "↳ Review gateway integration" in final_checklist
-    assert "↳ Check Telegram rendering" in final_checklist
+    assert final_checklist.index("🔄 Run tests") < final_checklist.index("✅ Inspect configuration")
+    assert final_checklist.index("✅ Inspect configuration") < final_checklist.index("✅ Implement checklist")
+    assert "Delegated 2 tasks 🤖" in final_checklist
+    assert "↳ Review gateway integration" not in final_checklist
     assert "should stay hidden" not in "\n".join(contents)
     assert len(adapter.edits) == 2, (
         "one edit should update todo state and one should add delegations; "
         "the repeated todo result must not edit unchanged text"
     )
+
+
+@pytest.mark.asyncio
+async def test_initial_empty_todo_sends_no_checklist(monkeypatch, tmp_path):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        InitiallyEmptyTodoAgent,
+        session_id="sess-todo-initial-empty",
+        config_data={"display": {"tool_progress": "off", "todo_progress": True}},
+    )
+
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert adapter.deletes == []
+
+
+@pytest.mark.asyncio
+async def test_empty_todo_deletes_existing_checklist(monkeypatch, tmp_path):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TodoClearingAgent,
+        session_id="sess-todo-clear",
+        config_data={"display": {"tool_progress": "off", "todo_progress": True}},
+    )
+
+    assert len(adapter.sent) == 1
+    assert "Working on 1 task:" in adapter.sent[0]["content"]
+    assert adapter.edits == []
+    assert adapter.deletes == [{"chat_id": "-1001", "message_id": "progress-1"}]
+
+
+@pytest.mark.asyncio
+async def test_final_drain_delivers_immediate_create_then_clear(monkeypatch, tmp_path):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ImmediateTodoClearingAgent,
+        session_id="sess-todo-immediate-clear",
+        config_data={"display": {"tool_progress": "off", "todo_progress": True}},
+    )
+
+    # The sender may coalesce the pair before the first send, or send then
+    # delete. Either way no checklist bubble may remain visible.
+    assert len(adapter.sent) == len(adapter.deletes)
+    if adapter.sent:
+        assert adapter.deletes == [{"chat_id": "-1001", "message_id": "progress-1"}]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_inflight_todo_deletion(monkeypatch, tmp_path):
+    BlockingDeleteProgressAdapter.latest = None
+    run_task = asyncio.create_task(
+        _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            TodoClearingAgent,
+            session_id="sess-todo-blocked-delete",
+            config_data={"display": {"tool_progress": "off", "todo_progress": True}},
+            adapter_cls=BlockingDeleteProgressAdapter,
+        )
+    )
+
+    while BlockingDeleteProgressAdapter.latest is None:
+        await asyncio.sleep(0)
+    adapter = BlockingDeleteProgressAdapter.latest
+    await asyncio.wait_for(adapter.delete_started.wait(), timeout=2)
+    await asyncio.sleep(0.5)
+    assert not run_task.done(), "shutdown cancelled an in-flight checklist deletion"
+
+    adapter.allow_delete.set()
+    completed_adapter, _ = await asyncio.wait_for(run_task, timeout=2)
+    assert completed_adapter is adapter
+    assert adapter.deletes == [{"chat_id": "-1001", "message_id": "progress-1"}]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_bounds_hung_todo_deletion(monkeypatch, tmp_path):
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(
+        gateway_run,
+        "_TODO_DELETE_SHUTDOWN_TIMEOUT_SECS",
+        0.05,
+        raising=False,
+    )
+    HangingDeleteProgressAdapter.latest = None
+    run_task = asyncio.create_task(
+        _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            TodoClearingAgent,
+            session_id="sess-todo-hung-delete",
+            config_data={"display": {"tool_progress": "off", "todo_progress": True}},
+            adapter_cls=HangingDeleteProgressAdapter,
+        )
+    )
+
+    while HangingDeleteProgressAdapter.latest is None:
+        await asyncio.sleep(0)
+    adapter = HangingDeleteProgressAdapter.latest
+    await asyncio.wait_for(adapter.delete_started.wait(), timeout=2)
+    completed_adapter = None
+    try:
+        completed_adapter, _ = await asyncio.wait_for(asyncio.shield(run_task), timeout=0.5)
+    except asyncio.TimeoutError:
+        adapter.allow_delete.set()
+        await asyncio.wait_for(run_task, timeout=2)
+        pytest.fail("shutdown waited indefinitely for checklist deletion")
+
+    assert completed_adapter is adapter
+    assert adapter.deletes == []
+    assert adapter.delete_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adapter_cls", [FailedDeleteProgressAdapter, RaisingDeleteProgressAdapter])
+async def test_failed_todo_delete_keeps_message_editable(monkeypatch, tmp_path, adapter_cls):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TodoClearThenRestoreAgent,
+        session_id=f"sess-todo-delete-failure-{adapter_cls.__name__}",
+        config_data={"display": {"tool_progress": "off", "todo_progress": True}},
+        adapter_cls=adapter_cls,
+    )
+
+    assert len(adapter.sent) == 1
+    assert len(adapter.edits) == 1
+    assert "Restored task" in adapter.edits[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_empty_todo_edits_to_delegated_only_content(monkeypatch, tmp_path):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TodoClearingWithDelegationAgent,
+        session_id="sess-todo-clear-with-delegation",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "todo_progress": True,
+                "delegated_tasks": "goal",
+            }
+        },
+    )
+
+    assert adapter.deletes == []
+    assert adapter.edits
+    final = adapter.edits[-1]["content"]
+    assert final == "🤖 Delegated tasks\n↳ Review the implementation"
+    assert "Working on" not in final
 
 
 @pytest.mark.asyncio

@@ -517,6 +517,44 @@ class TestCleanupProgress:
             assert resolve_display_setting(config, "telegram", "cleanup_progress") is True, val
 
 
+class TestDelegatedTasks:
+    """Delegated checklist detail is independently configurable."""
+
+    def test_default_is_off(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "telegram", "delegated_tasks") == "off"
+
+    def test_true_normalises_to_count(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"delegated_tasks": True}}
+        assert resolve_display_setting(config, "telegram", "delegated_tasks") == "count"
+
+    def test_false_normalises_to_off(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"delegated_tasks": False}}
+        assert resolve_display_setting(config, "telegram", "delegated_tasks") == "off"
+
+    def test_goal_mode_and_platform_override(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "delegated_tasks": "off",
+                "platforms": {"telegram": {"delegated_tasks": "goal"}},
+            }
+        }
+        assert resolve_display_setting(config, "telegram", "delegated_tasks") == "goal"
+
+    def test_invalid_value_falls_back_to_off(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"delegated_tasks": "verbose"}}
+        assert resolve_display_setting(config, "telegram", "delegated_tasks") == "off"
+
+
 class TestToolProgressGrouping:
     """resolve_display_setting() for the tool_progress_grouping knob."""
 

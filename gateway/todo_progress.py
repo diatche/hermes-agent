@@ -18,15 +18,18 @@ _STATUS_ICONS = {
     "completed": "✅",
     "cancelled": "🚫",
 }
+_DELEGATED_GOAL_MAX_CHARS = 80
 
 
 class TodoChecklist:
     """Track one turn's authoritative task state and delegated child goals."""
 
-    def __init__(self) -> None:
+    def __init__(self, delegated_tasks: str = "off") -> None:
         self._items: OrderedDict[str, dict[str, str]] = OrderedDict()
         self._delegated: list[str] = []
-        self._has_todo_state = False
+        self._delegated_tasks = (
+            delegated_tasks if delegated_tasks in {"off", "count", "goal"} else "off"
+        )
 
     def update_from_result(self, result: Any) -> str | None:
         """Replace task state from a successful todo tool's full JSON result.
@@ -61,11 +64,16 @@ class TodoChecklist:
             items[item_id] = {"id": item_id, "content": content, "status": status}
 
         self._items = items
-        self._has_todo_state = True
-        return self.render()
+        rendered = self.render()
+        # A valid empty result is an explicit clear signal. ``None`` remains
+        # reserved for malformed/error results that must not disturb the last
+        # known-good display state.
+        return rendered if rendered is not None else ""
 
     def add_delegations(self, args: Any) -> str | None:
         """Append goals dispatched through ``delegate_task`` to this turn."""
+        if self._delegated_tasks == "off":
+            return self.render()
         if not isinstance(args, Mapping):
             return self.render()
 
@@ -88,23 +96,37 @@ class TodoChecklist:
         return self.render()
 
     def render(self) -> str | None:
-        """Return current tasks plus delegated goals, or ``None`` before either."""
-        if not self._has_todo_state and not self._delegated:
+        """Return visible task/delegation sections, or ``None`` when empty."""
+        if not self._items and not self._delegated:
             return None
 
-        completed = sum(item["status"] == "completed" for item in self._items.values())
-        lines = [f"📋 Tasks — {completed}/{len(self._items)} completed", ""]
+        lines: list[str] = []
         if self._items:
+            active = [item for item in self._items.values() if item["status"] != "completed"]
+            completed = [item for item in self._items.values() if item["status"] == "completed"]
+            count = len(active)
+            noun = "task" if count == 1 else "tasks"
+            lines = [f"Working on {count} {noun}:", ""]
             lines.extend(
                 f"{_STATUS_ICONS[item['status']]} {item['content']}"
-                for item in self._items.values()
+                for item in (*active, *completed)
             )
-        elif self._has_todo_state:
-            lines.append("No tasks")
 
         if self._delegated:
-            if self._items or self._has_todo_state:
+            if lines:
                 lines.append("")
-            lines.append("🤖 Delegated tasks")
-            lines.extend(f"↳ {goal}" for goal in self._delegated)
+            if self._delegated_tasks == "count":
+                count = len(self._delegated)
+                noun = "task" if count == 1 else "tasks"
+                lines.append(f"Delegated {count} {noun} 🤖")
+            elif self._delegated_tasks == "goal":
+                lines.append("🤖 Delegated tasks")
+                lines.extend(f"↳ {_truncate_goal(goal)}" for goal in self._delegated)
         return "\n".join(lines)
+
+
+def _truncate_goal(goal: str) -> str:
+    """Cap displayed delegated goals without changing the child prompt."""
+    if len(goal) <= _DELEGATED_GOAL_MAX_CHARS:
+        return goal
+    return goal[: _DELEGATED_GOAL_MAX_CHARS - 1] + "…"

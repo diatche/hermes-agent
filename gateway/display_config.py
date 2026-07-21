@@ -33,6 +33,8 @@ from typing import Any
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "todo_progress": False,  # Dedicated live checklist; independent of ordinary tool chrome.
+    # Delegated work inside the live checklist: off | count | goal.
+    "delegated_tasks": "off",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
     "show_reasoning": False,
     # How a reasoning/thinking summary is rendered when show_reasoning is on.
@@ -255,6 +257,17 @@ def _normalise(setting: str, value: Any) -> Any:
         if val in {"true", "1", "yes", "on"}:
             return "all"
         return val if val in {"off", "new", "all", "verbose", "log"} else "all"
+    if setting == "delegated_tasks":
+        if value is False:
+            return "off"
+        if value is True:
+            return "count"
+        val = str(value).strip().lower()
+        if val in {"false", "0", "no", "off"}:
+            return "off"
+        if val in {"true", "1", "yes", "on"}:
+            return "count"
+        return val if val in {"count", "goal"} else "off"
     if setting in {
         "show_reasoning",
         "streaming",
