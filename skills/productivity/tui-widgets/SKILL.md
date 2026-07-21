@@ -98,9 +98,15 @@ and render `sparkRows` for dashboard panels, `sparkline` for one-liners.
 
 Contract essentials:
 
-- `mode: 'ambient'` — docks above the status bar, captures no input, the
-  command toggles it; `render` returns a CARD (usually `Dialog`), never
-  `Overlay`.
+- `mode: 'ambient'` — captures no input, the command toggles it; `render`
+  returns a CARD (usually `Dialog`), never `Overlay`. Placement via `zone`:
+  - Docks (in-flow chrome rows, reserve space): `dock-top` (under the top
+    status bar), `dock-bottom` (default — above the bottom one).
+  - Floats (overlay the transcript margins, no reserved rows): `top-left`,
+    `top-right`, `bottom-left`, `bottom-right`. Same-corner floats stack.
+  Map the user's words to the nearest zone: "top right" → `top-right`,
+  "above/next to the status bar" → a dock. Floats suit small glanceable
+  cards; anything tall belongs in a dock.
 - `mode: 'modal'` (default) — owns every keypress; `reduce` returns next
   state, the same reference to swallow a key, or `null` to close; `render`
   wraps content in `Overlay` for placement.

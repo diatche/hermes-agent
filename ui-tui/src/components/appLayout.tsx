@@ -22,7 +22,7 @@ import {
 } from '../lib/inputMetrics.js'
 import { PerfPane } from '../lib/perfPane.js'
 import { composerPromptText } from '../lib/prompt.js'
-import { ActiveWidgetSlot, AmbientDock } from '../sdk/host.js'
+import { ActiveWidgetSlot, AmbientDock, AmbientFloats } from '../sdk/host.js'
 
 import { AgentsOverlay } from './agentsOverlay.js'
 import { GoodVibesHeart, StatusRule, StickyPromptTracker, TranscriptScrollbar } from './appChrome.js'
@@ -362,6 +362,7 @@ const ComposerPane = memo(function ComposerPane({
       )}
 
       <StatusRulePane at="top" composer={composer} status={status} />
+      <AmbientDock placement="dock-top" />
 
       <Box flexDirection="column" marginTop={ui.statusBar === 'top' ? 0 : 1} position="relative">
         <FloatingOverlays
@@ -442,7 +443,7 @@ const ComposerPane = memo(function ComposerPane({
 
       {!composer.empty && !ui.sid && <Text color={ui.theme.color.muted}>⚕ {ui.status}</Text>}
 
-      <AmbientDock />
+      <AmbientDock placement="dock-bottom" />
       <StatusRulePane at="bottom" composer={composer} status={status} />
     </NoSelect>
   )
@@ -529,7 +530,8 @@ export const AppLayout = memo(function AppLayout({
   return (
     <Shell {...shellProps}>
       <Box flexDirection="column" flexGrow={1} position="relative">
-        <Box flexDirection="row" flexGrow={1}>
+        <Box flexDirection="row" flexGrow={1} position="relative">
+          {!overlay.agents && !overlay.journey && <AmbientFloats />}
           {overlay.agents ? (
             <PerfPane id="agents">
               <AgentsOverlayPane />

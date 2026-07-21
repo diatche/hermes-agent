@@ -69,6 +69,32 @@ describe('widget SDK host', () => {
     expect($isBlocked.get()).toBe(true)
   })
 
+  it('ambient zones route by the app contract (docks + floats)', async () => {
+    const { defineWidgetApp } = await import('../sdk/registry.js')
+    const { Text } = await import('@hermes/ink')
+    const { createElement } = await import('react')
+
+    defineWidgetApp({
+      help: 'corner test app',
+      id: 'corner-test',
+      mode: 'ambient',
+      zone: 'top-right',
+      init: () => ({}),
+      reduce: state => state,
+      render: () => createElement(Text, null, 'corner')
+    })
+
+    launchWidget('corner-test', 'x')
+    launchWidget('ticker', 'x')
+
+    const zoneOf = (id: string) => getWidgetApp(id)?.zone ?? 'dock-bottom'
+
+    expect(getOverlayState().ambient.map(a => [a.appId, zoneOf(a.appId)])).toEqual([
+      ['corner-test', 'top-right'],
+      ['ticker', 'dock-bottom']
+    ])
+  })
+
   it('ambient apps dock together and toggle independently', () => {
     expect(launchWidget('ticker', 'eurusd')).toBeNull()
     expect(launchWidget('weather', '')).toBeNull()

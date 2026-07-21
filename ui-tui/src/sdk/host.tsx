@@ -7,7 +7,7 @@ import { $overlayState, patchOverlayState } from '../app/overlayStore.js'
 import { $uiTheme } from '../app/uiStore.js'
 
 import { getWidgetApp } from './registry.js'
-import type { ActiveWidget, WidgetApp, WidgetInput } from './types.js'
+import type { ActiveWidget, AmbientZone, WidgetApp, WidgetInput } from './types.js'
 
 /**
  * The widget-app host. Core integrates through exactly four touchpoints:
@@ -150,27 +150,81 @@ export function ActiveWidgetSlot(): ReactNode {
   return renderApp(overlay.widget, { cols: stdout?.columns ?? 80, rows: stdout?.rows ?? 24, t: t as never })
 }
 
-/** The ambient dock: in-FLOW (never floats over the transcript),
- *  right-aligned, sitting directly above the status bar — GUI-style
- *  "widgets that just sit there" while the composer stays live. */
-export function AmbientDock(): ReactNode {
-  const overlay = useStore($overlayState)
+const zoneOf = (active: ActiveWidget): AmbientZone => getWidgetApp(active.appId)?.zone ?? 'dock-bottom'
+
+const useAmbientCtx = () => {
   const t = useStore($uiTheme)
   const { stdout } = useStdout()
 
-  if (!overlay.ambient.length) {
+  return { cols: stdout?.columns ?? 80, rows: stdout?.rows ?? 24, t: t as never }
+}
+
+/** An in-FLOW dock row: reserves real rows in the chrome (never covers
+ *  content), right-aligned cards. `dock-top` renders under the top status
+ *  bar, `dock-bottom` above the bottom one. */
+export function AmbientDock({ placement }: { placement: 'dock-bottom' | 'dock-top' }): ReactNode {
+  const overlay = useStore($overlayState)
+  const ctx = useAmbientCtx()
+  const docked = overlay.ambient.filter(active => zoneOf(active) === placement)
+
+  if (!docked.length) {
     return null
   }
-
-  const ctx = { cols: stdout?.columns ?? 80, rows: stdout?.rows ?? 24, t: t as never }
 
   // paddingRight keeps card borders off the terminal's last column — an
   // exact-edge border char trips pending-wrap and reads as a clipped border.
   return (
     <Box columnGap={1} flexDirection="row" justifyContent="flex-end" paddingRight={2} width="100%">
-      {overlay.ambient.map(active => (
+      {docked.map(active => (
         <Box key={active.appId}>{renderApp(active, ctx)}</Box>
       ))}
     </Box>
+  )
+}
+
+const FLOAT_ZONES: readonly { align: 'flex-end' | 'flex-start'; anchor: 'bottom' | 'top'; zone: AmbientZone }[] = [
+  { align: 'flex-start', anchor: 'top', zone: 'top-left' },
+  { align: 'flex-end', anchor: 'top', zone: 'top-right' },
+  { align: 'flex-start', anchor: 'bottom', zone: 'bottom-left' },
+  { align: 'flex-end', anchor: 'bottom', zone: 'bottom-right' }
+]
+
+/** The float layer: corner-anchored widgets overlaying the transcript
+ *  margins (absolute, no reserved rows — GUI-corner style). Same-corner
+ *  floats stack vertically. Mounted inside the transcript's relative
+ *  container so corners track the content area, not the whole screen. */
+export function AmbientFloats(): ReactNode {
+  const overlay = useStore($overlayState)
+  const ctx = useAmbientCtx()
+
+  const corners = FLOAT_ZONES.map(spec => ({
+    ...spec,
+    apps: overlay.ambient.filter(active => zoneOf(active) === spec.zone)
+  })).filter(corner => corner.apps.length)
+
+  if (!corners.length) {
+    return null
+  }
+
+  return (
+    <>
+      {corners.map(({ align, anchor, apps, zone }) => (
+        <Box
+          alignItems={align}
+          flexDirection="column"
+          key={zone}
+          left={0}
+          paddingX={2}
+          position="absolute"
+          rowGap={1}
+          width="100%"
+          {...(anchor === 'top' ? { top: 0 } : { bottom: 0 })}
+        >
+          {apps.map(active => (
+            <Box key={active.appId}>{renderApp(active, ctx)}</Box>
+          ))}
+        </Box>
+      ))}
+    </>
   )
 }
