@@ -36,7 +36,8 @@ widgets.
 
 1. Use `write_file` to create `~/.hermes/tui-widgets/<name>.mjs` (see
    `templates/clock.mjs` for a complete working widget).
-2. Tell the user to run `/widgets-reload` in the TUI (or restart it).
+2. If the TUI is running it hot-loads the file within ~a second (the
+   widgets directory is watched); `/widgets-reload` forces a rescan.
 3. The widget's id becomes its slash command automatically (`/<id>`), with
    its `help` in the `/` completion popover. No other registration exists.
 
@@ -83,10 +84,10 @@ Contract essentials:
 
 1. Pick `id`, `mode`, and the state shape; keep state serializable.
 2. Write the file from the template; wire data via `init` + `updateWidget`.
-3. `/widgets-reload`, then `/<id>` to launch; relaunch `/<id>` to dismiss
-   an ambient widget.
-4. Iterate: edit the file and `/widgets-reload` again — registration is
-   last-writer-wins, so the fresh definition shadows the old one.
+3. `/<id>` to launch (hot-loaded on write); relaunch `/<id>` to dismiss an
+   ambient widget.
+4. Iterate: edit the file — it hot-reloads on save (last-writer-wins, the
+   fresh definition shadows the old one). Relaunch `/<id>` to remount.
 
 ## Pitfalls
 

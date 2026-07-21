@@ -1,3 +1,4 @@
+import { watch } from 'fs'
 import { readdir } from 'fs/promises'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -99,4 +100,48 @@ export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoa
   }
 
   return result
+}
+
+let watching = false
+
+/** Generative-UI hot loading: watch the widgets directory and re-scan on
+ *  every change, so a widget Hermes writes appears within ~a second — no
+ *  `/widgets-reload`, no restart (GUI parity). Debounced (editors and
+ *  write_file emit bursts); polls until the directory exists so the very
+ *  first widget ever written also hot-loads. */
+export function watchUserWidgets(dir = widgetsDir()): void {
+  if (watching) {
+    return
+  }
+
+  watching = true
+
+  let timer: NodeJS.Timeout | undefined
+
+  const attach = () => {
+    try {
+      const watcher = watch(dir, () => {
+        clearTimeout(timer)
+        timer = setTimeout(() => void loadUserWidgets(dir), 300)
+        timer.unref?.()
+      })
+
+      watcher.unref?.()
+
+      return true
+    } catch {
+      return false // directory doesn't exist yet
+    }
+  }
+
+  if (!attach()) {
+    const poll = setInterval(() => {
+      if (attach()) {
+        clearInterval(poll)
+        void loadUserWidgets(dir)
+      }
+    }, 10_000)
+
+    poll.unref?.()
+  }
 }
