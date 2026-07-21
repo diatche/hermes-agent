@@ -602,6 +602,111 @@ class TestPreflightCompression:
         assert events[0][0] == "lifecycle"
         assert "Compacting context" in events[0][1]
         assert events[1] == ("compress", "started")
+        assert events[-1][0] == "lifecycle"
+        assert "Context compacted" in events[-1][1]
+        assert "1→2 messages" in events[-1][1]
+        assert "s" in events[-1][1]
+
+    def test_compress_context_emits_lifecycle_failure_when_engine_raises(self, agent):
+        agent.compression_enabled = False
+        events = []
+        agent.status_callback = lambda ev, msg: events.append((ev, msg))
+
+        with (
+            patch.object(
+                agent.context_compressor,
+                "compress",
+                side_effect=RuntimeError("summary backend unavailable"),
+            ),
+            pytest.raises(RuntimeError, match="summary backend unavailable"),
+        ):
+            agent._compress_context(
+                [{"role": "user", "content": "hello"}],
+                "system prompt",
+                approx_tokens=1234,
+            )
+
+        lifecycle = [message for event, message in events if event == "lifecycle"]
+        assert "Compacting context" in lifecycle[0]
+        assert "Context compaction failed" in lifecycle[-1]
+        assert "s" in lifecycle[-1]
+
+    def test_compress_context_emits_failure_for_boundary_error(self, agent):
+        agent.compression_enabled = False
+        events = []
+        agent.status_callback = lambda ev, msg: events.append((ev, msg))
+
+        with (
+            patch.object(
+                agent.context_compressor,
+                "compress",
+                return_value=[
+                    {"role": "user", "content": f"{SUMMARY_PREFIX}\nEarlier context"}
+                ],
+            ),
+            patch.object(
+                agent._todo_store,
+                "format_for_injection",
+                side_effect=RuntimeError("boundary write failed"),
+            ),
+            pytest.raises(RuntimeError, match="boundary write failed"),
+        ):
+            agent._compress_context(
+                [{"role": "user", "content": "hello"}],
+                "system prompt",
+                approx_tokens=1234,
+            )
+
+        lifecycle = [message for event, message in events if event == "lifecycle"]
+        assert "Compacting context" in lifecycle[0]
+        assert "Context compaction failed" in lifecycle[-1]
+
+    def test_compress_context_closes_lifecycle_when_engine_makes_no_progress(self, agent):
+        agent.compression_enabled = False
+        events = []
+        agent.status_callback = lambda ev, msg: events.append((ev, msg))
+        original = [{"role": "user", "content": "hello"}]
+
+        with patch.object(
+            agent.context_compressor,
+            "compress",
+            return_value=[dict(message) for message in original],
+        ):
+            compressed, _ = agent._compress_context(
+                original,
+                "system prompt",
+                approx_tokens=1234,
+            )
+
+        assert compressed == original
+        lifecycle = [message for event, message in events if event == "lifecycle"]
+        assert "Compacting context" in lifecycle[0]
+        assert "No context compaction needed" in lifecycle[-1]
+        assert "s" in lifecycle[-1]
+
+    def test_compress_context_closes_lifecycle_when_engine_aborts(self, agent):
+        agent.compression_enabled = False
+        events = []
+        agent.status_callback = lambda ev, msg: events.append((ev, msg))
+        original = [{"role": "user", "content": "hello"}]
+
+        def abort(messages, **_kwargs):
+            agent.context_compressor._last_compress_aborted = True
+            agent.context_compressor._last_summary_error = "summary unavailable"
+            return messages
+
+        with patch.object(agent.context_compressor, "compress", side_effect=abort):
+            compressed, _ = agent._compress_context(
+                original,
+                "system prompt",
+                approx_tokens=1234,
+            )
+
+        assert compressed == original
+        lifecycle = [message for event, message in events if event == "lifecycle"]
+        assert "Compacting context" in lifecycle[0]
+        assert "Context compaction aborted" in lifecycle[-1]
+        assert "s" in lifecycle[-1]
 
     def test_compression_reuses_cached_prompt_when_memory_snapshot_is_unchanged(self, agent):
         """A memory reload without new injected text must keep the cache prefix."""
