@@ -62,7 +62,9 @@ export default function register(sdk) {
 
 `sdk` contents: `defineWidgetApp`, `openWidget`, `updateWidget`, `isCtrl`,
 `React`, `h` (createElement — no JSX in .mjs), components `Box`, `Text`,
-`Dialog`, `Overlay`, `WidgetGrid`, `GridAreas`.
+`Dialog`, `Overlay`, `WidgetGrid`, `GridAreas`, and loaders `Shimmer`,
+`ShimmerRows`, `useShimmerPhase` — use `ShimmerRows` for loading phases
+instead of a bare "loading…" line.
 
 Contract essentials:
 

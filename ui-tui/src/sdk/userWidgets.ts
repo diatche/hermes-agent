@@ -7,6 +7,7 @@ import { pathToFileURL } from 'url'
 import { Box, Text } from '@hermes/ink'
 import * as React from 'react'
 
+import { Shimmer, ShimmerRows, useShimmerPhase } from '../components/loaders.js'
 import { Dialog, Overlay } from '../components/overlay.js'
 import { GridAreas, WidgetGrid } from '../components/widgetGrid.js'
 import { recordParentLifecycle } from '../lib/parentLog.js'
@@ -36,13 +37,16 @@ export const widgetSdk = {
   GridAreas,
   Overlay,
   React,
+  Shimmer,
+  ShimmerRows,
   Text,
   WidgetGrid,
   defineWidgetApp,
   h: React.createElement,
   isCtrl,
   openWidget,
-  updateWidget
+  updateWidget,
+  useShimmerPhase
 } as const
 
 export type WidgetSdk = typeof widgetSdk

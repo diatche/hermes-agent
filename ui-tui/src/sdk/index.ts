@@ -11,9 +11,10 @@
  * See `sdk/apps/` for the reference apps (`/grid-test`, `/dialog-test`).
  */
 
+// Theme + chrome primitives
+export { Shimmer, ShimmerRows, shimmerSegments, useShimmerPhase } from '../components/loaders.js'
 // Layout components + overlay primitives
 export { Dialog, Overlay, type OverlayZone } from '../components/overlay.js'
-// Theme + chrome primitives
 export { OverlayHint, windowItems } from '../components/overlayControls.js'
 export {
   ActionRow,
