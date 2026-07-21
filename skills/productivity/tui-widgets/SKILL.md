@@ -66,6 +66,18 @@ export default function register(sdk) {
 `ShimmerRows`, `useShimmerPhase` — use `ShimmerRows` for loading phases
 instead of a bare "loading…" line.
 
+Charts (pure string builders — color the result with theme tones):
+
+- `sdk.sparkline(series, width?)` → `▂▃▅▇█▆` one-row trend
+- `sdk.sparkRows(series, width, rows)` → multi-row column chart (top line
+  first) — the mission-control panel look; taller cells gain resolution
+- `sdk.gauge(ratio, width)` → `█████░░░` fill bar for a 0..1 value
+- `sdk.hbars(values, width)` → horizontal bar chart, one bar per value,
+  eighth-block tips, scaled to the max
+
+Keep a rolling series in component state (push per tick, cap ~120 samples)
+and render `sparkRows` for dashboard panels, `sparkline` for one-liners.
+
 Contract essentials:
 
 - `mode: 'ambient'` — docks above the status bar, captures no input, the

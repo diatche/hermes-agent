@@ -10,6 +10,7 @@ import * as React from 'react'
 import { Shimmer, ShimmerRows, useShimmerPhase } from '../components/loaders.js'
 import { Dialog, Overlay } from '../components/overlay.js'
 import { GridAreas, WidgetGrid } from '../components/widgetGrid.js'
+import { gauge, hbars, sparkline, sparkRows } from '../lib/charts.js'
 import { recordParentLifecycle } from '../lib/parentLog.js'
 
 import { openWidget, updateWidget } from './host.js'
@@ -42,9 +43,13 @@ export const widgetSdk = {
   Text,
   WidgetGrid,
   defineWidgetApp,
+  gauge,
   h: React.createElement,
+  hbars,
   isCtrl,
   openWidget,
+  sparkRows,
+  sparkline,
   updateWidget,
   useShimmerPhase
 } as const

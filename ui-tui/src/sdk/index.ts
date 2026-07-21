@@ -27,6 +27,7 @@ export {
 
 export { GridAreas, WidgetGrid } from '../components/widgetGrid.js'
 
+export { gauge, hbars, sparkline, sparkRows } from '../lib/charts.js'
 export { contrastRatio, liftForContrast, mix, relativeLuminance } from '../lib/color.js'
 // Layout engine
 export {
