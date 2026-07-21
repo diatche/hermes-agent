@@ -8,7 +8,16 @@ describe('chart primitives', () => {
 
     expect(line).toBe('▁▂▃▄▅▆▇█')
     expect(sparkline([1, 2, 3, 4], 2)).toHaveLength(2) // window = last N
-    expect(sparkline([])).toBe('')
+  })
+
+  it('is dimension-stable: short/empty series pad to exactly width', () => {
+    // Warm-up must never resize the card — latest sample pins right.
+    expect(sparkline([5], 6)).toHaveLength(6)
+    expect(sparkline([5], 6).endsWith('▁')).toBe(true) // flat series → bottom block, right-pinned
+    expect(sparkline([], 6)).toBe('      ')
+    expect(sparkRows([7], 5, 2).every(row => row.length === 5)).toBe(true)
+    expect(sparkRows([], 5, 2)).toEqual(['     ', '     '])
+    expect(hbars([1, 4], 8).every(bar => bar.length === 8)).toBe(true)
   })
 
   it('sparkRows partitions each column across rows (top line first)', () => {
@@ -31,8 +40,8 @@ describe('chart primitives', () => {
     const [half, full] = hbars([4, 8], 8)
 
     expect(full).toBe('████████')
-    expect(half).toBe('████')
-    expect(hbars([3, 8], 8)[0]).toBe('███') // 3/8 of 8 cells = exactly 3
-    expect(hbars([1, 2], 3)[0]).toMatch(/^█?[▏▎▍▌▋▊▉█]$/) // fractional tip
+    expect(half).toBe('████    ')
+    expect(hbars([3, 8], 8)[0]).toBe('███     ') // 3/8 of 8 cells, padded
+    expect(hbars([1, 2], 3)[0]).toMatch(/^█?[▏▎▍▌▋▊▉█] *$/) // fractional tip, padded
   })
 })

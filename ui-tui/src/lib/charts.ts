@@ -13,15 +13,20 @@ const normalize = (series: number[], window: number): { min: number; range: numb
   return { min, range: Math.max(...view) - min || 1, window: view }
 }
 
-/** One-row sparkline: `▂▃▅▇█▆…`, last `width` samples. */
+/** One-row sparkline: `▂▃▅▇█▆…`, last `width` samples. ALWAYS exactly
+ *  `width` cells — short series pad-left so the card never resizes while
+ *  history warms up (latest sample stays pinned to the right edge). */
 export function sparkline(series: number[], width = series.length): string {
   if (!series.length) {
-    return ''
+    return ' '.repeat(Math.max(0, width))
   }
 
   const { min, range, window } = normalize(series, width)
 
-  return window.map(v => BLOCKS[Math.min(BLOCKS.length - 1, Math.floor(((v - min) / range) * BLOCKS.length))]).join('')
+  return window
+    .map(v => BLOCKS[Math.min(BLOCKS.length - 1, Math.floor(((v - min) / range) * BLOCKS.length))])
+    .join('')
+    .padStart(width)
 }
 
 /**
@@ -32,7 +37,7 @@ export function sparkline(series: number[], width = series.length): string {
  */
 export function sparkRows(series: number[], width: number, rows: number): string[] {
   if (!series.length) {
-    return Array.from({ length: rows }, () => '')
+    return Array.from({ length: rows }, () => ' '.repeat(width))
   }
 
   const { min, range, window } = normalize(series, width)
@@ -48,6 +53,7 @@ export function sparkRows(series: number[], width: number, rows: number): string
         return filled === 0 ? ' ' : BLOCKS[filled - 1]
       })
       .join('')
+      .padStart(width) // warm-up pads left: chart grows from the right, card never resizes
   })
 }
 
@@ -58,8 +64,9 @@ export function gauge(ratio: number, width: number): string {
   return '█'.repeat(filled) + '░'.repeat(Math.max(0, width - filled))
 }
 
-/** Horizontal bar chart: one `███▌`-style bar per value, scaled to the max.
- *  Eighth-block tips keep adjacent values distinguishable. */
+/** Horizontal bar chart: one `███▌`-style bar per value, scaled to the max,
+ *  each padded to exactly `width` (stable card sizing). Eighth-block tips
+ *  keep adjacent values distinguishable. */
 export function hbars(values: number[], width: number): string[] {
   const max = Math.max(...values, 0) || 1
 
@@ -68,6 +75,6 @@ export function hbars(values: number[], width: number): string[] {
     const full = Math.floor(cells)
     const rest = Math.round((cells - full) * 8)
 
-    return '█'.repeat(full) + (rest > 0 ? '▏▎▍▌▋▊▉█'[rest - 1] : '')
+    return ('█'.repeat(full) + (rest > 0 ? '▏▎▍▌▋▊▉█'[rest - 1] : '')).padEnd(width)
   })
 }

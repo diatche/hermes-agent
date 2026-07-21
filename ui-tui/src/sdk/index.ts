@@ -12,6 +12,7 @@
  */
 
 // Theme + chrome primitives
+export { Accordion } from '../components/accordion.js'
 export { Shimmer, ShimmerRows, shimmerSegments, useShimmerPhase } from '../components/loaders.js'
 // Layout components + overlay primitives
 export { Dialog, Overlay, type OverlayZone } from '../components/overlay.js'

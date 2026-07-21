@@ -66,6 +66,20 @@ export default function register(sdk) {
 `ShimmerRows`, `useShimmerPhase` — use `ShimmerRows` for loading phases
 instead of a bare "loading…" line.
 
+Expand/collapse: `sdk.Accordion` — the same primitive the session panel's
+tool/skill sections use. `h(Accordion, { t, title: 'details', count: 3,
+defaultOpen: false }, body)` toggles on CLICK (works in ambient widgets,
+which receive no keys); modal apps may pass `open` + `onToggle` to drive it
+from reducer state instead.
+
+Stable sizing (cards must NEVER resize while ticking):
+
+- Give `Dialog` an explicit `width`; charts already return exactly the
+  `width` you ask for (short series pad-left while history warms up).
+- Pad dynamic numbers: `String(v).padStart(6)` — `51 ms` → `112 ms` must
+  not change the line length.
+- Keep row counts constant per phase; swap content, not structure.
+
 Charts (pure string builders — color the result with theme tones):
 
 - `sdk.sparkline(series, width?)` → `▂▃▅▇█▆` one-row trend

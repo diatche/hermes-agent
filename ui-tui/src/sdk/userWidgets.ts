@@ -7,6 +7,7 @@ import { pathToFileURL } from 'url'
 import { Box, Text } from '@hermes/ink'
 import * as React from 'react'
 
+import { Accordion } from '../components/accordion.js'
 import { Shimmer, ShimmerRows, useShimmerPhase } from '../components/loaders.js'
 import { Dialog, Overlay } from '../components/overlay.js'
 import { GridAreas, WidgetGrid } from '../components/widgetGrid.js'
@@ -33,6 +34,7 @@ import { isCtrl } from './types.js'
 /** Everything a user widget may touch, passed INTO its register() — user
  *  files have no resolvable import path to the bundle. */
 export const widgetSdk = {
+  Accordion,
   Box,
   Dialog,
   GridAreas,
