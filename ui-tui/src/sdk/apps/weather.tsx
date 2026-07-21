@@ -1,6 +1,6 @@
 import { Box, Text } from '@hermes/ink'
 
-import { Dialog, Overlay } from '../../components/overlay.js'
+import { Dialog } from '../../components/overlay.js'
 import type { Theme } from '../../theme.js'
 import { updateWidget } from '../host.js'
 import { defineWidgetApp } from '../registry.js'
@@ -146,20 +146,18 @@ export const weatherApp = defineWidgetApp<WeatherState>({
     return state
   },
 
-  // Ambient: a glanceable card on the right edge — no backdrop, no input
-  // capture, the composer stays live. /weather again dismisses it.
+  // Ambient: renders IN the dock (host owns placement) — a compact card
+  // that sits above the status bar while the composer stays live.
   render({ cols, state, t }) {
     const { phase } = state
     const title = phase.kind === 'ready' ? phase.report.area : 'Weather'
 
     return (
-      <Overlay zone="right">
-        <Dialog hint="/weather to close" title={title} width={Math.min(46, cols - 8)}>
-          {phase.kind === 'loading' && <Text color={t.color.muted}>fetching wttr.in…</Text>}
-          {phase.kind === 'error' && <Text color={t.color.error}>{phase.message}</Text>}
-          {phase.kind === 'ready' && <ReadyBody report={phase.report} t={t} />}
-        </Dialog>
-      </Overlay>
+      <Dialog title={title} width={Math.min(42, cols - 4)}>
+        {phase.kind === 'loading' && <Text color={t.color.muted}>fetching wttr.in…</Text>}
+        {phase.kind === 'error' && <Text color={t.color.error}>{phase.message}</Text>}
+        {phase.kind === 'ready' && <ReadyBody report={phase.report} t={t} />}
+      </Dialog>
     )
   }
 })

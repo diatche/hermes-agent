@@ -9,7 +9,7 @@ const buildOverlayState = (): OverlayState => ({
   billing: null,
   clarify: null,
   confirm: null,
-  ambient: null,
+  ambient: [],
   widget: null,
   journey: false,
   modelPicker: false,
