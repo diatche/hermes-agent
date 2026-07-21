@@ -64,6 +64,26 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+class PinCaptureBot:
+    def __init__(self):
+        self.pins = []
+        self.unpins = []
+
+    async def pin_chat_message(self, **kwargs):
+        self.pins.append(kwargs)
+        return True
+
+    async def unpin_chat_message(self, **kwargs):
+        self.unpins.append(kwargs)
+        return True
+
+
+class PinningProgressAdapter(ProgressCaptureAdapter):
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self._bot = PinCaptureBot()
+
+
 class BlockingDeleteProgressAdapter(ProgressCaptureAdapter):
     """Hold checklist deletion open to exercise progress-task shutdown."""
 
@@ -1949,6 +1969,56 @@ async def test_empty_todo_deletes_existing_checklist(monkeypatch, tmp_path):
     assert len(adapter.sent) == 1
     assert "Working on 1 task:" in adapter.sent[0]["content"]
     assert adapter.edits == []
+    assert adapter.deletes == [{"chat_id": "-1001", "message_id": "progress-1"}]
+
+
+@pytest.mark.asyncio
+async def test_telegram_todo_pin_pins_created_checklist_silently(monkeypatch, tmp_path):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TodoChecklistAgent,
+        session_id="sess-todo-pin",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "todo_progress": True,
+                "platforms": {"telegram": {"todo_progress_pin": True}},
+            }
+        },
+        adapter_cls=PinningProgressAdapter,
+    )
+
+    assert adapter._bot.pins == [
+        {
+            "chat_id": -1001,
+            "message_id": "progress-1",
+            "disable_notification": True,
+        }
+    ]
+    assert adapter._bot.unpins == []
+
+
+@pytest.mark.asyncio
+async def test_telegram_todo_pin_unpins_cleared_checklist(monkeypatch, tmp_path):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TodoClearingAgent,
+        session_id="sess-todo-pin-clear",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "todo_progress": True,
+                "platforms": {"telegram": {"todo_progress_pin": True}},
+            }
+        },
+        adapter_cls=PinningProgressAdapter,
+    )
+
+    assert adapter._bot.unpins == [
+        {"chat_id": -1001, "message_id": "progress-1"}
+    ]
     assert adapter.deletes == [{"chat_id": "-1001", "message_id": "progress-1"}]
 
 
