@@ -19765,6 +19765,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 )
                                 is_owned_checklist = (
                                     pinned_text.startswith("Working on ")
+                                    or pinned_text.startswith("All tasks complete:\n")
                                     or pinned_text.startswith("🤖 Delegated tasks\n")
                                     or re.match(
                                         r"^Delegated [1-9]\d* tasks? 🤖(?:\n|$)",

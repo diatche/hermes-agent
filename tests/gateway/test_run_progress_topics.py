@@ -2201,23 +2201,24 @@ async def test_telegram_todo_pin_removes_stale_bot_checklists_but_keeps_user_pin
 
 
 @pytest.mark.parametrize(
-    "delegated_text",
+    "checklist_text",
     [
+        "All tasks complete:\n\n✅ Verify the implementation",
         "Delegated 1 task 🤖",
         "Delegated 2 tasks 🤖",
         "🤖 Delegated tasks\n↳ Review the implementation",
     ],
 )
 @pytest.mark.asyncio
-async def test_telegram_todo_pin_removes_stale_delegated_only_checklist(
-    monkeypatch, tmp_path, delegated_text
+async def test_telegram_todo_pin_removes_stale_owned_checklist_variants(
+    monkeypatch, tmp_path, checklist_text
 ):
     adapter = PinningProgressAdapter()
     runner = _make_runner(adapter)
     adapter._bot.pinned_messages = [
         SimpleNamespace(
             message_id=41,
-            text=delegated_text,
+            text=checklist_text,
             from_user=SimpleNamespace(is_bot=True),
             message_thread_id=17585,
         )
