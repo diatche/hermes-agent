@@ -2200,6 +2200,49 @@ async def test_telegram_todo_pin_removes_stale_bot_checklists_but_keeps_user_pin
     assert [message.message_id for message in adapter._bot.pinned_messages] == [40]
 
 
+@pytest.mark.parametrize(
+    "delegated_text",
+    [
+        "Delegated 1 task 🤖",
+        "Delegated 2 tasks 🤖",
+        "🤖 Delegated tasks\n↳ Review the implementation",
+    ],
+)
+@pytest.mark.asyncio
+async def test_telegram_todo_pin_removes_stale_delegated_only_checklist(
+    monkeypatch, tmp_path, delegated_text
+):
+    adapter = PinningProgressAdapter()
+    runner = _make_runner(adapter)
+    adapter._bot.pinned_messages = [
+        SimpleNamespace(
+            message_id=41,
+            text=delegated_text,
+            from_user=SimpleNamespace(is_bot=True),
+            message_thread_id=17585,
+        )
+    ]
+
+    await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TodoChecklistAgent,
+        session_id="sess-todo-pin-clean-stale-delegated",
+        thread_id="17585",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "todo_progress": True,
+                "platforms": {"telegram": {"todo_progress_pin": True}},
+            }
+        },
+        runner=runner,
+        adapter=adapter,
+    )
+
+    assert adapter._bot.unpins == [{"chat_id": -1001, "message_id": 41}]
+
+
 @pytest.mark.asyncio
 async def test_telegram_todo_pin_does_not_unpin_other_topic(monkeypatch, tmp_path):
     adapter = PinningProgressAdapter()
