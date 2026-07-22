@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,24 @@ def _command(path: Path, name: str, content: str) -> None:
 def _environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
     fake_bin = tmp_path / "bin"
     app = tmp_path / "HermesGateway.app"
+    repo = tmp_path / "hermes-agent"
+    timeout_state = tmp_path / "wrapper-timeouts.json"
+    timeout_state.write_text(
+        json.dumps({"pid": 99111, "wrapper_grace": 65, "controller_wait": 75}),
+        encoding="utf-8",
+    )
+    _command(
+        repo / "venv" / "bin",
+        "hermes",
+        "#!/usr/bin/env bash\n"
+        "if [[ $1 == config && $2 == get ]]; then printf '0\\n'; exit 0; fi\n"
+        "exit 1\n",
+    )
+    _command(
+        repo / "scripts",
+        "hermes-wrapper-timeout-budget.py",
+        "#!/usr/bin/env bash\nprintf '75\\n'\n",
+    )
     env = os.environ.copy()
     env.update(
         {
@@ -32,6 +52,11 @@ def _environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
             "HERMES_WRAPPER_PLIST": str(tmp_path / "wrapper.plist"),
             "HERMES_WRAPPER_ENTRYPOINT": str(tmp_path / "entrypoint"),
             "HERMES_DASHBOARD_PORT": "9119",
+            "HERMES_WRAPPER_PYTHON": sys.executable,
+            "HERMES_WRAPPER_TIMEOUT_STATE": str(timeout_state),
+            "HERMES_WRAPPER_TIMEOUT_BUDGET_SCRIPT": str(
+                repo / "scripts" / "hermes-wrapper-timeout-budget.py"
+            ),
         }
     )
     return env, fake_bin
@@ -77,6 +102,104 @@ def test_stop_waits_only_for_captured_wrapper_tree(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "Stopped and quiescent" in result.stdout
+
+
+def test_stop_wait_budget_comes_from_active_wrapper_state(tmp_path: Path) -> None:
+    env, fake_bin = _environment(tmp_path)
+    Path(env["HERMES_WRAPPER_TIMEOUT_STATE"]).write_text(
+        json.dumps({"pid": 99111, "wrapper_grace": 1, "controller_wait": 1}),
+        encoding="utf-8",
+    )
+    loaded = tmp_path / "loaded"
+    loaded.write_text("yes\n", encoding="utf-8")
+    sleeps = tmp_path / "sleeps"
+    _command(
+        fake_bin,
+        "launchctl",
+        "#!/usr/bin/env bash\n"
+        "if [[ $1 == print ]]; then echo '    pid = 99111'; exit 0; fi\n"
+        "if [[ $1 == bootout ]]; then exit 0; fi\n"
+        "exit 1\n",
+    )
+    _command(fake_bin, "pgrep", "#!/usr/bin/env bash\nexit 1\n")
+    _command(fake_bin, "lsof", "#!/usr/bin/env bash\nexit 1\n")
+    _command(fake_bin, "ps", "#!/usr/bin/env bash\nexit 0\n")
+    _command(
+        fake_bin,
+        "sleep",
+        "#!/usr/bin/env bash\n"
+        f"printf 'poll\\n' >> {sleeps}\n"
+        "/bin/sleep \"$1\"\n",
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--stop"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert len(sleeps.read_text(encoding="utf-8").splitlines()) >= 1
+
+
+def test_stop_rejects_timeout_state_for_a_different_wrapper_pid(tmp_path: Path) -> None:
+    env, fake_bin = _environment(tmp_path)
+    Path(env["HERMES_WRAPPER_TIMEOUT_STATE"]).write_text(
+        json.dumps({"pid": 12345, "wrapper_grace": 65, "controller_wait": 75}),
+        encoding="utf-8",
+    )
+    calls = tmp_path / "calls"
+    _command(
+        fake_bin,
+        "launchctl",
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {calls}\n"
+        "if [[ $1 == print ]]; then echo '    pid = 99111'; exit 0; fi\n"
+        "exit 0\n",
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--stop"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "timeout state is invalid" in result.stderr
+    assert "bootout" not in calls.read_text(encoding="utf-8")
+
+
+def test_stop_bounds_a_hanging_launchctl_bootout(tmp_path: Path) -> None:
+    env, fake_bin = _environment(tmp_path)
+    Path(env["HERMES_WRAPPER_TIMEOUT_STATE"]).write_text(
+        json.dumps({"pid": 99111, "wrapper_grace": 1, "controller_wait": 1}),
+        encoding="utf-8",
+    )
+    _command(
+        fake_bin,
+        "launchctl",
+        "#!/usr/bin/env bash\n"
+        "if [[ $1 == print ]]; then echo '    pid = 99111'; exit 0; fi\n"
+        "if [[ $1 == bootout ]]; then trap '' TERM; while :; do /bin/sleep 0.1; done; fi\n"
+        "exit 1\n",
+    )
+    _command(fake_bin, "ps", "#!/usr/bin/env bash\nexit 0\n")
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--stop"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode == 1
+    assert "bootout exceeded coordinated stop deadline" in result.stderr
 
 
 def test_status_rejects_listener_not_owned_by_wrapper_tree(tmp_path: Path) -> None:
