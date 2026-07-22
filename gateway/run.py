@@ -19742,8 +19742,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # a turn stalls before cleanup. Telegram exposes the latest
                         # pin via getChat, so peel off consecutive bot-authored todo
                         # checklists in this topic while stopping at any user pin.
-                        # The text prefix deliberately identifies our checklist
-                        # without risking unrelated bot pins.
+                        # The text prefixes deliberately identify renderer-owned
+                        # checklists, including delegated-only views, without risking
+                        # unrelated bot pins.
                         seen_pins = set()
                         if hasattr(bot, "get_chat"):
                             while True:
@@ -19762,8 +19763,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 pinned_thread_id = getattr(
                                     pinned_message, "message_thread_id", None
                                 )
+                                is_owned_checklist = (
+                                    pinned_text.startswith("Working on ")
+                                    or pinned_text.startswith("🤖 Delegated tasks\n")
+                                    or re.match(
+                                        r"^Delegated [1-9]\d* tasks? 🤖(?:\n|$)",
+                                        pinned_text,
+                                    )
+                                    is not None
+                                )
                                 if (
-                                    not pinned_text.startswith("Working on ")
+                                    not is_owned_checklist
                                     or not getattr(pinned_author, "is_bot", False)
                                     or str(pinned_thread_id or "")
                                     != str(_progress_thread_id or "")
