@@ -1,10 +1,22 @@
 import Foundation
 import Dispatch
+import Darwin
 
 final class Supervisor {
+    private enum State {
+        case running
+        case shuttingDown
+        case finished
+    }
+
+    private struct ManagedChild {
+        let process: Process
+        let hasDedicatedGroup: Bool
+    }
+
     private let lock = NSLock()
-    private var children: [Process] = []
-    private var shuttingDown = false
+    private var children: [ManagedChild] = []
+    private var state = State.running
 
     private func log(_ message: String) {
         let formatter = ISO8601DateFormatter()
@@ -36,8 +48,9 @@ final class Supervisor {
 
     private func launch(_ executable: String, _ arguments: [String], name: String) -> Process {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
+        let trampoline = "import os, sys; os.execve(sys.argv[1], sys.argv[1:], os.environ)"
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = ["-c", trampoline, executable] + arguments
         process.currentDirectoryURL = URL(fileURLWithPath: "/Users/diatche/.hermes")
         process.environment = configuredEnvironment()
         process.standardOutput = FileHandle.standardOutput
@@ -45,25 +58,57 @@ final class Supervisor {
         process.terminationHandler = { [weak self] proc in
             guard let self else { return }
             self.log("\(name) exited status=\(proc.terminationStatus)")
-            self.lock.lock()
-            let shouldExit = !self.shuttingDown
-            self.lock.unlock()
-            if shouldExit {
-                self.terminateAll()
+            if self.shutdownAndWait() {
                 exit(proc.terminationStatus == 0 ? 0 : proc.terminationStatus)
             }
         }
+
+        // Starting and registering a child is one transaction with respect to
+        // shutdown. A termination callback may block here, but cannot snapshot
+        // children between process.run() and registration.
+        lock.lock()
+        guard state == .running else {
+            lock.unlock()
+            log("refusing to start \(name) after shutdown began")
+            dispatchMain()
+        }
         do {
             try process.run()
+            let groupDeadline = ProcessInfo.processInfo.systemUptime + 2
+            while process.isRunning
+                && getpgid(process.processIdentifier) != process.processIdentifier
+                && ProcessInfo.processInfo.systemUptime < groupDeadline {
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            let hasDedicatedGroup =
+                getpgid(process.processIdentifier) == process.processIdentifier
+            if process.isRunning && !hasDedicatedGroup {
+                children.append(
+                    ManagedChild(process: process, hasDedicatedGroup: false)
+                )
+                lock.unlock()
+                log("failed to establish dedicated process group for \(name)")
+                if shutdownAndWait() {
+                    exit(1)
+                }
+                dispatchMain()
+            }
+            children.append(
+                ManagedChild(
+                    process: process,
+                    hasDedicatedGroup: hasDedicatedGroup
+                )
+            )
+            lock.unlock()
             log("started \(name) pid=\(process.processIdentifier): \(executable) \(arguments.joined(separator: " "))")
         } catch {
+            lock.unlock()
             log("failed to start \(name): \(error)")
-            terminateAll()
-            exit(1)
+            if shutdownAndWait() {
+                exit(1)
+            }
+            dispatchMain()
         }
-        lock.lock()
-        children.append(process)
-        lock.unlock()
         return process
     }
 
@@ -73,14 +118,64 @@ final class Supervisor {
         _ = launch(hermes, ["dashboard", "--host", "0.0.0.0", "--port", "9119", "--no-open", "--skip-build"], name: "dashboard")
     }
 
-    func terminateAll() {
+    private func isAlive(_ child: ManagedChild) -> Bool {
+        if child.hasDedicatedGroup {
+            if kill(-child.process.processIdentifier, 0) == 0 {
+                return true
+            }
+            return errno == EPERM
+        }
+        return child.process.isRunning
+    }
+
+    private func signal(_ child: ManagedChild, _ signal: Int32) {
+        let pid = child.process.processIdentifier
+        let target = child.hasDedicatedGroup ? -pid : pid
+        if kill(target, signal) != 0 && errno != ESRCH {
+            log("failed to signal child target=\(target) signal=\(signal) errno=\(errno)")
+        }
+    }
+
+    @discardableResult
+    func shutdownAndWait(timeout: TimeInterval = 30) -> Bool {
         lock.lock()
-        shuttingDown = true
+        guard state == .running else {
+            lock.unlock()
+            return false
+        }
+        state = .shuttingDown
         let snapshot = children
         lock.unlock()
-        for child in snapshot where child.isRunning {
-            child.terminate()
+
+        for child in snapshot where isAlive(child) {
+            signal(child, SIGTERM)
         }
+
+        let graceDeadline = ProcessInfo.processInfo.systemUptime + timeout
+        while snapshot.contains(where: isAlive)
+            && ProcessInfo.processInfo.systemUptime < graceDeadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
+        for child in snapshot where isAlive(child) {
+            log("force-killing child group pid=\(child.process.processIdentifier) after shutdown timeout")
+            signal(child, SIGKILL)
+        }
+
+        let killDeadline = ProcessInfo.processInfo.systemUptime + 5
+        while snapshot.contains(where: isAlive)
+            && ProcessInfo.processInfo.systemUptime < killDeadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        let survivors = snapshot.filter(isAlive)
+        if !survivors.isEmpty {
+            log("child process group remained after SIGKILL: \(survivors.map { $0.process.processIdentifier })")
+        }
+
+        lock.lock()
+        state = .finished
+        lock.unlock()
+        return true
     }
 
     func waitForever() {
@@ -94,14 +189,16 @@ signal(SIGTERM, SIG_IGN)
 signal(SIGINT, SIG_IGN)
 let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
 termSource.setEventHandler {
-    supervisor.terminateAll()
-    exit(0)
+    if supervisor.shutdownAndWait() {
+        exit(0)
+    }
 }
 termSource.resume()
 let intSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
 intSource.setEventHandler {
-    supervisor.terminateAll()
-    exit(0)
+    if supervisor.shutdownAndWait() {
+        exit(0)
+    }
 }
 intSource.resume()
 
