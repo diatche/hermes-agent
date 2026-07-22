@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for Pavel's signed HermesGateway.app supervisor.
+  ExitTimeOut is the conservative static ceiling validated by
+  hermes-wrapper-timeout-budget.py; the app/controller derive live budgets
+  from agent.restart_drain_timeout.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>nz.diatche.hermes-gateway</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/diatche/.hermes/local/bin/start-hermes-gateway-wrapper.sh</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/diatche/.hermes</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/diatche/.hermes/hermes-agent/venv/bin:/Users/diatche/.hermes/hermes-agent/node_modules/.bin:/Users/diatche/.nvm/versions/node/v24.14.0/bin:/Users/diatche/.local/bin:/Users/diatche/.antigravity/antigravity/bin:/Users/diatche/Library/pnpm:/Users/diatche/miniconda3/bin:/Users/diatche/miniconda3/condabin:/Users/diatche/.rbenv/shims:/Users/diatche/.rbenv/bin:/opt/homebrew/opt/postgresql@17/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/opt/pkg/env/active/bin:/opt/pmk/env/global/bin:/Library/Apple/usr/bin:/Library/TeX/texbin:/usr/local/share/dotnet:~/.dotnet/tools:/Users/diatche/Library/Android/sdk/emulator:/Users/diatche/Library/Android/sdk/platform-tools</string>
+		<key>VIRTUAL_ENV</key>
+		<string>/Users/diatche/.hermes/hermes-agent/venv</string>
+		<key>HERMES_HOME</key>
+		<string>/Users/diatche/.hermes</string>
+	</dict>
+	<key>LimitLoadToSessionType</key>
+	<array>
+		<string>Aqua</string>
+		<string>Background</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ExitTimeOut</key>
+	<integer>3700</integer>
+	<key>StandardOutPath</key>
+	<string>/Users/diatche/.hermes/logs/hermes-gateway-wrapper.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/diatche/.hermes/logs/hermes-gateway-wrapper.error.log</string>
+</dict>
+</plist>

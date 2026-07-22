@@ -23,6 +23,9 @@ RESTART_LOG="$LOG_DIR/hermes-gateway-wrapper.restart.log"
 PORT="${HERMES_DASHBOARD_PORT:-9119}"
 REPO="${HERMES_REPO:-$HOME/.hermes/hermes-agent}"
 MAINTENANCE_ACTIVE="${HERMES_MAINTENANCE_ACTIVE:-$HOME/.hermes/local/update/active.json}"
+TIMEOUT_BUDGET_SCRIPT="${HERMES_WRAPPER_TIMEOUT_BUDGET_SCRIPT:-$REPO/scripts/hermes-wrapper-timeout-budget.py}"
+TIMEOUT_STATE="${HERMES_WRAPPER_TIMEOUT_STATE:-$HOME/.hermes/local/run/hermes-gateway-wrapper-timeouts.json}"
+PYTHON_BIN="${HERMES_WRAPPER_PYTHON:-$REPO/venv/bin/python}"
 
 usage() {
   printf 'Usage: %s [--foreground|--detach|--stop|--force-stop|--enforce-exclusivity|--status|--assert-update-quiescence|--help]\n' "$0"
@@ -36,6 +39,33 @@ require_restart_permission() {
     echo "ERROR: maintenance owns gateway restart; refusing competing restart" >&2
     return 1
   fi
+}
+
+stop_wait_polls() {
+  local expected_pid="$1" value
+  if [[ ! -r "$TIMEOUT_STATE" ]]; then
+    echo "ERROR: active wrapper timeout state is missing: $TIMEOUT_STATE" >&2
+    return 1
+  fi
+  if ! value="$("$PYTHON_BIN" - "$TIMEOUT_STATE" "$expected_pid" <<'PY'
+import json, math, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    state = json.load(stream)
+if state.get("pid") != int(sys.argv[2]):
+    raise SystemExit("wrapper timeout state PID does not match active LaunchAgent")
+value = state.get("controller_wait")
+if isinstance(value, bool) or not isinstance(value, (int, float)):
+    raise SystemExit("invalid controller_wait in wrapper timeout state")
+if not math.isfinite(value) or value < 1 or value != math.ceil(value):
+    raise SystemExit("invalid controller_wait in wrapper timeout state")
+print(int(value))
+PY
+  )"; then
+    echo "ERROR: active wrapper timeout state is invalid" >&2
+    return 1
+  fi
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$value"
 }
 
 wrapper_pid() {
@@ -173,6 +203,7 @@ verify_prereqs() {
   [[ -f "$PLIST" ]] || { echo "ERROR: plist not found: $PLIST" >&2; exit 2; }
   [[ -x "$APP/Contents/MacOS/HermesGateway" ]] || { echo "ERROR: wrapper executable missing: $APP/Contents/MacOS/HermesGateway" >&2; exit 2; }
   [[ -x "$ENTRYPOINT" ]] || { echo "ERROR: wrapper entrypoint missing: $ENTRYPOINT" >&2; exit 2; }
+  [[ -x "$TIMEOUT_BUDGET_SCRIPT" ]] || { echo "ERROR: timeout budget resolver missing: $TIMEOUT_BUDGET_SCRIPT" >&2; exit 2; }
   plutil -lint "$PLIST" >/dev/null
 }
 
@@ -195,15 +226,42 @@ enforce_exclusivity() {
 }
 
 stop_foreground() {
-  local old_wrapper old_children current_children pid all_gone
+  local old_wrapper old_children current_children pid all_gone wait_polls poll deadline bootout_error
+  bootout_error="$(mktemp -t hermes-wrapper-bootout.XXXXXX)"
+  trap 'rm -f "$bootout_error"' RETURN
   old_wrapper="$(wrapper_pid || true)"
+  if [[ -z "$old_wrapper" ]]; then
+    if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 \
+      && [[ -z "$(wrapper_app_pids)" ]] \
+      && [[ -z "$(listener_pids)" ]]; then
+      echo "Stopped and quiescent: $DOMAIN/$LABEL"
+      return 0
+    fi
+    echo "ERROR: loaded wrapper has no verifiable PID" >&2
+    return 1
+  fi
+  if ! wait_polls="$(stop_wait_polls "$old_wrapper")"; then
+    return 1
+  fi
+  deadline=$((SECONDS + wait_polls))
   old_children=""
   if [[ -n "$old_wrapper" ]]; then
     old_children="$(descendant_pids "$old_wrapper" || true)"
   fi
-  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-  launchctl bootout "$DOMAIN" "$PLIST" 2>/dev/null || true
-  for _ in {1..30}; do
+  launchctl bootout "$DOMAIN/$LABEL" 2>"$bootout_error" &
+  local bootout_pid=$!
+  while kill -0 "$bootout_pid" 2>/dev/null && (( SECONDS < deadline )); do sleep 0.1; done
+  if kill -0 "$bootout_pid" 2>/dev/null; then
+    kill -TERM "$bootout_pid" 2>/dev/null || true
+    sleep 0.2
+    kill -KILL "$bootout_pid" 2>/dev/null || true
+    wait "$bootout_pid" 2>/dev/null || true
+    echo "ERROR: launchctl bootout exceeded coordinated stop deadline" >&2
+    cat "$bootout_error" >&2 2>/dev/null || true
+    return 1
+  fi
+  wait "$bootout_pid" 2>/dev/null || true
+  for ((poll = 0; SECONDS < deadline; poll++)); do
     if [[ -n "$old_wrapper" ]] && kill -0 "$old_wrapper" 2>/dev/null; then
       current_children="$(descendant_pids "$old_wrapper" || true)"
       old_children="$(printf '%s\n%s\n' "$old_children" "$current_children" | awk 'NF && !seen[$0]++')"
@@ -223,6 +281,7 @@ stop_foreground() {
     sleep 1
   done
   echo "ERROR: wrapper-owned process topology remains after bootout" >&2
+  cat "$bootout_error" >&2 2>/dev/null || true
   ps -axo pid,ppid,stat,command | grep -Ei 'HermesGateway|hermes gateway run' | grep -v grep >&2 || true
   lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >&2 || true
   return 1

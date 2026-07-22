@@ -3,6 +3,13 @@ import Dispatch
 import Darwin
 
 final class Supervisor {
+    private let hermes = "/Users/diatche/.hermes/hermes-agent/venv/bin/hermes"
+    private let timeoutBudgetScript = "/Users/diatche/.hermes/hermes-agent/scripts/hermes-wrapper-timeout-budget.py"
+    private let timeoutStatePath = "/Users/diatche/.hermes/local/run/hermes-gateway-wrapper-timeouts.json"
+    private let configReadTimeout: TimeInterval = 5
+    private var shutdownGrace: TimeInterval?
+    private var controllerWait: TimeInterval?
+
     private enum State {
         case running
         case shuttingDown
@@ -44,6 +51,86 @@ final class Supervisor {
         ].joined(separator: ":")
         env["PATH"] = pathPrefix + ":" + (env["PATH"] ?? "")
         return env
+    }
+
+    private func readTimeoutBudgets() throws -> (wrapperGrace: TimeInterval, controllerWait: TimeInterval) {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: timeoutBudgetScript)
+        process.arguments = ["--json"]
+        process.currentDirectoryURL = URL(fileURLWithPath: "/Users/diatche/.hermes")
+        process.environment = configuredEnvironment()
+        process.standardOutput = output
+        process.standardError = FileHandle.standardError
+        try process.run()
+
+        let deadline = ProcessInfo.processInfo.systemUptime + configReadTimeout
+        while process.isRunning && ProcessInfo.processInfo.systemUptime < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if process.isRunning {
+            process.terminate()
+            let termDeadline = ProcessInfo.processInfo.systemUptime + 1
+            while process.isRunning && ProcessInfo.processInfo.systemUptime < termDeadline {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+                let killDeadline = ProcessInfo.processInfo.systemUptime + 1
+                while process.isRunning && ProcessInfo.processInfo.systemUptime < killDeadline {
+                    Thread.sleep(forTimeInterval: 0.02)
+                }
+            }
+            if !process.isRunning { process.waitUntilExit() }
+            throw NSError(
+                domain: "HermesGateway",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "timed out resolving wrapper shutdown budget pid=\(process.processIdentifier)"]
+            )
+        }
+        guard process.terminationStatus == 0 else {
+            throw NSError(
+                domain: "HermesGateway",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "timeout budget resolver failed with status \(process.terminationStatus)"]
+            )
+        }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let object = try JSONSerialization.jsonObject(with: data)
+        guard let budgets = object as? [String: Any],
+              let grace = budgets["wrapper-grace"] as? NSNumber,
+              let wait = budgets["controller-wait"] as? NSNumber,
+              grace.doubleValue.isFinite, grace.doubleValue >= 0,
+              wait.doubleValue.isFinite, wait.doubleValue >= grace.doubleValue else {
+            throw NSError(
+                domain: "HermesGateway",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "invalid correlated timeout budget response"]
+            )
+        }
+        return (grace.doubleValue, wait.doubleValue)
+    }
+
+    private func publishTimeoutState() throws {
+        guard let shutdownGrace, let controllerWait else {
+            throw NSError(
+                domain: "HermesGateway",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "timeout budgets are unavailable"]
+            )
+        }
+        let state: [String: Any] = [
+            "pid": Int(getpid()),
+            "wrapper_grace": shutdownGrace,
+            "controller_wait": controllerWait,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys])
+        let url = URL(fileURLWithPath: timeoutStatePath)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: url, options: [.atomic])
     }
 
     private func launch(_ executable: String, _ arguments: [String], name: String) -> Process {
@@ -113,7 +200,16 @@ final class Supervisor {
     }
 
     func start() {
-        let hermes = "/Users/diatche/.hermes/hermes-agent/venv/bin/hermes"
+        do {
+            let budgets = try readTimeoutBudgets()
+            shutdownGrace = budgets.wrapperGrace
+            controllerWait = budgets.controllerWait
+            try publishTimeoutState()
+            log("shutdown grace configured to \(shutdownGrace!) seconds; controller wait \(controllerWait!) seconds")
+        } catch {
+            log("refusing to launch children: \(error.localizedDescription)")
+            exit(78)
+        }
         _ = launch(hermes, ["gateway", "run", "--replace"], name: "gateway")
         _ = launch(hermes, ["dashboard", "--host", "0.0.0.0", "--port", "9119", "--no-open", "--skip-build"], name: "dashboard")
     }
@@ -137,7 +233,7 @@ final class Supervisor {
     }
 
     @discardableResult
-    func shutdownAndWait(timeout: TimeInterval = 30) -> Bool {
+    func shutdownAndWait(timeout: TimeInterval? = nil) -> Bool {
         lock.lock()
         guard state == .running else {
             lock.unlock()
@@ -151,7 +247,8 @@ final class Supervisor {
             signal(child, SIGTERM)
         }
 
-        let graceDeadline = ProcessInfo.processInfo.systemUptime + timeout
+        let grace = timeout ?? shutdownGrace ?? 0
+        let graceDeadline = ProcessInfo.processInfo.systemUptime + grace
         while snapshot.contains(where: isAlive)
             && ProcessInfo.processInfo.systemUptime < graceDeadline {
             Thread.sleep(forTimeInterval: 0.05)
@@ -175,6 +272,7 @@ final class Supervisor {
         lock.lock()
         state = .finished
         lock.unlock()
+        try? FileManager.default.removeItem(atPath: timeoutStatePath)
         return true
     }
 
