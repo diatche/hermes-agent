@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import subprocess
 import sys
@@ -15,11 +16,79 @@ from urllib.parse import parse_qs
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "deploy-hermes-wrapper.py"
 
 
+def _module():
+    spec = importlib.util.spec_from_file_location("deploy_hermes_wrapper", SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _executable(path: Path, content: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
     return path
+
+
+def _terminal_env(**updates: str) -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("HERMES_SESSION_")
+        and key not in {"_HERMES_GATEWAY", "HERMES_UI_SESSION_ID"}
+    }
+    environment.update(updates)
+    return environment
+
+
+def test_agent_foreground_run_refuses_before_touching_launchd(tmp_path: Path) -> None:
+    calls = tmp_path / "calls"
+    launchctl = _executable(
+        tmp_path / "launchctl",
+        "#!/bin/sh\n" f"printf called >> {calls}\n" "exit 0\n",
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--launchctl", str(launchctl)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "_HERMES_GATEWAY": "1"},
+    )
+
+    assert result.returncode == 2
+    assert "circular wait" in result.stderr
+    assert "--detach" in result.stderr
+    assert not calls.exists()
+
+
+def test_detach_starts_a_new_session_with_delayed_worker(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module = _module()
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    class Process:
+        pid = 43210
+
+    def fake_popen(command: list[str], **kwargs: object) -> Process:
+        calls.append((command, kwargs))
+        return Process()
+
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+
+    result = module.main(
+        ["--detach", "--detach-delay", "12", "--detach-log", str(tmp_path / "log")]
+    )
+
+    assert result == 0
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert "--detached-worker" in command
+    assert command[command.index("--detach-delay") + 1] == "12"
+    assert kwargs["start_new_session"] is True
+    assert kwargs["stdin"] is subprocess.DEVNULL
 
 
 def test_effective_launchd_timeout_mismatch_is_a_warning_after_successful_restart(
@@ -77,7 +146,7 @@ def test_effective_launchd_timeout_mismatch_is_a_warning_after_successful_restar
         capture_output=True,
         text=True,
         check=False,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        env=_terminal_env(PYTHONDONTWRITEBYTECODE="1"),
     )
 
     assert result.returncode == 0, result.stderr
@@ -163,11 +232,9 @@ def test_telegram_progress_uses_one_message_and_notification_failure_is_nonfatal
             capture_output=True,
             text=True,
             check=False,
-            env={
-                **os.environ,
-                "PYTHONDONTWRITEBYTECODE": "1",
-                "TELEGRAM_BOT_TOKEN": "",
-            },
+            env=_terminal_env(
+                PYTHONDONTWRITEBYTECODE="1", TELEGRAM_BOT_TOKEN=""
+            ),
         )
     finally:
         server.shutdown()

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Restart and verify Pavel's signed Hermes gateway wrapper.
 
-Usage: ``python3 scripts/deploy-hermes-wrapper.py``.
+Usage from Terminal: ``python3 scripts/deploy-hermes-wrapper.py``.
+Usage from a Hermes agent session: add ``--detach``. Never run the foreground
+mode from the gateway turn it is stopping: the turn can wait for the restart
+while graceful shutdown waits for the turn, creating a circular wait.
 The script invokes the established wrapper controller, verifies runtime state,
 and reports informational checkpoint mismatches as warnings. It does not edit
 configuration, install files, or replace the signed app bundle.
@@ -16,6 +19,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib import error, parse, request
 
@@ -25,6 +29,7 @@ from dotenv import dotenv_values
 DEFAULT_HOME = Path.home() / ".hermes"
 DEFAULT_LABEL = "nz.diatche.hermes-gateway"
 DEFAULT_TELEGRAM_CHAT_ID = "297138560"
+DEFAULT_DETACH_LOG = DEFAULT_HOME / "logs/hermes-wrapper-deployment.log"
 
 
 class TelegramProgress:
@@ -139,8 +144,59 @@ def _read_timeout_state(path: Path) -> dict[str, int]:
     return state
 
 
+def _in_agent_session() -> bool:
+    return bool(os.environ.get("_HERMES_GATEWAY") or os.environ.get("HERMES_SESSION_ID"))
+
+
+def _schedule_detached(args: argparse.Namespace, argv: list[str]) -> int:
+    args.detach_log.parent.mkdir(parents=True, exist_ok=True)
+    worker_argv = [argument for argument in argv if argument != "--detach"]
+    worker_argv.append("--detached-worker")
+    environment = os.environ.copy()
+    for key in tuple(environment):
+        if key.startswith("HERMES_SESSION_") or key in {
+            "_HERMES_GATEWAY",
+            "HERMES_UI_SESSION_ID",
+        }:
+            environment.pop(key, None)
+    with args.detach_log.open("ab", buffering=0) as log:
+        process = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), *worker_argv],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+            env=environment,
+        )
+    print(
+        f"Scheduled detached Hermes gateway restart as PID {process.pid}; "
+        f"starting after {args.detach_delay:g}s. Log: {args.detach_log}"
+    )
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=(
+            "Agent sessions must use --detach to avoid a circular wait. "
+            "Foreground mode is intended only for an independent Terminal."
+        ),
+    )
+    parser.add_argument(
+        "--detach",
+        action="store_true",
+        help="start an independent delayed worker and return before shutdown",
+    )
+    parser.add_argument(
+        "--detach-delay",
+        type=float,
+        default=10.0,
+        help="seconds the detached worker waits for the initiating turn to finish",
+    )
+    parser.add_argument("--detach-log", type=Path, default=DEFAULT_DETACH_LOG)
+    parser.add_argument("--detached-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--controller",
         default=str(DEFAULT_HOME / "local/bin/hermes-gateway-wrapperctl"),
@@ -172,7 +228,21 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = _parser().parse_args(raw_argv)
+    if args.detach:
+        return _schedule_detached(args, raw_argv)
+    if _in_agent_session() and not args.detached_worker:
+        print(
+            "ERROR: refusing foreground restart from a Hermes agent session: "
+            "it can create a circular wait between this turn and gateway drain. "
+            "Run this command with --detach, or run foreground mode from an "
+            "independent Terminal.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.detached_worker:
+        time.sleep(args.detach_delay)
     warnings: list[str] = []
     domain = f"gui/{subprocess.check_output(['id', '-u'], text=True).strip()}"
     notifier: TelegramProgress | None = None
