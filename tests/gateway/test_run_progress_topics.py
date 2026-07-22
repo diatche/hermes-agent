@@ -68,6 +68,7 @@ class PinCaptureBot:
     def __init__(self):
         self.pins = []
         self.unpins = []
+        self.pinned_messages = []
 
     async def pin_chat_message(self, **kwargs):
         self.pins.append(kwargs)
@@ -75,7 +76,17 @@ class PinCaptureBot:
 
     async def unpin_chat_message(self, **kwargs):
         self.unpins.append(kwargs)
+        self.pinned_messages = [
+            message
+            for message in self.pinned_messages
+            if message.message_id != kwargs["message_id"]
+        ]
         return True
+
+    async def get_chat(self, chat_id):
+        return SimpleNamespace(
+            pinned_message=self.pinned_messages[-1] if self.pinned_messages else None
+        )
 
 
 class PinningProgressAdapter(ProgressCaptureAdapter):
@@ -2135,6 +2146,58 @@ async def test_telegram_todo_pin_replaces_prior_checklist_in_same_topic(monkeypa
         {"chat_id": -1001, "message_id": "progress-1", "disable_notification": True},
         {"chat_id": -1001, "message_id": "progress-2", "disable_notification": True},
     ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_todo_pin_removes_stale_bot_checklists_but_keeps_user_pin(
+    monkeypatch, tmp_path
+):
+    adapter = PinningProgressAdapter()
+    runner = _make_runner(adapter)
+    runner._pinned_todo_messages[("-1001", "17585")] = "42"
+    adapter._bot.pinned_messages = [
+        SimpleNamespace(
+            message_id=40,
+            text="Parish notices for Sunday",
+            from_user=SimpleNamespace(is_bot=False),
+            message_thread_id=17585,
+        ),
+        SimpleNamespace(
+            message_id=41,
+            text="Working on 2 tasks:\n\nFirst old task",
+            from_user=SimpleNamespace(is_bot=True),
+            message_thread_id=17585,
+        ),
+        SimpleNamespace(
+            message_id=42,
+            text="Working on 1 task:\n\nSecond old task",
+            from_user=SimpleNamespace(is_bot=True),
+            message_thread_id=17585,
+        ),
+    ]
+
+    await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TodoChecklistAgent,
+        session_id="sess-todo-pin-clean-stale",
+        thread_id="17585",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "todo_progress": True,
+                "platforms": {"telegram": {"todo_progress_pin": True}},
+            }
+        },
+        runner=runner,
+        adapter=adapter,
+    )
+
+    assert adapter._bot.unpins == [
+        {"chat_id": -1001, "message_id": 42},
+        {"chat_id": -1001, "message_id": 41},
+    ]
+    assert [message.message_id for message in adapter._bot.pinned_messages] == [40]
 
 
 @pytest.mark.asyncio
