@@ -97,10 +97,10 @@ stop_foreground() {
     launchctl bootout "$DOMAIN" "$PLIST" >/dev/null 2>&1 || true
   clear_reserved_port
   if job_is_loaded; then
-    echo "ERROR: $DOMAIN/$LABEL remains loaded after stop" >&2
-    return 1
+    echo "Stopped listener on port $PORT; $DOMAIN/$LABEL remains loaded"
+  else
+    echo "Stopped: $DOMAIN/$LABEL; port $PORT is free"
   fi
-  echo "Stopped: $DOMAIN/$LABEL; port $PORT is free"
 }
 
 wait_for_ready_port() {
@@ -144,8 +144,12 @@ restart_foreground() {
     echo "===== $(date '+%Y-%m-%d %H:%M:%S %Z') restarting $DOMAIN/$LABEL ====="
     stop_foreground
     enforce_exclusivity
-    launchctl bootstrap "$DOMAIN" "$PLIST"
-    launchctl kickstart "$DOMAIN/$LABEL"
+    if job_is_loaded; then
+      launchctl kickstart -k "$DOMAIN/$LABEL"
+    else
+      launchctl bootstrap "$DOMAIN" "$PLIST"
+      launchctl kickstart "$DOMAIN/$LABEL"
+    fi
     wait_for_ready_port
     run_health_check
     echo "===== restart complete: port $PORT is healthy ====="
@@ -153,11 +157,14 @@ restart_foreground() {
 }
 
 detach_restart() {
+  local worker_label command
   require_restart_permission
   verify_prereqs
   mkdir -p "$LOG_DIR"
-  echo "Scheduling HermesGateway.app restart in the background. Log: $RESTART_LOG"
-  nohup /bin/bash -lc "sleep 2; exec '$0' --foreground" >>"$RESTART_LOG" 2>&1 &
+  worker_label="${LABEL}.restart.$(date +%s).$$"
+  printf -v command 'sleep 2; exec %q --foreground' "$0"
+  echo "Scheduling HermesGateway.app restart through launchd. Log: $RESTART_LOG"
+  launchctl submit -l "$worker_label" -- /bin/bash -lc "$command"
 }
 
 assert_update_quiescence() {

@@ -54,7 +54,7 @@ def _environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
         "#!/bin/sh\n"
         f"printf 'launchctl %s\\n' \"$*\" >> '{calls}'\n"
         f"if [ \"$1\" = print ]; then [ -f '{loaded}' ]; exit $?; fi\n"
-        f"if [ \"$1\" = bootout ]; then rm -f '{loaded}'; exit 0; fi\n"
+        f"if [ \"$1\" = bootout ]; then [ -n \"$HERMES_TEST_KEEP_LOADED\" ] || rm -f '{loaded}'; exit 0; fi\n"
         f"if [ \"$1\" = bootstrap ]; then touch '{loaded}'; exit 0; fi\n"
         f"if [ \"$1\" = kickstart ]; then touch '{loaded}'; printf '8822\\n' > '{listener}'; exit 0; fi\n"
         "exit 0\n",
@@ -129,6 +129,38 @@ def test_restart_bootstraps_only_after_port_is_free_and_runs_health(tmp_path: Pa
     health_index = next(i for i, line in enumerate(lines) if line.startswith("health "))
     assert kill_index < bootstrap_index < health_index
     assert any("--check-only --no-state --json" in line for line in lines)
+
+
+def test_restart_kickstarts_loaded_job_after_port_cleanup(tmp_path: Path) -> None:
+    env, calls, _ = _environment(tmp_path)
+    env["HERMES_TEST_KEEP_LOADED"] = "1"
+    (tmp_path / "loaded").write_text("yes\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--foreground"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = calls.read_text(encoding="utf-8").splitlines()
+    assert "launchctl kickstart -k gui/501/nz.diatche.hermes-gateway" in lines
+    assert not any(line.startswith("launchctl bootstrap ") for line in lines)
+
+
+def test_detach_submits_launchd_owned_worker(tmp_path: Path) -> None:
+    result, calls, _ = _run(tmp_path, "--detach")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    submit = next(
+        line for line in calls.read_text(encoding="utf-8").splitlines()
+        if line.startswith("launchctl submit -l ")
+    )
+    assert "nz.diatche.hermes-gateway.restart." in submit
+    assert "-- /bin/bash -lc sleep 2; exec" in submit
 
 
 def test_restart_is_blocked_by_active_maintenance(tmp_path: Path) -> None:
