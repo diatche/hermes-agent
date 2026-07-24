@@ -1499,6 +1499,8 @@ export const zhHant = defineLocale({
     noProject: '無專案',
     projectEmpty: '尚無工作階段',
     noSessions: '尚無工作階段',
+    clearRecents: '清除最近記錄',
+    clearOlderHalf: '清除最近記錄中較舊的一半',
     projects: {
       sectionLabel: '專案',
       newButton: '新增專案',

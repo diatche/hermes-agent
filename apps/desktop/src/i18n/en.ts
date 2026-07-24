@@ -1619,6 +1619,8 @@ export const en: Translations = {
     noProject: 'No project',
     projectEmpty: 'No sessions yet',
     noSessions: 'No sessions yet',
+    clearRecents: 'Clear Recents',
+    clearOlderHalf: 'Clear older half of recents',
     projects: {
       sectionLabel: 'Projects',
       newButton: 'New project',

@@ -1548,6 +1548,8 @@ export const ja = defineLocale({
     noProject: 'プロジェクトなし',
     projectEmpty: 'セッションはまだありません',
     noSessions: 'セッションはまだありません',
+    clearRecents: '最近の履歴をクリア',
+    clearOlderHalf: '最近の履歴の古い半分をクリア',
     projects: {
       sectionLabel: 'プロジェクト',
       newButton: '新規プロジェクト',

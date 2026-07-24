@@ -8,7 +8,7 @@ import { useLocation } from 'react-router-dom'
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
-import { ContextMenu, ContextMenuContent, ContextMenuTrigger } from '@/components/ui/context-menu'
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { KbdGroup } from '@/components/ui/kbd'
 import { SearchField } from '@/components/ui/search-field'
@@ -129,6 +129,7 @@ import {
   StartWorkButton,
   useRepoWorktreeMap
 } from './projects'
+import { olderHalfBy } from './recents'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
@@ -228,7 +229,7 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onLoadMoreProfileSessions?: (profile: string) => Promise<void> | void
   onLoadMoreMessaging?: (platform: string) => Promise<void> | void
   onResumeSession: (sessionId: string) => void
-  onDeleteSession: (sessionId: string) => void
+  onDeleteSession: (sessionId: string) => Promise<void> | void
   onArchiveSession: (sessionId: string) => void
   onBranchSession: (sessionId: string) => void
   onNewSessionInWorkspace: (path: null | string) => void
@@ -951,6 +952,15 @@ export function ChatSidebar({
   // parallel grouped view, not a filter on this one — nothing is hidden here.
   const displayAgentSessions = agentSessions
 
+  const clearRecents = useCallback(
+    async (items: readonly SessionInfo[]) => {
+      for (const session of items) {
+        await onDeleteSession(session.id)
+      }
+    },
+    [onDeleteSession]
+  )
+
   // Pagination is scope-aware. In "All profiles" mode it tracks the global
   // unified set. When scoped to one profile it must compare that profile's own
   // loaded rows against that profile's total — otherwise a huge default profile
@@ -1372,6 +1382,29 @@ export function ChatSidebar({
                       </div>
                     </div>
                   )
+                }
+                headerContextMenu={
+                  !agentsGrouped && !inProject ? (
+                    <div className="flex items-center gap-1">
+                      <ContextMenuItem
+                        className="flex-1"
+                        disabled={displayAgentSessions.length === 0}
+                        onSelect={() => void clearRecents(displayAgentSessions)}
+                        variant="destructive"
+                      >
+                        {s.clearRecents}
+                      </ContextMenuItem>
+                      <ContextMenuItem
+                        aria-label={s.clearOlderHalf}
+                        className="w-8 justify-center px-0"
+                        disabled={displayAgentSessions.length < 2}
+                        onSelect={() => void clearRecents(olderHalfBy(displayAgentSessions, sessionTime))}
+                        title={s.clearOlderHalf}
+                      >
+                        ½
+                      </ContextMenuItem>
+                    </div>
+                  ) : undefined
                 }
                 label={sessionsLabel}
                 labelMeta={

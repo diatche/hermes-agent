@@ -3,6 +3,7 @@ import type * as React from 'react'
 import { useMemo } from 'react'
 
 import { SidebarPanelLabel } from '@/app/shell/sidebar-label'
+import { ContextMenu, ContextMenuContent, ContextMenuTrigger } from '@/components/ui/context-menu'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
 import type { HermesGitWorktree } from '@/global'
@@ -34,6 +35,7 @@ interface SidebarSectionHeaderProps {
   action?: React.ReactNode
   meta?: React.ReactNode
   icon?: React.ReactNode
+  contextMenu?: React.ReactNode
   // When false the section can't be collapsed: the label renders static (no
   // toggle, no caret) and the section is always open. Used for the single-
   // project view, where collapsing one project makes no sense.
@@ -47,6 +49,7 @@ function SidebarSectionHeader({
   action,
   meta,
   icon,
+  contextMenu,
   collapsible = true
 }: SidebarSectionHeaderProps) {
   const labelBody = (
@@ -57,7 +60,7 @@ function SidebarSectionHeader({
     </>
   )
 
-  return (
+  const header = (
     <div className="group/section flex shrink-0 items-center justify-between gap-1 pb-1 pt-1.5">
       {collapsible ? (
         <button
@@ -76,6 +79,15 @@ function SidebarSectionHeader({
       )}
       {action}
     </div>
+  )
+
+  return contextMenu ? (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>{header}</ContextMenuTrigger>
+      <ContextMenuContent>{contextMenu}</ContextMenuContent>
+    </ContextMenu>
+  ) : (
+    header
   )
 }
 
@@ -98,6 +110,7 @@ interface SidebarSessionsSectionProps {
   emptyState: React.ReactNode
   forceEmptyState?: boolean
   headerAction?: React.ReactNode
+  headerContextMenu?: React.ReactNode
   footer?: React.ReactNode
   groups?: SidebarSessionGroup[]
   tree?: SidebarWorkspaceTree[]
@@ -160,6 +173,7 @@ export function SidebarSessionsSection({
   emptyState,
   forceEmptyState = false,
   headerAction,
+  headerContextMenu,
   footer,
   groups,
   projectOverview,
@@ -350,6 +364,7 @@ export function SidebarSessionsSection({
       <SidebarSectionHeader
         action={headerAction}
         collapsible={collapsible}
+        contextMenu={headerContextMenu}
         icon={labelIcon}
         label={label}
         meta={labelMeta}

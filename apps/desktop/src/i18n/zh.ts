@@ -1802,6 +1802,8 @@ export const zh: Translations = {
     noProject: '无项目',
     projectEmpty: '暂无会话',
     noSessions: '暂无会话',
+    clearRecents: '清除最近记录',
+    clearOlderHalf: '清除最近记录中较旧的一半',
     projects: {
       sectionLabel: '项目',
       newButton: '新建项目',

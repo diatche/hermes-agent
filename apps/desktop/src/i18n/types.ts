@@ -1344,6 +1344,8 @@ export interface Translations {
     noProject: string
     projectEmpty: string
     noSessions: string
+    clearRecents: string
+    clearOlderHalf: string
     projects: {
       sectionLabel: string
       newButton: string
