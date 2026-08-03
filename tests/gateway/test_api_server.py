@@ -4047,6 +4047,21 @@ class TestModelRoutesParsing:
         )
         assert adapter._model_routes["a"] == {"model": "m", "provider": "p"}
 
+    def test_route_accepts_bounded_context_and_reasoning_options(self):
+        adapter = _make_routing_adapter({
+            "voice": {
+                "model": "openai/gpt-5.6",
+                "reasoning_effort": "minimal",
+                "skip_context_files": True,
+            }
+        })
+
+        assert adapter._model_routes["voice"] == {
+            "model": "openai/gpt-5.6",
+            "reasoning_effort": "minimal",
+            "skip_context_files": True,
+        }
+
     def test_resolve_route_lookup(self):
         adapter = _make_routing_adapter({"minimax-m2": {"model": "minimax/minimax-m1"}})
         assert adapter._resolve_route("minimax-m2") == {"model": "minimax/minimax-m1"}
@@ -4179,6 +4194,29 @@ class TestModelRoutesAgentCreation:
         assert captured["model"] == "minimax/minimax-m1"
         assert captured["api_key"] == "sk-route"
         assert captured["base_url"] == "https://route.example/v1"
+
+    def test_route_overrides_reasoning_and_project_context(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        adapter = _make_routing_adapter({
+            "voice": {
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "minimal",
+                "skip_context_files": True,
+            }
+        })
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+        adapter._create_agent(session_id="s1", route=adapter._resolve_route("voice"))
+
+        assert captured["reasoning_config"] == {"enabled": True, "effort": "minimal"}
+        assert captured["skip_context_files"] is True
 
     def test_route_provider_resolves_provider_credentials(self, monkeypatch):
         captured = {}

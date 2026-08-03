@@ -1695,7 +1695,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             return {}
 
-        allowed_keys = ("model", "provider", "api_key", "base_url")
+        string_keys = ("model", "provider", "api_key", "base_url", "reasoning_effort")
         routes: Dict[str, Dict[str, Any]] = {}
         for alias, cfg in raw.items():
             alias_str = str(alias).strip()
@@ -1706,9 +1706,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 continue
             route = {
                 key: str(cfg[key]).strip()
-                for key in allowed_keys
+                for key in string_keys
                 if cfg.get(key) is not None and str(cfg[key]).strip()
             }
+            if isinstance(cfg.get("skip_context_files"), bool):
+                route["skip_context_files"] = cfg["skip_context_files"]
             if not route.get("model"):
                 logger.warning(
                     "api_server model_routes: route %r has no 'model'; dropping", alias_str
@@ -1836,6 +1838,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 runtime_kwargs["api_key"] = route["api_key"]
             if route.get("base_url"):
                 runtime_kwargs["base_url"] = route["base_url"]
+            if route.get("reasoning_effort"):
+                from hermes_constants import parse_reasoning_effort
+
+                effort = parse_reasoning_effort(route["reasoning_effort"])
+                if effort is not None:
+                    reasoning_config = effort
             logger.debug(
                 "api_server model route applied: model=%s provider=%s",
                 model,
@@ -1864,6 +1872,7 @@ class APIServerAdapter(BasePlatformAdapter):
             quiet_mode=True,
             verbose_logging=False,
             ephemeral_system_prompt=ephemeral_system_prompt or None,
+            skip_context_files=bool(route and route.get("skip_context_files")),
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
