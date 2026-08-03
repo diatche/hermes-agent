@@ -1223,6 +1223,28 @@ class TestTelegramMenuCommands:
                 f"Command '{name}' is {len(name)} chars (limit {_TG_NAME_LIMIT})"
             )
 
+    def test_includes_dispatchable_quick_commands(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "quick_commands:\n"
+            "  restart_wrapper:\n"
+            "    type: exec\n"
+            "    command: wrapperctl --detach\n"
+            "    description: Restart wrapper\n"
+            "  wrapper-status:\n"
+            "    type: alias\n"
+            "    target: /status\n"
+            "  ignored:\n"
+            "    type: unsupported\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        menu, _hidden = telegram_menu_commands(max_commands=100)
+        entries = dict(menu)
+
+        assert entries["restart_wrapper"] == "Restart wrapper"
+        assert entries["wrapper_status"] == "Run /wrapper_status"
+        assert "ignored" not in entries
+
     def test_operational_builtins_survive_thirty_command_cap(self, tmp_path, monkeypatch):
         (tmp_path / "config.yaml").write_text(
             "display:\n  tool_progress_command: true\n"

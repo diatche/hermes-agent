@@ -541,6 +541,27 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
         tg_name = _sanitize_telegram_name(name)
         if tg_name:
             result.append((tg_name, description))
+    # User quick commands are first-class gateway slash commands too. Include
+    # them in Telegram's BotCommand menu rather than requiring users to know
+    # and type them manually. Only exec/alias entries are dispatchable.
+    try:
+        from hermes_cli.config import read_raw_config
+        quick_commands = (read_raw_config() or {}).get("quick_commands", {})
+    except Exception:
+        quick_commands = {}
+    if isinstance(quick_commands, Mapping):
+        for name, metadata in quick_commands.items():
+            if not isinstance(metadata, Mapping):
+                continue
+            if metadata.get("type") not in {"exec", "alias"}:
+                continue
+            tg_name = _sanitize_telegram_name(str(name))
+            if not tg_name:
+                continue
+            description = str(
+                metadata.get("description") or f"Run /{tg_name}"
+            )
+            result.append((tg_name, description))
     return result
 
 
