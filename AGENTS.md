@@ -221,6 +221,22 @@ source .venv/bin/activate   # or: source venv/bin/activate
 `$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
 main checkout).
 
+## Worktree lifecycle
+
+A linked worktree is temporary task infrastructure, not a completed-work
+artifact. When an agent creates or takes ownership of a worktree, cleanup is
+part of finishing the task:
+
+1. Before the final response, inspect the worktree status and confirm its work
+   is committed, merged or otherwise preserved on a branch/ref.
+2. If the task is complete and the worktree is clean, remove the checkout with
+   `git worktree remove <path>` from the primary repository, then run
+   `git worktree prune`.
+3. Never force-remove a dirty worktree or one containing unmerged work. Preserve
+   it and report the exact path and reason it remains.
+4. Removing a completed worktree does not authorize deleting its branch. Keep
+   branches unless the user explicitly asks for branch cleanup.
+
 ## Project Structure
 
 File counts shift constantly — don't treat the tree below as exhaustive.
