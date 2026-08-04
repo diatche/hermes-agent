@@ -109,7 +109,10 @@ def test_supervisor_waits_for_children_before_exiting_on_sigterm(tmp_path: Path)
             capture_output=True,
             text=True,
         ).stdout
-        assert str(fake_hermes) in commands
+        # macOS may canonicalize /private/var to /var when directly executing
+        # a script from pytest's temporary directory.
+        expected_command_path = str(fake_hermes).replace("/private/var/", "/var/")
+        assert expected_command_path in commands
         assert "import os, sys; os.execve" not in commands
 
         supervisor.send_signal(signal.SIGTERM)

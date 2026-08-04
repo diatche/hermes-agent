@@ -135,9 +135,12 @@ final class Supervisor {
 
     private func launch(_ executable: String, _ arguments: [String], name: String) -> Process {
         let process = Process()
-        let trampoline = "import os, sys; os.execve(sys.argv[1], sys.argv[1:], os.environ)"
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        process.arguments = ["-c", trampoline, executable] + arguments
+        // Launch the managed executable directly. On macOS 26.6, execve-ing it
+        // from a /usr/bin/python3 trampoline can leave the replacement image
+        // permanently stuck in dyld before main(), so neither child becomes
+        // ready even though Foundation still reports the Process as running.
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
         process.currentDirectoryURL = URL(fileURLWithPath: "/Users/diatche/.hermes")
         process.environment = configuredEnvironment()
         process.standardOutput = FileHandle.standardOutput
