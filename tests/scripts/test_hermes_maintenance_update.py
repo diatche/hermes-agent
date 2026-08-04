@@ -283,10 +283,15 @@ def test_post_finishes_prepared_handoff_after_direct_official_update(
     assert state["phase"] == "complete"
 
 
-def test_check_is_read_only_and_never_calls_wrapper(tmp_path: Path) -> None:
-    repo, _ = _make_repo(tmp_path)
+def test_check_fetches_live_upstream_privately_and_never_calls_wrapper(
+    tmp_path: Path,
+) -> None:
+    repo, upstream_sha = _make_repo(tmp_path)
     wrapper, health, calls = _fake_runtime(tmp_path)
-    refs_before = _git(repo, "for-each-ref", "--format=%(refname) %(objectname)")
+    head_before = _git(repo, "rev-parse", "HEAD")
+    branch_before = _git(repo, "branch", "--show-current")
+    main_before = _git(repo, "rev-parse", "refs/heads/main")
+    tracking_before = _git(repo, "rev-parse", "refs/remotes/origin/main")
 
     result = subprocess.run(
         [
@@ -297,14 +302,71 @@ def test_check_is_read_only_and_never_calls_wrapper(tmp_path: Path) -> None:
             "--state-dir", str(tmp_path / "state"),
             "--wrapperctl", str(wrapper),
             "--health-script", str(health),
+            "--json",
         ],
         text=True,
         capture_output=True,
     )
 
     assert result.returncode == 0, result.stderr
-    assert "mergeable" in result.stdout
-    assert _git(repo, "for-each-ref", "--format=%(refname) %(objectname)") == refs_before
+    payload = json.loads(result.stdout)
+    assert payload["mergeable"] is True
+    assert payload["upstream_sha"] == upstream_sha
+    assert _git(repo, "rev-parse", "HEAD") == head_before
+    assert _git(repo, "branch", "--show-current") == branch_before
+    assert _git(repo, "rev-parse", "refs/heads/main") == main_before
+    assert _git(repo, "rev-parse", "refs/remotes/origin/main") == tracking_before
+    private_refs = _git(
+        repo,
+        "for-each-ref",
+        "--format=%(objectname)",
+        "refs/hermes-maintenance/fetches/",
+    ).splitlines()
+    assert private_refs == [upstream_sha]
+    assert not calls.exists()
+
+
+def test_check_fetch_failure_does_not_move_checkout_or_production_refs(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _make_repo(tmp_path)
+    wrapper, health, calls = _fake_runtime(tmp_path)
+    head_before = _git(repo, "rev-parse", "HEAD")
+    branch_before = _git(repo, "branch", "--show-current")
+    main_before = _git(repo, "rev-parse", "refs/heads/main")
+    tracking_before = _git(repo, "rev-parse", "refs/remotes/origin/main")
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", str(tmp_path / "missing-upstream.git")],
+        cwd=repo,
+        check=True,
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--check",
+            "--repo", str(repo),
+            "--state-dir", str(tmp_path / "state"),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert _git(repo, "rev-parse", "HEAD") == head_before
+    assert _git(repo, "branch", "--show-current") == branch_before
+    assert _git(repo, "rev-parse", "refs/heads/main") == main_before
+    assert _git(repo, "rev-parse", "refs/remotes/origin/main") == tracking_before
+    assert _git(
+        repo,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/hermes-maintenance/fetches/",
+    ) == ""
     assert not calls.exists()
 
 
@@ -756,11 +818,22 @@ def test_hindsight_embedding_guard_repairs_only_incompatible_hub(
     assert commands[0][1] == "-c"
     assert commands[1] == (
         str(python), "-m", "pip", "install", "--no-deps",
-        "huggingface-hub>=1.5.0,<2.0",
+        "huggingface-hub==1.24.0",
     )
     assert commands[2] == commands[0]
     assert commands[3][1] == "-c"
     assert commands[3] != commands[0]
+
+
+def test_hindsight_embedding_guard_matches_lazy_dependency_pin() -> None:
+    module = _load_script_module()
+    from tools.lazy_deps import LAZY_DEPS
+
+    hub_requirement = next(
+        spec for spec in LAZY_DEPS["tool.trace_upload"]
+        if spec.startswith("huggingface-hub")
+    )
+    assert module.HINDSIGHT_HUB_REQUIREMENT == hub_requirement
 
 
 def test_hindsight_embedding_guard_is_noop_when_version_and_imports_work(

@@ -62,18 +62,20 @@ success from the required resulting Git state. A nonzero updater exit that still
 produced the complete required state may therefore proceed; a partial or
 unexpected state is rejected.
 
-## Preflight only
+## Live upstream preflight only
 
-To check the current checkout and recorded upstream state without stopping
-Hermes:
+To fetch and check the current live upstream state without stopping Hermes:
 
 ```bash
 python3 scripts/hermes-maintenance-update.py --check
 ```
 
-`--check` does not fetch, write refs or `FETCH_HEAD`, alter the checkout, or
-stop/restart Hermes. Git's `merge-tree --write-tree` may leave harmless
-unreachable temporary objects; normal Git maintenance can reclaim them.
+`--check` fetches `origin/main` into a unique private ref under
+`refs/hermes-maintenance/fetches/`. It does not move branch or remote-tracking
+refs, write `FETCH_HEAD`, alter the checkout, or stop/restart Hermes. Git's
+`merge-tree --write-tree` may leave harmless unreachable temporary objects;
+normal Git maintenance can reclaim them. Private fetch refs are retained as
+an audit trail and may be pruned by maintenance cleanup.
 
 `-h` and `--help` describe the public `--pre`, `--post`, and `--check`
 interface. Path, timeout, and structured-output overrides used by isolated tests
@@ -92,8 +94,9 @@ are intentionally hidden.
 - Official-updater external state is not transactional: dependencies, generated
   assets, bundled skills, config migrations, caches, and backups may remain
   after updater or post failure.
-- The Hindsight `huggingface-hub>=1.5.0,<2.0` repair uses `pip --no-deps` and is
-  intentionally outside the Git rollback boundary.
+- The Hindsight `huggingface-hub==1.24.0` repair uses `pip --no-deps`, matches
+  the shared lazy-dependency/lockfile pin, and is intentionally outside the Git
+  rollback boundary.
 - The stock Hermes gateway service remains disabled; lifecycle control stays
   with the custom HermesGateway wrapper.
 

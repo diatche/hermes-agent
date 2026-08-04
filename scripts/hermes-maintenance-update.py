@@ -7,7 +7,8 @@ official update and ``--post`` commands. The updater then runs directly in the
 operator's terminal. ``--post`` verifies its pinned Git result, publishes
 ``diatche``, restores the checkout, and restarts and health-checks the wrapper.
 Run ``--post`` even if the official update fails so the previous runtime can be
-recovered. ``--check`` is a no-fetch, no-ref/no-checkout merge preflight.
+recovered. ``--check`` fetches live upstream into a private maintenance ref and
+performs a no-checkout merge preflight without moving branch or tracking refs.
 """
 from __future__ import annotations
 
@@ -38,10 +39,11 @@ ZERO_OID = "0" * 40
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 OID_RE = re.compile(r"^[0-9a-f]{40}$")
 TERMINAL_PHASES = {"complete", "recovered"}
-HINDSIGHT_HUB_REQUIREMENT = "huggingface-hub>=1.5.0,<2.0"
+HINDSIGHT_HUB_VERSION = "1.24.0"
+HINDSIGHT_HUB_REQUIREMENT = f"huggingface-hub=={HINDSIGHT_HUB_VERSION}"
 HINDSIGHT_HUB_MISSING = 10
 HINDSIGHT_HUB_INCOMPATIBLE = 11
-HINDSIGHT_HUB_VERSION_PROBE = """\
+HINDSIGHT_HUB_VERSION_PROBE = f"""\
 from importlib.metadata import PackageNotFoundError, version
 from packaging.specifiers import SpecifierSet
 try:
@@ -49,7 +51,7 @@ try:
 except PackageNotFoundError:
     raise SystemExit(10)
 raise SystemExit(
-    0 if SpecifierSet(">=1.5.0,<2.0").contains(installed, prereleases=True) else 11
+    0 if SpecifierSet("=={HINDSIGHT_HUB_VERSION}").contains(installed, prereleases=True) else 11
 )
 """
 HINDSIGHT_IMPORT_PROBE = """\
@@ -252,7 +254,10 @@ def _ensure_hindsight_embeddings(repo: Path, timeout: float) -> None:
             )
         version_verified = _run(version_probe, cwd=repo, timeout=timeout)
         if version_verified.returncode in repairable_version_results:
-            raise RuntimeError("huggingface-hub remains outside >=1.5.0,<2.0")
+            raise RuntimeError(
+                f"huggingface-hub remains outside the required exact version "
+                f"{HINDSIGHT_HUB_VERSION}"
+            )
         if version_verified.returncode:
             detail = version_verified.stderr.strip() or version_verified.stdout.strip()
             raise RuntimeError(
@@ -871,12 +876,12 @@ def _check(args: argparse.Namespace) -> int:
     try:
         _assert_checkout(repo, "diatche")
         integration = _oid(repo, "refs/heads/diatche")
-        upstream = _oid(
-            repo, f"refs/remotes/{args.remote}/{args.upstream_branch}"
+        fetch_ref, upstream = _fetch_private(
+            repo, args.remote, args.upstream_branch, f"check-{uuid.uuid4().hex}"
         )
         _check_merge(repo, integration, upstream)
         payload = {"ok": True, "mergeable": True, "integration_sha": integration,
-                   "upstream_sha": upstream}
+                   "upstream_sha": upstream, "fetch_ref": fetch_ref}
         print(json.dumps(payload, indent=2, sort_keys=True) if args.json else "OK: mergeable")
         return 0
     except Exception as exc:
@@ -905,7 +910,7 @@ def _parser() -> argparse.ArgumentParser:
     phase.add_argument(
         "--check",
         action="store_true",
-        help="check checkout cleanliness and mergeability only",
+        help="fetch live upstream privately and check checkout cleanliness and mergeability",
     )
     parser.add_argument("--repo", type=Path, default=DEFAULT_REPO, help=hidden)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR, help=hidden)

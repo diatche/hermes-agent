@@ -25,7 +25,7 @@ def test_update_parser_accepts_no_gateway_restart() -> None:
 
 
 def test_no_gateway_restart_rejects_windows_before_update_side_effects(monkeypatch) -> None:
-    import hermes_cli.main as main
+    import hermes_cli.update_cmd as update_cmd
 
     side_effect_reached = False
 
@@ -33,11 +33,13 @@ def test_no_gateway_restart_rejects_windows_before_update_side_effects(monkeypat
         nonlocal side_effect_reached
         side_effect_reached = True
 
-    monkeypatch.setattr(main, "_is_windows", lambda: True)
-    monkeypatch.setattr(main, "_run_pre_update_backup", mark_side_effect)
+    monkeypatch.setattr(update_cmd, "_is_windows", lambda: True)
+    monkeypatch.setattr(update_cmd, "_run_pre_update_backup", mark_side_effect)
 
     with pytest.raises(SystemExit) as raised:
-        main._cmd_update_impl(SimpleNamespace(no_gateway_restart=True), gateway_mode=False)
+        update_cmd._cmd_update_impl(
+            SimpleNamespace(no_gateway_restart=True), gateway_mode=False
+        )
 
     assert raised.value.code == 2
     assert side_effect_reached is False
