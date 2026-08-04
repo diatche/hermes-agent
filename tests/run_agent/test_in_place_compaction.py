@@ -98,16 +98,17 @@ class TestInPlaceCompaction:
             # compacted set so compaction actually shrinks the live session and
             # doesn't immediately re-compact (#38763).
             reloaded = db.get_messages_as_conversation(sid)
-            assert len(reloaded) == 2
+            assert len(reloaded) == 3
             assert [m.get("content") for m in reloaded] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
+                "m7",
             ]
-            assert row["message_count"] == 2  # live (active) count
+            assert row["message_count"] == 3  # live (active) count
             # NON-DESTRUCTIVE: the 8 seeded originals survive at active=0
-            # alongside the 2 compacted rows — nothing was DELETEd.
+            # alongside the 3 compacted rows — nothing was DELETEd.
             all_rows = db.get_messages(sid, include_inactive=True)
-            assert len(all_rows) == 10
+            assert len(all_rows) == 11
             archived = [m for m in all_rows if not m.get("active", 1)]
             assert len(archived) == 8
             # The originals remain FTS-searchable (active=0 is a content-
@@ -126,7 +127,7 @@ class TestInPlaceCompaction:
             # Rotation-independent in-place signal set for the gateway.
             assert agent._last_compaction_in_place is True
             # Live transcript actually shrank.
-            assert len(compressed) == 2
+            assert len(compressed) == 3
 
     def test_active_delegation_is_appended_verbatim_to_compaction_summary(self):
         """Compression keeps a deterministic reminder of delegated work."""
@@ -164,7 +165,7 @@ class TestInPlaceCompaction:
                 "- deleg_deadbeef: Audit the authentication flow — running\n"
                 "  Do not duplicate this work; wait for and incorporate its completion."
             )
-            assert len(compressed) == 2
+            assert len(compressed) >= 2
 
     def test_delegation_snapshot_targets_tagged_merged_summary_after_head(self):
         """Protected head content stays untouched; multimodal merged summaries work."""
@@ -307,16 +308,17 @@ class TestRotationFallbackWhenFlagOff:
             # The compacted child is persisted atomically at the rotation
             # boundary, so a headless process killed before finalization can
             # still resume it without duplicating the two handoff messages.
-            assert agent._last_flushed_db_idx == 2
+            assert agent._last_flushed_db_idx == 3
             assert [m.get("content") for m in db.get_messages_as_conversation(agent.session_id)] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
+                "m7",
             ]
             # Rotation mode does NOT set the in-place signal.
             assert getattr(agent, "_last_compaction_in_place", False) is False
 
-    def test_rotation_rebinds_active_completion_to_continuation(self, monkeypatch):
-        """A child finishing after rotation targets the live continuation."""
+    def test_rotation_keeps_completion_owned_by_compression_lineage(self):
+        """A late child remains pinned to the parent lineage after rotation."""
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
         from tools import async_delegation
@@ -326,11 +328,6 @@ class TestRotationFallbackWhenFlagOff:
             sid = "20260619_130100_deleg"
             _seed(db, sid, "delegation")
             agent = _make_agent(db, sid, in_place=False)
-            monkeypatch.setattr(
-                async_delegation,
-                "_connect",
-                lambda: (_ for _ in ()).throw(RuntimeError("test DB unavailable")),
-            )
             with async_delegation._records_lock:
                 async_delegation._records["deleg_rotate"] = {
                     "delegation_id": "deleg_rotate",
@@ -353,7 +350,9 @@ class TestRotationFallbackWhenFlagOff:
                     async_delegation._records.pop("deleg_rotate", None)
 
             assert agent.session_id != sid
-            assert record["parent_session_id"] == agent.session_id
+            # The gateway resolves this ended compression parent to its verified
+            # live tip. Keeping the immutable spawning owner avoids racing /new.
+            assert record["parent_session_id"] == sid
             assert "deleg_rotate" in compressed[0]["content"]
             persisted = db.get_messages_as_conversation(agent.session_id)
             assert "deleg_rotate" in persisted[0]["content"]

@@ -77,6 +77,11 @@ _DEFAULT_MAX_ASYNC_CHILDREN = 3
 _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
+# A pending completion whose delivery keeps failing is retried across claim
+# cycles (and across restarts via restore_undelivered_completions). Cap the
+# attempts so an unroutable row converges to a terminal 'dropped' state
+# instead of replaying on every restart forever.
+_MAX_DELIVERY_ATTEMPTS = 8
 _DB_LOCK = threading.Lock()
 _MAX_COMPRESSION_DELEGATIONS = 8
 _MAX_COMPRESSION_GOALS_PER_BATCH = 8
@@ -88,10 +93,12 @@ def _db_path():
 
 
 def _connect() -> sqlite3.Connection:
+    from hermes_state import apply_wal_with_fallback
+
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")
+    apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS async_delegations (
             delegation_id TEXT PRIMARY KEY,
@@ -111,7 +118,8 @@ def _connect() -> sqlite3.Connection:
             owner_started_at INTEGER,
             task_json TEXT,
             delivery_claim TEXT,
-            delivery_claimed_at REAL
+            delivery_claimed_at REAL,
+            origin_session_id TEXT NOT NULL DEFAULT ''
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -121,6 +129,11 @@ def _connect() -> sqlite3.Connection:
         ("task_json", "TEXT"),
         ("delivery_claim", "TEXT"),
         ("delivery_claimed_at", "REAL"),
+        # Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
+        # request — the wake self-post target. Without persisting it,
+        # completions recovered after a process restart are unroutable on
+        # api_server (the in-memory record that carried it is gone).
+        ("origin_session_id", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -145,12 +158,13 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?)""",
+                owner_started_at, task_json, origin_session_id)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
              record["dispatched_at"], now, __import__("os").getpid(),
-             owner_started_at, json.dumps(task_payload)),
+             owner_started_at, json.dumps(task_payload),
+             record.get("origin_session_id", "")),
         )
     _prune_durable_records()
 
@@ -231,11 +245,12 @@ def recover_abandoned_delegations() -> int:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
-                      owner_started_at, task_json
+                      owner_started_at, task_json, origin_session_id
                FROM async_delegations WHERE state IN ('running','finalizing')"""
         ).fetchall()
         for row in rows:
-            delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json = row
+            (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
+             pid, started, task_json, origin_session_id) = row
             live = False
             if pid:
                 live = _pid_exists(int(pid))
@@ -247,6 +262,9 @@ def recover_abandoned_delegations() -> int:
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
+                # Restore the durable wake target so completions recovered
+                # after a restart remain routable to api_server sessions.
+                "origin_session_id": origin_session_id or "",
                 "parent_session_id": parent_id, "goal": task.get("goal", ""),
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
@@ -337,14 +355,59 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Release a failed delivery claim so another consumer may retry."""
+    """Release a failed delivery claim so another consumer may retry.
+
+    Attempts are counted at claim time, so a row that keeps being claimed and
+    released has burned real delivery attempts. Once the budget is exhausted
+    the row converges to a terminal ``dropped`` state instead of returning to
+    ``pending`` — otherwise an undeliverable completion replays on every
+    gateway restart forever (restore_undelivered_completions only restores
+    pending rows).
+    """
+    now = time.time()
     with _DB_LOCK, _connect() as conn:
+        capped = conn.execute(
+            """UPDATE async_delegations SET delivery_state='dropped',
+                      delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=? AND delivery_attempts>=?""",
+            (now, delegation_id, claim_id, _MAX_DELIVERY_ATTEMPTS),
+        )
+        if capped.rowcount == 1:
+            logger.warning(
+                "Async delegation %s exhausted its %d delivery attempts; "
+                "marking terminally dropped (result remains queryable).",
+                delegation_id, _MAX_DELIVERY_ATTEMPTS,
+            )
+            return True
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=NULL,
                       delivery_claimed_at=NULL, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND delivery_claim=?""",
-            (time.time(), delegation_id, claim_id),
+            (now, delegation_id, claim_id),
+        )
+        return cur.rowcount == 1
+
+
+def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Terminally drop a claimed completion that can never be delivered.
+
+    Used when the delivery target is permanently gone — the spawning session
+    ended at an explicit user boundary (/new, reset) rather than a compression
+    rotation. Marking the row ``dropped`` (not ``delivered``) keeps the ack
+    honest, and (not ``pending``) keeps restart recovery from replaying a
+    completion that will be fail-closed dropped again every time.
+    """
+    now = time.time()
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET delivery_state='dropped',
+                      updated_at=?, delivery_claim=NULL,
+                      delivery_claimed_at=NULL
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""",
+            (now, delegation_id, claim_id),
         )
         return cur.rowcount == 1
 
@@ -378,7 +441,8 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
     with _DB_LOCK, _connect() as conn:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
-                      result_json, delivery_state, delivery_attempts
+                      result_json, delivery_state, delivery_attempts,
+                      origin_session_id
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
@@ -388,6 +452,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "dispatched_at": row[2], "completed_at": row[3],
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
+        "origin_session_id": row[7] or "",
     }
 
 
@@ -438,6 +503,34 @@ def _prune_completed_locked() -> None:
         _records.pop(rid, None)
 
 
+def _current_origin_session_id() -> str:
+    """Raw session id of the ORIGINATING api_server request, or ``""``.
+
+    The obvious source — ``HERMES_SESSION_ID`` via ``get_session_env`` — is
+    NOT safe to read at dispatch time: constructing a child agent
+    (``agent/agent_init.py``) calls ``set_current_session_id(child.session_id)``,
+    clobbering that ContextVar *and* ``os.environ`` with the subagent's
+    internal ``{timestamp}_{uuid}`` id moments before the dispatch code reads
+    it, so the completion wake would self-post into the subagent's own
+    (unread) session instead of the spawner's.
+
+    The request-scoped ``HERMES_SESSION_CHAT_ID`` binding survives child
+    construction: ``_bind_api_server_session`` binds ``chat_id`` to the raw
+    ``X-Hermes-Session-Id``, and its only writer is ``set_session_vars`` —
+    ``set_current_session_id`` never touches it. Gate on the platform: on
+    push platforms ``chat_id`` is a chat, not a session, so yield ``""``
+    there.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "api_server":
+            return ""
+        return get_session_env("HERMES_SESSION_CHAT_ID", "") or ""
+    except Exception:
+        return ""
+
+
 def dispatch_async_delegation(
     *,
     goal: str,
@@ -449,6 +542,7 @@ def dispatch_async_delegation(
     parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
+    origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
 ) -> Dict[str, Any]:
@@ -497,6 +591,7 @@ def dispatch_async_delegation(
         "model": model,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
+        "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -617,6 +712,7 @@ def _push_completion_event(
         # session; empty string => CLI (single-session) path.
         "session_key": record.get("session_key", ""),
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
+        "origin_session_id": record.get("origin_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
@@ -656,6 +752,7 @@ def dispatch_async_delegation_batch(
     parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
+    origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
@@ -697,6 +794,7 @@ def dispatch_async_delegation_batch(
         "model": model,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
+        "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -797,6 +895,7 @@ def _finalize_batch(
         "delegation_id": delegation_id,
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
+        "origin_session_id": event_record.get("origin_session_id", ""),
         "parent_session_id": event_record.get("parent_session_id"),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
@@ -845,47 +944,6 @@ def list_async_delegations() -> List[Dict[str, Any]]:
             {k: v for k, v in r.items() if k != "interrupt_fn"}
             for r in _records.values()
         ]
-
-
-def rebind_active_delegations_parent(
-    old_parent_session_id: str,
-    new_parent_session_id: str,
-) -> int:
-    """Move live completion ownership to a compression continuation session."""
-    if not old_parent_session_id or not new_parent_session_id:
-        return 0
-    with _records_lock:
-        rebound_ids = [
-            delegation_id
-            for delegation_id, record in _records.items()
-            if record.get("status") in {"running", "finalizing"}
-            and str(record.get("parent_session_id") or "") == old_parent_session_id
-        ]
-        for delegation_id in rebound_ids:
-            _records[delegation_id]["parent_session_id"] = new_parent_session_id
-    if rebound_ids:
-        try:
-            with _DB_LOCK, _connect() as conn:
-                conn.executemany(
-                    """UPDATE async_delegations
-                       SET parent_session_id=?, updated_at=?
-                       WHERE delegation_id=? AND state IN ('running','finalizing')""",
-                    [
-                        (new_parent_session_id, time.time(), delegation_id)
-                        for delegation_id in rebound_ids
-                    ],
-                )
-        except Exception:
-            # The live registry drives completion routing. Keep compression and
-            # in-process delivery working even if the durable audit update is
-            # temporarily unavailable.
-            logger.warning(
-                "Could not persist delegation parent rebind %s -> %s",
-                old_parent_session_id,
-                new_parent_session_id,
-                exc_info=True,
-            )
-    return len(rebound_ids)
 
 
 def format_active_delegations_for_compression(
