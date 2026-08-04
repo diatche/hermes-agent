@@ -23,11 +23,13 @@ The pre step:
 
 1. validates the clean `diatche` checkout and custom gateway wrapper;
 2. fetches and pins `origin/main`;
-3. checks mergeability and validates an isolated candidate;
-4. rechecks checkout/ref invariants;
-5. stops the custom gateway wrapper;
-6. records an `awaiting-official-update` journal;
-7. prints the exact update and post commands.
+3. refuses normal maintenance if local `main` already equals the pinned upstream
+   commit, because the updater must retain ownership of that forward transition;
+4. checks mergeability and validates an isolated candidate;
+5. rechecks checkout/ref invariants;
+6. stops the custom gateway wrapper;
+7. records an `awaiting-official-update` journal;
+8. prints the exact update and post commands.
 
 ### 2. Run the printed official update command
 
@@ -58,9 +60,10 @@ checks. If the updater left partial or invalid Git state, post attempts the
 bounded owned-state recovery and restarts the previous runtime when safe.
 
 The post step cannot observe the separate updater process's exit code. It judges
-success from the required resulting Git state. A nonzero updater exit that still
-produced the complete required state may therefore proceed; a partial or
-unexpected state is rejected.
+success from the required resulting Git state. Installation synchronization is
+owned by and trusted to the official updater; this wrapper does not inspect or
+repeat its dependency, build, migration, profile, cache, or managed-component
+phases. A partial or unexpected Git state is rejected.
 
 ## Live upstream preflight only
 
@@ -88,6 +91,8 @@ are intentionally hidden.
   `runs/*.json` files remain records and are not replayed.
 - Publication uses compare-and-swap checks for `main`, `origin/main`, the pinned
   private fetch ref, and the old `diatche` ref.
+- The custom wrapper owns only local integration and lifecycle policy. The
+  official updater owns and is trusted for installation synchronization.
 - Recovery changes only Git refs/checkout state proven to be owned by the
   transaction. Concurrent ref, index, worktree, or untracked changes fail closed
   and are preserved.

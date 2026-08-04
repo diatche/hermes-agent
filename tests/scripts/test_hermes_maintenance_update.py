@@ -554,6 +554,45 @@ def test_conflict_fails_before_forced_stop(tmp_path: Path) -> None:
     assert calls.read_text(encoding="utf-8").splitlines() == ["--status"]
 
 
+def test_prematurely_advanced_main_fails_before_candidate_or_stop(
+    tmp_path: Path,
+) -> None:
+    repo, upstream_sha = _make_repo(tmp_path)
+    wrapper, health, calls = _fake_runtime(tmp_path)
+    state_dir = tmp_path / "state"
+    old_diatche = _git(repo, "rev-parse", "diatche")
+    _git(repo, "fetch", "origin", "main")
+    _git(repo, "update-ref", "refs/heads/main", upstream_sha)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--pre",
+            "--repo", str(repo),
+            "--state-dir", str(state_dir),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert "local main already equals the pinned upstream commit" in result.stderr
+    assert "controlled recovery is required" in result.stderr
+    assert _git(repo, "rev-parse", "main") == upstream_sha
+    assert _git(repo, "rev-parse", "diatche") == old_diatche
+    assert _git(repo, "branch", "--show-current") == "diatche"
+    assert calls.read_text(encoding="utf-8").splitlines() == ["--status"]
+    assert _git(
+        repo,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/hermes-maintenance/candidates/",
+    ) == ""
+
+
 def test_missing_updater_fails_before_forced_stop(tmp_path: Path) -> None:
     repo, _ = _make_repo(tmp_path)
     wrapper, health, calls = _fake_runtime(tmp_path)

@@ -299,6 +299,16 @@ def _check_merge(repo: Path, integration_oid: str, upstream_oid: str) -> None:
         raise RuntimeError("upstream conflicts with diatche; refs and checkout were not changed")
 
 
+def _assert_updater_has_forward_transition(main_oid: str, upstream_oid: str) -> None:
+    """Require the official updater to retain ownership of advancing main."""
+    if main_oid == upstream_oid:
+        raise RuntimeError(
+            "local main already equals the pinned upstream commit; the official "
+            "updater's full synchronization path cannot be assumed. Refusing "
+            "normal maintenance; controlled recovery is required"
+        )
+
+
 def _build_candidate(
     repo: Path, state_dir: Path, run_id: str, integration_oid: str, upstream_oid: str
 ) -> tuple[str, str]:
@@ -624,6 +634,7 @@ def _run_pre_locked(
         fetch_ref, upstream_oid = _fetch_private(
             repo, args.remote, args.upstream_branch, run_id
         )
+        _assert_updater_has_forward_transition(main_old, upstream_oid)
         _progress("Checking mergeability without changing refs or checkout")
         _check_merge(repo, integration_old, upstream_oid)
         _progress("Building and validating the isolated merge candidate")
