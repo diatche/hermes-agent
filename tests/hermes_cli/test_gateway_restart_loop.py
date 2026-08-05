@@ -310,6 +310,110 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
 
+    def test_binary_reference_does_not_reenter_scanner_through_env_reader(
+        self, monkeypatch, tmp_path
+    ):
+        """A local binary leaf must not be decoded by the remote-read fallback.
+
+        The core scanner classifies NUL-containing files as binary leaves, but
+        terminal_tool's backend reader used to decode the same file as text and
+        feed it back into recursive path scanning, where an embedded NUL raised
+        ValueError before the command could execute.
+        """
+        import tools.approval as approval
+        import tools.terminal_tool as tt
+
+        monkeypatch.setattr(approval, "get_current_session_key", lambda default="": "test")
+
+        binary = tmp_path / "binary-tool"
+        binary_bytes = b"\x7fELF\x00/not-a-script"
+        binary.write_bytes(binary_bytes)
+        binary.chmod(0o755)
+
+        class _ExecutingEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                if command.startswith(("cat ", "base64 < ")):
+                    raise AssertionError("local binary must not use the remote reader")
+                return {"returncode": 0, "output": "binary ran", "cwd": str(tmp_path)}
+
+        self._patch_env(monkeypatch, _ExecutingEnv(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=str(binary), force=True))
+
+        assert result["exit_code"] == 0
+        assert result["output"] == "binary ran"
+
+    def test_remote_binary_reference_does_not_reenter_scanner(
+        self, monkeypatch, tmp_path
+    ):
+        """Remote binary bytes must survive transport for reliable classification."""
+        import tools.approval as approval
+        import tools.terminal_tool as tt
+
+        monkeypatch.setattr(approval, "get_current_session_key", lambda default="": "test")
+        binary_bytes = b"\x7fELF\x00/not-a-script"
+
+        class _ExecutingEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                if command.startswith("cat ") and "/remote/binary-tool" in command:
+                    return {
+                        "returncode": 0,
+                        "output": binary_bytes.decode("utf-8", errors="replace"),
+                    }
+                if command.startswith("cat "):
+                    return {"returncode": 1, "output": ""}
+                return {"returncode": 0, "output": "binary ran", "cwd": str(tmp_path)}
+
+        self._patch_env(monkeypatch, _ExecutingEnv(), inside_gateway=True)
+
+        result = json.loads(
+            tt.terminal_tool(command="/remote/binary-tool", force=True)
+        )
+
+        assert result["exit_code"] == 0
+        assert result["output"] == "binary ran"
+
+    def test_nul_containing_shell_script_remains_blocked(
+        self, monkeypatch, tmp_path
+    ):
+        """NUL bytes alone do not prove a file is a non-executable binary."""
+        import tools.approval as approval
+        import tools.terminal_tool as tt
+
+        monkeypatch.setattr(approval, "get_current_session_key", lambda default="": "test")
+
+        script = tmp_path / "unsafe.sh"
+        script_bytes = b"\x7fELF\n\x00hermes gateway restart\n"
+        script.write_bytes(script_bytes)
+        script.chmod(0o755)
+
+        class _ExecutingEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                if command.startswith("cat "):
+                    return {
+                        "returncode": 0,
+                        "output": script_bytes.decode("utf-8", errors="replace"),
+                    }
+                return {"returncode": 0, "output": "script ran", "cwd": str(tmp_path)}
+
+        self._patch_env(monkeypatch, _ExecutingEnv(), inside_gateway=True)
+
+        result = json.loads(
+            tt.terminal_tool(command=f"/bin/bash {script}", force=True)
+        )
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
     def test_blocks_launchctl_submit_inside_gateway(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
 
@@ -800,7 +904,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         import tools.terminal_tool as tt
 
         # Path only exists on the remote backend; locally it is absent, so the
-        # guard must fall back to env.execute('cat ...') to scan it.
+        # guard must read it through the remote environment to scan it.
         script = "/remote/workspace/remote.sh"
         calls = []
 
@@ -809,8 +913,11 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
             cwd = str(tmp_path)
             def execute(self, command, **kwargs):
                 calls.append(command)
-                if "cat" in command and "/remote/workspace/remote.sh" in command:
-                    return {"output": "#!/bin/bash\\nhermes gateway restart\\n", "returncode": 0}
+                if command.startswith("cat ") and "/remote/workspace/remote.sh" in command:
+                    return {
+                        "output": "shell banner\n#!/bin/bash\nhermes gateway restart\n",
+                        "returncode": 0,
+                    }
                 return {"output": "", "returncode": 0}
 
         fake_env = _RemoteEnv()
@@ -821,7 +928,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
 
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
-        assert any("cat" in c for c in calls)
+        assert any(c.startswith("cat ") for c in calls)
 
 
 class TestCronCreateLifecycleBlockExtra:

@@ -2536,6 +2536,7 @@ def terminal_tool(
                 """
                 if env is None:
                     return None
+
                 try:
                     local_path = Path(script_path).expanduser()
                     if not local_path.is_absolute():
@@ -2545,14 +2546,18 @@ def terminal_tool(
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
                             if len(data) <= 1024 * 1024:
-                                return data.decode("utf-8", errors="replace")
+                                return data.replace(b"\x00", b"").decode(
+                                    "utf-8", errors="replace"
+                                )
                 except Exception:
                     pass
                 # Remote / sandboxed backend: read via the environment's shell.
                 try:
                     result = env.execute(f"cat {shlex.quote(script_path)}")
                     if result.get("returncode", -1) == 0:
-                        return result.get("output", "")
+                        output = result.get("output", "")
+                        if len(output.encode("utf-8")) <= 1024 * 1024:
+                            return output.replace("\x00", "")
                 except Exception:
                     pass
                 return None
