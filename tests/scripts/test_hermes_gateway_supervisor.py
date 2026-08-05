@@ -113,6 +113,7 @@ def test_supervisor_waits_for_children_before_exiting_on_sigterm(tmp_path: Path)
         # a script from pytest's temporary directory.
         expected_command_path = str(fake_hermes).replace("/private/var/", "/var/")
         assert expected_command_path in commands
+        assert "gateway run --replace --external-supervisor" in commands
         assert "import os, sys; os.execve" not in commands
 
         supervisor.send_signal(signal.SIGTERM)

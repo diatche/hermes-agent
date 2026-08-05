@@ -213,7 +213,14 @@ final class Supervisor {
             log("refusing to launch children: \(error.localizedDescription)")
             exit(78)
         }
-        _ = launch(hermes, ["gateway", "run", "--replace"], name: "gateway")
+        // Declare that this gateway is owned by the signed app/launchd wrapper.
+        // In-band /restart and post-update restart handoff then exit back to this
+        // supervisor instead of trying to manage Hermes's stock LaunchAgent.
+        _ = launch(
+            hermes,
+            ["gateway", "run", "--replace", "--external-supervisor"],
+            name: "gateway"
+        )
         _ = launch(hermes, ["dashboard", "--host", "0.0.0.0", "--port", "9119", "--no-open", "--skip-build"], name: "dashboard")
     }
 
