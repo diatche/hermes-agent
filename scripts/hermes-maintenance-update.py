@@ -292,11 +292,25 @@ def _check_merge(repo: Path, integration_oid: str, upstream_oid: str) -> None:
     # not move refs or alter the checkout. Avoid a second disposable repository
     # merely to isolate garbage that normal Git maintenance can reclaim.
     result = _git(
-        repo, "merge-tree", "--write-tree", integration_oid, upstream_oid,
+        repo, "merge-tree", "--write-tree", "--name-only",
+        integration_oid, upstream_oid,
         check=False,
     )
     if result.returncode:
-        raise RuntimeError("upstream conflicts with diatche; refs and checkout were not changed")
+        first_block = result.stdout.split("\n\n", 1)[0].splitlines()
+        conflicting_files = first_block[1:] if len(first_block) > 1 else []
+        files = "\n".join(f"  - {path}" for path in conflicting_files)
+        if not files:
+            files = "  - Git did not report the conflicting paths"
+        raise RuntimeError(
+            f"upstream commit {upstream_oid} does not merge cleanly into "
+            f"diatche commit {integration_oid}.\n"
+            f"Conflicting files:\n{files}\n"
+            "Next: resolve these conflicts in an isolated integration "
+            "branch/worktree, validate the result, then rerun "
+            "hermes-maintenance-update --check.\n"
+            "No refs or checkout files were changed."
+        )
 
 
 def _assert_updater_has_forward_transition(main_oid: str, upstream_oid: str) -> None:
@@ -893,7 +907,15 @@ def _check(args: argparse.Namespace) -> int:
         _check_merge(repo, integration, upstream)
         payload = {"ok": True, "mergeable": True, "integration_sha": integration,
                    "upstream_sha": upstream, "fetch_ref": fetch_ref}
-        print(json.dumps(payload, indent=2, sort_keys=True) if args.json else "OK: mergeable")
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(
+                "OK: upstream merges cleanly into diatche.\n"
+                f"Checked upstream: {args.remote}/{args.upstream_branch} @ {upstream}\n"
+                f"Against diatche: {integration}\n"
+                "Next: run hermes-maintenance-update when ready."
+            )
         return 0
     except Exception as exc:
         payload = {"ok": False, "mergeable": False, "error": str(exc)}

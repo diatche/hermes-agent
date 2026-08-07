@@ -326,6 +326,64 @@ def test_check_fetches_live_upstream_privately_and_never_calls_wrapper(
     assert not calls.exists()
 
 
+def test_check_success_reports_pinned_commits_and_next_step(tmp_path: Path) -> None:
+    repo, upstream_sha = _make_repo(tmp_path)
+    integration_sha = _git(repo, "rev-parse", "diatche")
+    wrapper, health, calls = _fake_runtime(tmp_path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--check",
+            "--repo", str(repo),
+            "--state-dir", str(tmp_path / "state"),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "OK: upstream merges cleanly into diatche." in result.stdout
+    assert f"Checked upstream: origin/main @ {upstream_sha}" in result.stdout
+    assert f"Against diatche: {integration_sha}" in result.stdout
+    assert "Next: run hermes-maintenance-update when ready." in result.stdout
+    assert not calls.exists()
+
+
+def test_check_conflict_reports_pinned_commits_files_and_next_step(
+    tmp_path: Path,
+) -> None:
+    repo, upstream_sha = _make_repo(tmp_path, conflict=True)
+    integration_sha = _git(repo, "rev-parse", "diatche")
+    wrapper, health, calls = _fake_runtime(tmp_path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--check",
+            "--repo", str(repo),
+            "--state-dir", str(tmp_path / "state"),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert f"upstream commit {upstream_sha}" in result.stderr
+    assert f"diatche commit {integration_sha}" in result.stderr
+    assert "Conflicting files:\n  - base.txt" in result.stderr
+    assert "resolve these conflicts in an isolated integration branch/worktree" in result.stderr
+    assert "rerun hermes-maintenance-update --check" in result.stderr
+    assert "No refs or checkout files were changed." in result.stderr
+    assert not calls.exists()
+
+
 def test_check_fetch_failure_does_not_move_checkout_or_production_refs(
     tmp_path: Path,
 ) -> None:
