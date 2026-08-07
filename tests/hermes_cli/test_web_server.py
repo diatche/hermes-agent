@@ -398,7 +398,9 @@ class TestWebServerEndpoints:
         assert response.json()["sessions"] == []
         assert response.json()["total"] == 0
 
-    @pytest.mark.parametrize("missing_column", ["archived", "pinned"])
+    @pytest.mark.parametrize(
+        "missing_column", ["archived", "pinned", "last_activity_at"]
+    )
     def test_get_sessions_heals_stale_schema_store(self, missing_column):
         import sqlite3
 
@@ -433,6 +435,109 @@ class TestWebServerEndpoints:
         finally:
             healed.close()
         assert missing_column in columns
+
+    def test_profiles_sidebar_heals_stale_schema_store(self):
+        """The desktop's batched sidebar route must heal a stale store too.
+
+        The shipped regression (#72424 aftermath): a store predating
+        ``sessions.last_activity_at`` made every per-profile read raise
+        "no such column", which this endpoint swallowed into its ``errors``
+        array — the desktop rendered "No sessions yet" after `hermes update`
+        until the user's first message forced a writable open elsewhere.
+        """
+        import sqlite3
+
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db_path = get_hermes_home() / "state.db"
+        seed = SessionDB(db_path=db_path)
+        try:
+            seed.create_session("sidebar-stale", source="cli")
+            seed.append_message(
+                session_id="sidebar-stale", role="user", content="hi"
+            )
+        finally:
+            seed.close()
+
+        legacy = sqlite3.connect(str(db_path))
+        try:
+            legacy.execute("ALTER TABLE sessions DROP COLUMN last_activity_at")
+            legacy.commit()
+        finally:
+            legacy.close()
+
+        response = self.client.get("/api/profiles/sessions/sidebar")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["errors"] == []
+        assert [row["id"] for row in payload["recents"]["sessions"]] == [
+            "sidebar-stale"
+        ]
+
+    def test_heal_gives_up_when_reconcile_cannot_fix_the_store(self, monkeypatch):
+        """A probe failure reconciliation can't cure must not retry forever.
+
+        The writable heal is a full SessionDB init against a possibly-live
+        DB. If the store is STILL behind the probe afterwards (schema problem
+        ADD COLUMN can't express), retrying that init on every sidebar poll
+        would hammer the DB for nothing: serve reads probe-less instead, warn
+        once, and never pay the writable open for that store again.
+        """
+        from hermes_cli import web_server
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db_path = get_hermes_home() / "state.db"
+        seed = SessionDB(db_path=db_path)
+        try:
+            seed.create_session("unfixable", source="cli")
+        finally:
+            seed.close()
+
+        # A column no SCHEMA_SQL declares: the heal's writable reconcile
+        # cannot add it, so the re-probe keeps failing.
+        monkeypatch.setattr(
+            web_server,
+            "_session_db_read_probe_statements",
+            lambda: ('SELECT "sessions"."not_a_real_column" FROM "sessions" LIMIT 0',),
+        )
+        monkeypatch.setattr(web_server, "_session_db_heal_exhausted", set())
+        monkeypatch.setattr(web_server, "_session_db_heal_warned", set())
+
+        writable_opens = []
+
+        import hermes_state
+
+        original_init = hermes_state.SessionDB.__init__
+
+        def counting_init(self, *args, **kwargs):
+            if not kwargs.get("read_only", False):
+                writable_opens.append(1)
+            return original_init(self, *args, **kwargs)
+
+        # web_server imports SessionDB inside the function body, so patching
+        # the class on hermes_state covers every open the helper makes.
+        monkeypatch.setattr(hermes_state.SessionDB, "__init__", counting_init)
+
+        # First open: probe fails -> one writable heal -> re-probe fails ->
+        # exhausted. Still returns a usable read-only handle.
+        db = web_server._open_session_db_for_profile(None, read_only=True)
+        try:
+            assert db.list_sessions_rich(limit=10, compact_rows=True)
+        finally:
+            db.close()
+        assert len(writable_opens) == 1
+        assert str(db_path) in web_server._session_db_heal_exhausted
+
+        # Second open: probe skipped, NO further writable opens.
+        db = web_server._open_session_db_for_profile(None, read_only=True)
+        try:
+            assert db.list_sessions_rich(limit=10, compact_rows=True)
+        finally:
+            db.close()
+        assert len(writable_opens) == 1
 
     def test_get_sessions_zero_byte_store_returns_empty_list(self):
         from hermes_constants import get_hermes_home
@@ -1002,6 +1107,72 @@ class TestWebServerEndpoints:
         assert status_data["exit_code"] == 1
         assert status_data["pid"] is None
         assert any("docker pull nousresearch/hermes-agent:latest" in line for line in status_data["lines"])
+
+    def test_update_hermes_spawns_with_action_id(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        class Proc:
+            pid = 12345
+
+        calls = []
+
+        def fake_spawn(subcommand, name, *, env_overrides=None):
+            calls.append((subcommand, name, env_overrides))
+            return Proc()
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(web_server.secrets, "token_hex", lambda _size: "a" * 32)
+        monkeypatch.setattr(web_server, "_spawn_hermes_action", fake_spawn)
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        web_server._ACTION_RESULTS.pop("hermes-update", None)
+
+        resp = self.client.post("/api/hermes/update")
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "ok": True,
+            "pid": 12345,
+            "name": "hermes-update",
+            "action_id": "a" * 32,
+        }
+        assert calls == [
+            (["update"], "hermes-update", {"HERMES_ACTION_ID": "a" * 32})
+        ]
+
+    def test_update_hermes_reuses_running_action(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        class Proc:
+            pid = 24680
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(
+            web_server,
+            "_spawn_hermes_action",
+            lambda *_args, **_kwargs: pytest.fail("must not spawn a duplicate update"),
+        )
+        web_server._ACTION_PROCS["hermes-update"] = Proc()
+        web_server._ACTION_IDS["hermes-update"] = "b" * 32
+
+        try:
+            resp = self.client.post("/api/hermes/update")
+        finally:
+            web_server._ACTION_PROCS.pop("hermes-update", None)
+            web_server._ACTION_IDS.pop("hermes-update", None)
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "ok": True,
+            "pid": 24680,
+            "name": "hermes-update",
+            "already_running": True,
+            "action_id": "b" * 32,
+        }
 
 
 
