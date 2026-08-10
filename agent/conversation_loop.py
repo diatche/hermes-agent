@@ -1907,8 +1907,8 @@ def run_conversation(
             # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
             if "finish_reason" in api_msg:
                 api_msg.pop("finish_reason")
-            # Strip internal thinking-prefill marker
-            api_msg.pop("_thinking_prefill", None)
+            # _thinking_prefill survives here intentionally: the drop pass below
+            # needs it. The transport strips all underscore keys before the wire.
             # Strip length-continuation marks; not every transport drops underscore keys.
             api_msg.pop("_length_continuation_fragment", None)
             api_msg.pop("_length_continuation_nudge", None)
