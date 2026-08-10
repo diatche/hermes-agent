@@ -61,6 +61,7 @@ export type GatewayEventPayload = {
   running?: boolean
   cwd?: string
   branch?: string
+  terminal_backend?: string
   credential_warning?: string
   install_warning?: string
   personality?: string
@@ -860,7 +861,12 @@ function applyStoredToolResultToParts(parts: ChatMessagePart[], toolMessage: Ses
 function storedToolMessagePart(toolMessage: SessionMessage, fallbackIndex: number): ChatMessagePart {
   const name = toolMessage.tool_name || toolMessage.name || 'tool'
   const context = textFromUnknown(toolMessage.context || toolMessage.text || toolMessage.content || '')
-  const args = context ? { context } : {}
+  // Prefer the full arguments when the gateway projection carries them:
+  // `context` is an 80-char display preview, and the expanded tool row
+  // rebuilds the real command from args. Keep `context` alongside as the
+  // title-side placeholder.
+  const storedArgs = parseMaybeJsonObject(toolMessage.args)
+  const args = { ...storedArgs, ...(context ? { context } : {}) }
 
   return {
     type: 'tool-call',
