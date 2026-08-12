@@ -1281,7 +1281,11 @@ def execute_code(
         )
 
     if not code or not code.strip():
-        return tool_error("No code provided.")
+        return tool_error(
+            "No code provided. execute_code requires a non-empty 'code' "
+            "parameter containing Python source. To run shell commands, use "
+            "terminal(command=...) instead."
+        )
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
@@ -2063,14 +2067,47 @@ EXECUTE_CODE_SCHEMA = build_execute_code_schema()
 # --- Registry ---
 from tools.registry import registry, tool_error
 
+
+def _execute_code_handler(args: dict, **kwargs) -> str:
+    """Recover misdirected calls before dispatching to ``execute_code``.
+
+    Models sometimes reuse terminal's ``command`` argument or send a
+    non-string ``code`` payload; both get an actionable redirect instead
+    of a generic failure.
+    """
+    # Help models recover when they reuse terminal's ``command`` argument.
+    if "code" not in args and "command" in args:
+        logger.warning(
+            "execute_code received 'command' instead of the required 'code' argument"
+        )
+        return tool_error(
+            "execute_code received a 'command' parameter, but it requires "
+            "Python source in 'code'. Use terminal(command=...) for shell "
+            "commands; for Python, retry as execute_code(code=...)."
+        )
+
+    code = args.get("code", "")
+    if code is not None and not isinstance(code, str):
+        # A non-string payload (int, dict, list) would otherwise surface as
+        # a generic AttributeError from code.strip() — redirect instead.
+        return tool_error(
+            f"execute_code received a {type(code).__name__} in 'code', but it "
+            "requires Python source as a string. Retry as "
+            "execute_code(code=\"...\")."
+        )
+
+    return execute_code(
+        code=code or "",
+        task_id=kwargs.get("task_id"),
+        enabled_tools=kwargs.get("enabled_tools"),
+    )
+
+
 registry.register(
     name="execute_code",
     toolset="code_execution",
     schema=EXECUTE_CODE_SCHEMA,
-    handler=lambda args, **kw: execute_code(
-        code=args.get("code", ""),
-        task_id=kw.get("task_id"),
-        enabled_tools=kw.get("enabled_tools")),
+    handler=_execute_code_handler,
     check_fn=check_sandbox_requirements,
     emoji="🐍",
     max_result_size_chars=100_000,

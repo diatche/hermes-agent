@@ -20,6 +20,11 @@ DEFAULT_CONFIG = {
         "wal_autocheckpoint": None,
         "journal_size_limit": None,
     },
+    # Soft file-descriptor limit for long-running Hermes server processes.
+    # Clamped to the OS hard limit; 0/false/null disables the adjustment.
+    "runtime": {
+        "nofile_soft_limit": 4096,
+    },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,
@@ -177,13 +182,16 @@ DEFAULT_CONFIG = {
         # Verification closure: after the agent edits files in a code workspace,
         # do not accept a final answer until fresh verification evidence exists
         # or the agent explains why it cannot run checks. The loop is bounded
-        # and uses the passive verification ledger. Default is "auto" —
-        # surface-aware: on for interactive coding surfaces (CLI, TUI, desktop)
-        # and programmatic callers, off for conversational messaging surfaces
-        # (Telegram, Discord, etc.) where the verification narrative would reach
-        # a human as chat noise. Doc/markdown/skill-only edits never fire it.
-        # Set true to force on everywhere, or false to disable.
-        "verify_on_stop": "auto",
+        # and uses the passive verification ledger. Default is False (opt-in):
+        # the v31/v32 config migrations already switch existing installs off
+        # because the verification narrative proved more noise than signal,
+        # and the docs tell users to treat off as the effective default — a
+        # fresh install must not be the one population that still gets the
+        # nudges. Set true to force on everywhere, or "auto" for the legacy
+        # surface-aware behavior (on for interactive coding surfaces — CLI,
+        # TUI, desktop — and programmatic callers, off for conversational
+        # messaging surfaces). Doc/markdown/skill-only edits never fire it.
+        "verify_on_stop": False,
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
@@ -403,6 +411,17 @@ DEFAULT_CONFIG = {
     },
 
     "browser": {
+        # Browser tool implementation.
+        # ""            — DEFAULT: Browser Use mode when the browser-use CLI
+        #                 (or uvx) is available; otherwise the built-in
+        #                 browser tools. Camofox setups always keep the
+        #                 built-in tools (no CDP surface).
+        # "browser-use" — force Browser Use mode: one browser_exec tool
+        #                 driving the Browser Use CLI 3.0 over any CDP
+        #                 backend (local Chrome, cloud browsers)
+        # "off"         — force the built-in browser tools
+        #                 (browser_navigate, browser_click, …)
+        "backend": "",
         "inactivity_timeout": 120,
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
@@ -964,6 +983,7 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "provider": "auto",
             "model": "",
+            "prefer_fast_model": False,  # opt in to provider fast tier; auto otherwise uses the main model
             "base_url": "",
             "api_key": "",
             "timeout": 30,
@@ -2330,6 +2350,10 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Automatically claim tasks in the first-class review column and spawn
+        # the assigned profile with the bundled sdlc-review skill. Disable for
+        # boards where every review is performed manually from the dashboard.
+        "review_dispatch": True,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
@@ -2526,6 +2550,10 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Optional named-profile allowlist for multiplex mode. None preserves
+        # the historical serve-all behavior; [] serves only the default.
+        "multiplex_profile_allowlist": None,
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored
