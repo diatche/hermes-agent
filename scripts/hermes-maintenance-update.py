@@ -341,9 +341,20 @@ def _build_candidate(
         if merged.returncode:
             raise RuntimeError("isolated candidate merge failed")
         candidate_oid = _oid(worktree, "HEAD")
-        checked = _git(worktree, "diff", "--check", f"{integration_oid}..{candidate_oid}", check=False)
+        # Validate the local integration delta, not upstream's own historical
+        # whitespace. The official updater owns the pinned upstream tree; this
+        # wrapper should reject whitespace introduced by the diatche side or by
+        # conflict resolution without blocking on defects already in upstream.
+        checked = _git(
+            worktree, "diff", "--check", f"{upstream_oid}..{candidate_oid}",
+            check=False,
+        )
         if checked.returncode:
-            raise RuntimeError("candidate failed git diff --check")
+            detail = checked.stdout.strip() or checked.stderr.strip()
+            raise RuntimeError(
+                "candidate local integration delta failed git diff --check"
+                + (f":\n{detail}" if detail else "")
+            )
         created = _git(repo, "update-ref", candidate_ref, candidate_oid, ZERO_OID, check=False)
         if created.returncode:
             raise RuntimeError("candidate ref creation compare-and-swap failed")
