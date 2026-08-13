@@ -518,6 +518,27 @@ class TestCmdUpdateBranchFlag:
         merge_cmds = [c for c in commands if "merge --ff-only" in c]
         assert any("origin/bb/gui" in c and "origin/main" not in c for c in merge_cmds), merge_cmds
 
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_exact_revision_is_validated_and_becomes_update_target(
+        self, mock_run, _mock_which, capsys
+    ):
+        revision = "a" * 40
+        mock_run.side_effect = self._branch_side_effect(
+            current_branch="main", target_branch="main", commit_count="1"
+        )
+        args = SimpleNamespace(branch="main", revision=revision)
+
+        cmd_update(args)
+
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        assert any(
+            f"merge-base --is-ancestor {revision} origin/main" in command
+            for command in commands
+        )
+        assert any(f"rev-list HEAD..{revision} --count" in command for command in commands)
+        assert any(f"merge --ff-only {revision}" in command for command in commands)
+
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -687,6 +708,22 @@ class TestCmdUpdateZipBranchRefusal:
 
         out = capsys.readouterr().out
         assert "bb/gui" in out
+        assert "not supported" in out
+        # No actual download attempted.
+        assert "Downloading latest version" not in out
+
+    def test_zip_fallback_refuses_exact_revision(self, capsys):
+        from hermes_cli.main import _update_via_zip
+
+        revision = "a" * 40
+        args = SimpleNamespace(branch="main", revision=revision)
+        with pytest.raises(SystemExit) as exc_info:
+            _update_via_zip(args)
+        assert exc_info.value.code == 1
+
+        out = capsys.readouterr().out
+        assert "--revision is not supported" in out
+        assert revision not in out
         assert "not supported" in out
         # No actual download attempted.
         assert "Downloading latest version" not in out

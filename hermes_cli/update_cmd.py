@@ -790,6 +790,16 @@ def _update_via_zip(args):
     # bug --branch was added to prevent. Refuse to proceed in that case
     # rather than lie.
     branch = _m()._resolve_update_branch(args)
+    revision = _m()._resolve_update_revision(args)
+    if revision is not None:
+        print(
+            "✗ --revision is not supported on the Windows ZIP-fallback update path."
+        )
+        print(
+            "  Resolve the git-side breakage and rerun the exact revision update; "
+            "the ZIP fallback only supports the main branch tip."
+        )
+        _m().sys.exit(1)
     if branch != "main":
         print(
             f"✗ --branch={branch} is not supported on the Windows ZIP-fallback "
@@ -2249,7 +2259,12 @@ def _run_logged_subprocess(cmd, *, cwd=None, env=None):
     _log_only_write(result.stdout or "")
     return result
 
-def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
+def _cmd_update_check(
+    branch: str = "main",
+    *,
+    branch_explicit: bool = False,
+    revision: str | None = None,
+):
     """Implement ``hermes update --check``: fetch and report without installing.
 
     ``branch`` selects which branch the check compares against. Default is
@@ -2380,6 +2395,20 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     if verify_result.returncode != 0:
         print(f"✗ Branch '{branch}' not found on {compare_branch.split('/', 1)[0]}.")
         sys.exit(1)
+
+    if revision is not None:
+        revision_check = subprocess.run(
+            git_cmd + ["merge-base", "--is-ancestor", revision, compare_branch],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if revision_check.returncode != 0:
+            print(
+                f"✗ Revision {revision} is not a commit reachable from {compare_branch}."
+            )
+            sys.exit(1)
+        compare_branch = revision
 
     if is_shallow:
         # No history to count across the shallow boundary. Compare tip SHAs and
@@ -4040,6 +4069,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
         branch = _m()._resolve_update_branch(args)
+        revision = _m()._resolve_update_revision(args)
 
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
@@ -4064,6 +4094,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 if stderr:
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
+
+        target_ref = f"origin/{branch}"
+        if revision is not None:
+            revision_check = subprocess.run(
+                git_cmd + ["merge-base", "--is-ancestor", revision, target_ref],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            if revision_check.returncode != 0:
+                print(
+                    f"✗ Revision {revision} is not a commit reachable from {target_ref}."
+                )
+                sys.exit(1)
+            target_ref = revision
 
         # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
@@ -4132,13 +4177,26 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Check if there are updates
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{target_ref}", "--count"],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             check=True,
         )
         commit_count = int(result.stdout.strip())
+        if revision is not None:
+            head_result = subprocess.run(
+                git_cmd + ["rev-parse", "HEAD"],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                check=True,
+            )
+            if head_result.stdout.strip() != revision:
+                # Exact revisions may intentionally move backward from a
+                # previously selected latest commit. Enter the normal
+                # merge/reset path even when HEAD..revision has no new commits.
+                commit_count = max(commit_count, 1)
 
         if commit_count == 0:
             _invalidate_update_cache()
@@ -4260,7 +4318,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # `pull --ff-only origin <branch>` given the fresh tracking ref;
             # the divergence fallback below is unchanged.
             pull_result = subprocess.run(
-                git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+                git_cmd + ["merge", "--ff-only", target_ref],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -4273,7 +4331,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                 )
                 reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                    git_cmd + ["reset", "--hard", target_ref],
                     cwd=_m().PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",

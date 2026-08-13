@@ -81,6 +81,8 @@ def _make_repo(tmp_path: Path, *, conflict: bool = False) -> tuple[Path, str]:
     _write(seed, "base.txt" if conflict else "upstream.txt", "upstream\n")
     upstream_sha = _commit(seed, "upstream")
     _git(seed, "push", "origin", "main")
+    _git(seed, "tag", "v2026.8.13", upstream_sha)
+    _git(seed, "push", "origin", "refs/tags/v2026.8.13")
     return repo, upstream_sha
 
 
@@ -187,6 +189,8 @@ def _args(repo: Path, state_dir: Path, wrapper: Path, health: Path) -> Namespace
         updater_executable=updater,
         remote="origin",
         upstream_branch="main",
+        target_mode="latest",
+        commit=None,
         wrapper_timeout=30,
         health_timeout=30,
         updater_timeout=30,
@@ -204,7 +208,81 @@ def test_public_help_exposes_pre_post_check_and_help() -> None:
     assert "--pre" in result.stdout
     assert "--post" in result.stdout
     assert "--check" in result.stdout
+    assert "--latest" in result.stdout
+    assert "--commit" in result.stdout
     assert "--run" not in result.stdout
+
+
+def test_target_mode_defaults_to_latest_stable_release(tmp_path: Path) -> None:
+    repo, _ = _make_repo(tmp_path)
+    newest_release = _git(repo, "rev-parse", "refs/remotes/origin/main")
+    _git(repo, "tag", "v2026.8.14", newest_release)
+    _git(repo, "push", "origin", "refs/tags/v2026.8.14")
+    _git(repo, "tag", "v2026.8.14.2", newest_release)
+    _git(repo, "push", "origin", "refs/tags/v2026.8.14.2")
+    _git(repo, "tag", "v2026.8.15-rc1", newest_release)
+    _git(repo, "push", "origin", "refs/tags/v2026.8.15-rc1")
+    module = _load_script_module()
+
+    target = module._resolve_update_target(repo, "origin", "main", "stable", None, "test")
+
+    assert target.label == "stable release v2026.8.14.2"
+    assert target.oid == newest_release
+
+
+def test_specific_commit_must_belong_to_upstream_main(tmp_path: Path) -> None:
+    repo, upstream_sha = _make_repo(tmp_path)
+    module = _load_script_module()
+
+    target = module._resolve_update_target(
+        repo, "origin", "main", "commit", upstream_sha[:12], "test"
+    )
+
+    assert target.label == f"commit {upstream_sha}"
+    assert target.oid == upstream_sha
+
+
+def test_stable_target_can_lag_upstream_tip_and_complete_handoff(tmp_path: Path) -> None:
+    repo, release_sha = _make_repo(tmp_path)
+    seed = tmp_path / "seed"
+    _write(seed, "post-release.txt", "development\n")
+    upstream_sha = _commit(seed, "post release development")
+    _git(seed, "push", "origin", "main")
+    _git(repo, "fetch", "origin", "main")
+    _git(repo, "tag", "-f", "v2026.8.13", release_sha)
+    _git(repo, "push", "--force", "origin", "refs/tags/v2026.8.13")
+    wrapper, health, _ = _fake_runtime(tmp_path)
+    state_dir = tmp_path / "state"
+    common = [
+        "--repo", str(repo),
+        "--state-dir", str(state_dir),
+        "--wrapperctl", str(wrapper),
+        "--health-script", str(health),
+    ]
+
+    prepared = subprocess.run(
+        [sys.executable, str(SCRIPT), "--pre", *common],
+        text=True,
+        capture_output=True,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["main_new"] == release_sha
+    assert state["branch_oid"] == upstream_sha
+
+    _git(repo, "fetch", "origin", "main")
+    _git(repo, "update-ref", "refs/heads/main", release_sha)
+    _git(repo, "switch", "main")
+    _git(repo, "reset", "--hard", release_sha)
+
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), "--post", *common],
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert _git(repo, "rev-parse", "main") == release_sha
+    assert _git(repo, "rev-parse", "origin/main") == upstream_sha
 
 
 def test_pre_stops_runtime_prints_handoff_and_never_runs_updater(tmp_path: Path) -> None:
@@ -232,13 +310,14 @@ def test_pre_stops_runtime_prints_handoff_and_never_runs_updater(tmp_path: Path)
         "--force-stop",
     ]
     assert not (tmp_path / "official-updater-calls.log").exists()
+    state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
     assert f"cd {repo}" in result.stdout
     assert (
-        f"{repo}/venv/bin/hermes update --branch main --no-backup --yes "
+        f"{repo}/venv/bin/hermes update --branch main --revision "
+        f"{state['main_new']} --no-backup --yes "
         "--no-gateway-restart"
     ) in result.stdout
     assert f"{SCRIPT} --post" in result.stdout
-    state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
     assert state["phase"] == "awaiting-official-update"
 
 
@@ -347,7 +426,8 @@ def test_check_success_reports_pinned_commits_and_next_step(tmp_path: Path) -> N
 
     assert result.returncode == 0, result.stderr
     assert "OK: upstream merges cleanly into diatche." in result.stdout
-    assert f"Checked upstream: origin/main @ {upstream_sha}" in result.stdout
+    assert f"Checked target: stable release" in result.stdout
+    assert f"@ {upstream_sha}" in result.stdout
     assert f"Against diatche: {integration_sha}" in result.stdout
     assert "Next: run hermes-maintenance-update when ready." in result.stdout
     assert not calls.exists()

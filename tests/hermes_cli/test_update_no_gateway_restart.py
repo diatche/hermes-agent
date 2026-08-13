@@ -24,6 +24,21 @@ def test_update_parser_accepts_no_gateway_restart() -> None:
     assert args.func is sentinel
 
 
+def test_update_parser_accepts_exact_revision() -> None:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+
+    def sentinel(_args: argparse.Namespace) -> None:
+        return None
+
+    build_update_parser(subparsers, cmd_update=sentinel)
+
+    args = parser.parse_args(["update", "--branch", "main", "--revision", "a" * 40])
+
+    assert args.revision == "a" * 40
+    assert args.func is sentinel
+
+
 def test_no_gateway_restart_rejects_windows_before_update_side_effects(monkeypatch) -> None:
     import hermes_cli.update_cmd as update_cmd
 

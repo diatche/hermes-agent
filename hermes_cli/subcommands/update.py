@@ -62,6 +62,15 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         ),
     )
     update_parser.add_argument(
+        "--revision",
+        default=None,
+        metavar="SHA",
+        help=(
+            "Update to this exact commit on the selected branch instead of its "
+            "tip. The commit must be reachable from origin/<branch>."
+        ),
+    )
+    update_parser.add_argument(
         "--force",
         action="store_true",
         default=False,

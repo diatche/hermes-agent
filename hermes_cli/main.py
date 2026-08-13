@@ -9140,6 +9140,17 @@ def _resolve_update_branch(args) -> str:
     return (getattr(args, "branch", None) or "main").strip() or "main"
 
 
+def _resolve_update_revision(args) -> str | None:
+    """Normalize an optional exact update commit."""
+    value = (getattr(args, "revision", None) or "").strip().lower()
+    if not value:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        print("✗ --revision must be a full 40-character commit SHA.")
+        sys.exit(2)
+    return value
+
+
 def _size_delta_label(saved_mb: float) -> str:
     """Human label for a before/after database size delta, in MB.
 
@@ -9194,6 +9205,7 @@ def cmd_update(args):
         _cmd_update_check(
             branch=branch,
             branch_explicit=bool(getattr(args, "branch", None)),
+            revision=_resolve_update_revision(args),
         )
         return
 

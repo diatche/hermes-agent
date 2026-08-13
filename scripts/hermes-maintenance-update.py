@@ -28,7 +28,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, NamedTuple, Sequence
 
 DEFAULT_REPO = Path.home() / ".hermes" / "hermes-agent"
 DEFAULT_STATE_DIR = Path.home() / ".hermes" / "local" / "update"
@@ -60,9 +60,16 @@ import huggingface_hub
 import sentence_transformers
 import transformers
 """
-OFFICIAL_UPDATE_ARGUMENTS = (
-    "update", "--branch", "main", "--no-backup", "--yes", "--no-gateway-restart"
-)
+OFFICIAL_UPDATE_ARGUMENTS = ("update", "--branch", "main")
+OFFICIAL_UPDATE_SUFFIX = ("--no-backup", "--yes", "--no-gateway-restart")
+
+
+class UpdateTarget(NamedTuple):
+    oid: str
+    branch_oid: str
+    label: str
+    source_ref: str
+    branch_ref: str
 
 
 class BusyError(RuntimeError):
@@ -287,6 +294,88 @@ def _fetch_private(repo: Path, remote: str, upstream_branch: str, run_id: str) -
     return ref, _oid(repo, ref)
 
 
+def _resolve_update_target(
+    repo: Path,
+    remote: str,
+    upstream_branch: str,
+    mode: str,
+    requested_commit: str | None,
+    run_id: str,
+) -> UpdateTarget:
+    branch_ref, branch_oid = _fetch_private(
+        repo, remote, upstream_branch, run_id
+    )
+    if mode == "latest":
+        return UpdateTarget(
+            oid=branch_oid,
+            branch_oid=branch_oid,
+            label=f"latest {remote}/{upstream_branch}",
+            source_ref=branch_ref,
+            branch_ref=branch_ref,
+        )
+
+    if mode == "stable":
+        releases_root = f"refs/hermes-maintenance/releases/{run_id}"
+        fetched = _git(
+            repo,
+            "fetch",
+            "--no-write-fetch-head",
+            "--refmap=",
+            remote,
+            f"+refs/tags/v*:refs/hermes-maintenance/releases/{run_id}/*",
+            check=False,
+            timeout=300,
+        )
+        if fetched.returncode:
+            raise RuntimeError(fetched.stderr.strip() or "release tag fetch failed")
+        listed = _git(
+            repo,
+            "for-each-ref",
+            "--sort=-version:refname",
+            "--format=%(refname)",
+            releases_root,
+        ).stdout.splitlines()
+        for ref in listed:
+            tag = "v" + ref.rsplit("/", 1)[-1].removeprefix("v")
+            if not re.fullmatch(r"v\d{4}\.\d{1,2}\.\d{1,2}(?:\.\d+)*", tag):
+                continue
+            oid = _oid(repo, f"{ref}^{{commit}}")
+            if not _git(
+                repo, "merge-base", "--is-ancestor", oid, branch_oid, check=False
+            ).returncode:
+                return UpdateTarget(
+                    oid=oid,
+                    branch_oid=branch_oid,
+                    label=f"stable release {tag}",
+                    source_ref=ref,
+                    branch_ref=branch_ref,
+                )
+        raise RuntimeError(f"no stable release tag is reachable from {remote}/{upstream_branch}")
+
+    if mode != "commit" or not requested_commit:
+        raise RuntimeError("specific commit mode requires --commit SHA")
+    resolved = _git(
+        repo, "rev-parse", "--verify", f"{requested_commit}^{{commit}}", check=False
+    )
+    candidate = resolved.stdout.strip()
+    if resolved.returncode or not OID_RE.fullmatch(candidate):
+        raise RuntimeError("requested commit could not be resolved after fetching upstream")
+    oid = candidate
+    if _git(repo, "merge-base", "--is-ancestor", oid, branch_oid, check=False).returncode:
+        raise RuntimeError(
+            f"requested commit {oid} is not reachable from {remote}/{upstream_branch}"
+        )
+    commit_ref = f"refs/hermes-maintenance/commits/{run_id}"
+    _update_ref_transaction(repo, [f"create {commit_ref} {oid}"])
+    return UpdateTarget(
+        oid=oid,
+        branch_oid=branch_oid,
+        label=f"commit {oid}",
+        source_ref=commit_ref,
+        branch_ref=branch_ref,
+    )
+
+
 def _check_merge(repo: Path, integration_oid: str, upstream_oid: str) -> None:
     # merge-tree may leave harmless unreachable temporary objects, but it does
     # not move refs or alter the checkout. Avoid a second disposable repository
@@ -380,32 +469,34 @@ def _update_ref_transaction(repo: Path, commands: list[str]) -> None:
 
 def _publish_integration(
     repo: Path, *, main_oid: str, origin_main_oid: str, upstream_ref: str,
-    upstream_oid: str, integration_branch: str, integration_old: str,
+    upstream_ref_oid: str, integration_branch: str, integration_old: str,
     integration_new: str,
 ) -> None:
     """CAS only the local integration ref while verifying updater-owned refs."""
     _update_ref_transaction(repo, [
         f"verify refs/heads/main {main_oid}",
         f"verify refs/remotes/origin/main {origin_main_oid}",
-        f"verify {upstream_ref} {upstream_oid}",
+        f"verify {upstream_ref} {upstream_ref_oid}",
         f"update refs/heads/{integration_branch} {integration_new} {integration_old}",
     ])
 
 
 def _assert_official_update_result(
-    repo: Path, *, upstream_ref: str, upstream_oid: str, integration_old: str,
+    repo: Path, *, upstream_ref: str, branch_ref: str, target_oid: str, branch_oid: str,
+    integration_old: str,
 ) -> None:
     expected = (
-        ("refs/heads/main", upstream_oid),
-        ("refs/remotes/origin/main", upstream_oid),
-        (upstream_ref, upstream_oid),
+        ("refs/heads/main", target_oid),
+        ("refs/remotes/origin/main", branch_oid),
+        (upstream_ref, target_oid),
+        (branch_ref, branch_oid),
         ("refs/heads/diatche", integration_old),
     )
     for ref, oid in expected:
         if _oid(repo, ref) != oid:
             raise RuntimeError(f"official updater left unexpected Git state: {ref}")
     branch = _git(repo, "branch", "--show-current").stdout.strip()
-    expected_head = {"main": upstream_oid, "diatche": integration_old}.get(branch)
+    expected_head = {"main": target_oid, "diatche": integration_old}.get(branch)
     if expected_head is None:
         raise RuntimeError("official updater left the checkout on an unexpected branch")
     if _oid(repo, "HEAD") != expected_head:
@@ -482,6 +573,7 @@ def _recover_owned_git_state(repo: Path, payload: dict[str, Any]) -> None:
     """Restore only Git states provably produced by this orchestration run."""
     main_old = str(payload["main_old"])
     upstream = str(payload["main_new"])
+    branch_oid = str(payload.get("branch_oid", upstream))
     integration_old = str(payload["integration_old"])
     integration_new = str(payload["integration_new"])
     origin_ref = str(payload.get("origin_ref", "refs/remotes/origin/main"))
@@ -495,10 +587,13 @@ def _recover_owned_git_state(repo: Path, payload: dict[str, Any]) -> None:
     if current_integration not in {integration_old, integration_new}:
         raise RuntimeError("cannot recover after concurrent diatche movement")
     current_origin = _oid(repo, origin_ref) if origin_old is not None else None
-    if origin_old is not None and current_origin not in {str(origin_old), upstream}:
+    if origin_old is not None and current_origin not in {str(origin_old), branch_oid}:
         raise RuntimeError("cannot recover after concurrent origin/main movement")
     if fetch_ref is not None and _oid(repo, str(fetch_ref)) != upstream:
         raise RuntimeError("cannot recover after private fetch ref movement")
+    branch_ref = payload.get("branch_ref")
+    if branch_ref is not None and _oid(repo, str(branch_ref)) != branch_oid:
+        raise RuntimeError("cannot recover after private branch fetch ref movement")
 
     branch = _git(repo, "branch", "--show-current").stdout.strip()
     head = _oid(repo, "HEAD")
@@ -655,10 +750,16 @@ def _run_pre_locked(
         origin_ref = f"refs/remotes/{args.remote}/{args.upstream_branch}"
         origin_old = _oid(repo, origin_ref)
         integration_old = _oid(repo, "refs/heads/diatche")
-        _progress(f"Fetching {args.remote}/{args.upstream_branch}")
-        fetch_ref, upstream_oid = _fetch_private(
-            repo, args.remote, args.upstream_branch, run_id
+        _progress(f"Resolving the requested {args.target_mode} update target")
+        target = _resolve_update_target(
+            repo,
+            args.remote,
+            args.upstream_branch,
+            args.target_mode,
+            args.commit,
+            run_id,
         )
+        fetch_ref, upstream_oid = target.source_ref, target.oid
         _assert_updater_has_forward_transition(main_old, upstream_oid)
         _progress("Checking mergeability without changing refs or checkout")
         _check_merge(repo, integration_old, upstream_oid)
@@ -672,6 +773,9 @@ def _run_pre_locked(
         )
         journal.update(
             fetch_ref=fetch_ref,
+            branch_ref=target.branch_ref,
+            branch_oid=target.branch_oid,
+            target_label=target.label,
             candidate_ref=candidate_ref,
             origin_ref=origin_ref,
             origin_old=origin_old,
@@ -700,12 +804,19 @@ def _run_pre_locked(
         _wrapper(args.wrapperctl.resolve(), repo, "--force-stop", args.wrapper_timeout)
         journal.update(phase="awaiting-official-update", updated_at=_now())
         _write_journal(state_dir, journal)
+        update_arguments = (
+            *OFFICIAL_UPDATE_ARGUMENTS,
+            "--revision",
+            upstream_oid,
+            *OFFICIAL_UPDATE_SUFFIX,
+        )
         update_command = " ".join(
-            shlex.quote(str(part)) for part in (updater, *OFFICIAL_UPDATE_ARGUMENTS)
+            shlex.quote(str(part)) for part in (updater, *update_arguments)
         )
         post_command = Path(sys.argv[0]).resolve()
         print()
         print("Pre-update checks passed and the gateway is stopped.")
+        print(f"Pinned target: {target.label} ({upstream_oid})")
         print("Run these commands in order:")
         print()
         print(f"  cd {shlex.quote(str(repo))} && {update_command}")
@@ -776,14 +887,18 @@ def _run_post_locked(
         _progress("Loading the prepared maintenance handoff")
         journal = _load_post_handoff(repo, state_dir)
         upstream_oid = str(journal["main_new"])
+        branch_oid = str(journal.get("branch_oid", upstream_oid))
         integration_old = str(journal["integration_old"])
         candidate_oid = str(journal["integration_new"])
         fetch_ref = str(journal["fetch_ref"])
+        branch_ref = str(journal.get("branch_ref", fetch_ref))
         _progress("Verifying the official Hermes update result")
         _assert_official_update_result(
             repo,
             upstream_ref=fetch_ref,
-            upstream_oid=upstream_oid,
+            branch_ref=branch_ref,
+            target_oid=upstream_oid,
+            branch_oid=branch_oid,
             integration_old=integration_old,
         )
         journal.update(
@@ -794,9 +909,9 @@ def _run_post_locked(
         _publish_integration(
             repo,
             main_oid=upstream_oid,
-            origin_main_oid=upstream_oid,
+            origin_main_oid=branch_oid,
             upstream_ref=fetch_ref,
-            upstream_oid=upstream_oid,
+            upstream_ref_oid=upstream_oid,
             integration_branch="diatche",
             integration_old=integration_old,
             integration_new=candidate_oid,
@@ -912,18 +1027,25 @@ def _check(args: argparse.Namespace) -> int:
     try:
         _assert_checkout(repo, "diatche")
         integration = _oid(repo, "refs/heads/diatche")
-        fetch_ref, upstream = _fetch_private(
-            repo, args.remote, args.upstream_branch, f"check-{uuid.uuid4().hex}"
+        target = _resolve_update_target(
+            repo,
+            args.remote,
+            args.upstream_branch,
+            args.target_mode,
+            args.commit,
+            f"check-{uuid.uuid4().hex}",
         )
+        fetch_ref, upstream = target.source_ref, target.oid
         _check_merge(repo, integration, upstream)
         payload = {"ok": True, "mergeable": True, "integration_sha": integration,
-                   "upstream_sha": upstream, "fetch_ref": fetch_ref}
+                   "upstream_sha": upstream, "fetch_ref": fetch_ref,
+                   "target": target.label}
         if args.json:
             print(json.dumps(payload, indent=2, sort_keys=True))
         else:
             print(
                 "OK: upstream merges cleanly into diatche.\n"
-                f"Checked upstream: {args.remote}/{args.upstream_branch} @ {upstream}\n"
+                f"Checked target: {target.label} @ {upstream}\n"
                 f"Against diatche: {integration}\n"
                 "Next: run hermes-maintenance-update when ready."
             )
@@ -956,6 +1078,20 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="fetch live upstream privately and check checkout cleanliness and mergeability",
     )
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument(
+        "--latest",
+        dest="target_mode",
+        action="store_const",
+        const="latest",
+        help="target the latest commit on upstream main instead of a stable release",
+    )
+    target.add_argument(
+        "--commit",
+        metavar="SHA",
+        help="target a specific commit reachable from upstream main",
+    )
+    parser.set_defaults(target_mode="stable")
     parser.add_argument("--repo", type=Path, default=DEFAULT_REPO, help=hidden)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR, help=hidden)
     parser.add_argument("--wrapperctl", type=Path, default=DEFAULT_WRAPPERCTL, help=hidden)
@@ -971,6 +1107,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.commit:
+        args.target_mode = "commit"
     repo = args.repo.expanduser().resolve()
     args.repo = repo
     if not _git(repo, "rev-parse", "--is-inside-work-tree", check=False).stdout.strip() == "true":
