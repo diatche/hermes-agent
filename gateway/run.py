@@ -4301,7 +4301,8 @@ class TurnRunner:
                                 or pinned_text.startswith("All tasks complete:\n")
                                 or pinned_text.startswith("🤖 Delegated tasks\n")
                                 or re.match(
-                                    r"^Delegated [1-9]\d* tasks? 🤖(?:\n|$)",
+                                    r"^(?:Waiting on [1-9]\d* delegated tasks?|"
+                                    r"Delegated [1-9]\d* tasks?) 🤖(?:\n|$)",
                                     pinned_text,
                                 )
                                 is not None
@@ -23426,6 +23427,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         accepted = False
         try:
+            if evt.get("type") == "async_delegation":
+                try:
+                    await self._cleanup_completed_delegation_todo_pin(evt)
+                except Exception:
+                    # Presentation cleanup must never suppress the actual child
+                    # result. Keep the completion durable/retryable on its own
+                    # delivery contract and leave any stale pin for the normal
+                    # next-checklist reconciliation path.
+                    logger.debug(
+                        "Could not clean up completed delegation todo pin",
+                        exc_info=True,
+                    )
             injection_result = await self._inject_watch_notification(synth_text, evt)
             if injection_result is not True:
                 return injection_result
@@ -23470,6 +23483,100 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 except Exception:
                     logger.debug("Could not release durable completion claim", exc_info=True)
+
+    async def _cleanup_completed_delegation_todo_pin(self, evt: dict) -> bool:
+        """Remove the delegated suffix when the last async dispatch completes.
+
+        Telegram is the only platform with pinned todo progress today. Ownership
+        is re-established from Telegram itself so this also works after a
+        gateway restart: bot authorship, exact chat/topic, and the renderer's
+        anchored delegated grammar must all match before editing anything.
+        """
+        if evt.get("type") != "async_delegation":
+            return False
+
+        session_key = str(evt.get("session_key") or "").strip()
+        delegation_id = str(evt.get("delegation_id") or "").strip()
+        try:
+            from tools.async_delegation import list_async_delegations
+
+            for record in list_async_delegations():
+                if str(record.get("delegation_id") or "") == delegation_id:
+                    continue
+                if str(record.get("session_key") or "") != session_key:
+                    continue
+                if str(record.get("status") or "") in {
+                    "running",
+                    "stalling",
+                    "finalizing",
+                }:
+                    return False
+        except Exception:
+            logger.debug(
+                "Could not inspect sibling delegations before todo cleanup",
+                exc_info=True,
+            )
+            return False
+
+        source = self._build_process_event_source(evt)
+        if source is None or source.platform != Platform.TELEGRAM:
+            return False
+        adapter = self._adapter_for_source(source)
+        bot = getattr(adapter, "_bot", None) if adapter is not None else None
+        if bot is None or not hasattr(bot, "get_chat"):
+            return False
+
+        chat = await bot.get_chat(chat_id=int(source.chat_id))
+        pinned = getattr(chat, "pinned_message", None)
+        message_id = getattr(pinned, "message_id", None)
+        if message_id is None:
+            return False
+        author = getattr(pinned, "from_user", None)
+        pinned_thread_id = getattr(pinned, "message_thread_id", None)
+        if (
+            not getattr(author, "is_bot", False)
+            or str(pinned_thread_id or "") != str(source.thread_id or "")
+        ):
+            return False
+
+        pinned_text = (
+            getattr(pinned, "text", None)
+            or getattr(pinned, "caption", None)
+            or ""
+        )
+        from gateway.todo_progress import without_delegated_section
+
+        remaining = without_delegated_section(pinned_text)
+        if remaining is None:
+            return False
+
+        pin_key = (str(source.chat_id), str(source.thread_id or ""))
+        message_id_text = str(message_id)
+        if remaining:
+            result = await adapter.edit_message(
+                chat_id=str(source.chat_id),
+                message_id=message_id_text,
+                content=remaining,
+            )
+            return bool(result is not None and getattr(result, "success", False))
+
+        if not hasattr(bot, "unpin_chat_message"):
+            return False
+        unpinned = await bot.unpin_chat_message(
+            chat_id=int(source.chat_id),
+            message_id=message_id,
+        )
+        if unpinned is False:
+            return False
+        deleted = await adapter.delete_message(
+            chat_id=str(source.chat_id),
+            message_id=message_id_text,
+        )
+        if deleted:
+            if str(self._pinned_todo_messages.get(pin_key)) == message_id_text:
+                self._pinned_todo_messages.pop(pin_key, None)
+            return True
+        return False
 
     def _enrich_async_delegation_routing(self, evt: dict) -> None:
         """Fill platform/chat_id/thread_id/chat_type on an async-delegation event.

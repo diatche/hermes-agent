@@ -54,6 +54,10 @@ def _async_event(delegation_id="deleg_duplicate"):
         "type": "async_delegation",
         "delegation_id": delegation_id,
         "session_key": "agent:main:telegram:dm:12345:678",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "12345",
+        "thread_id": "678",
         "goal": "Investigate flaky test",
         "status": "completed",
         "summary": "Found it",
@@ -66,6 +70,39 @@ def _async_event(delegation_id="deleg_duplicate"):
         "origin_profile": "default",
         "origin_hermes_home": "/tmp/hermes-default",
     }
+
+
+def _pinned_todo_adapter(text, *, thread_id="678"):
+    operations = []
+    pinned = SimpleNamespace(
+        message_id=77,
+        text=text,
+        caption=None,
+        message_thread_id=int(thread_id) if thread_id else None,
+        from_user=SimpleNamespace(is_bot=True),
+    )
+
+    async def _get_chat(**_kwargs):
+        return SimpleNamespace(pinned_message=pinned)
+
+    async def _unpin(**_kwargs):
+        operations.append("unpin")
+        return True
+
+    async def _delete(*_args, **_kwargs):
+        operations.append("delete")
+        return True
+
+    adapter = SimpleNamespace(
+        _bot=SimpleNamespace(
+            get_chat=AsyncMock(side_effect=_get_chat),
+            unpin_chat_message=AsyncMock(side_effect=_unpin),
+        ),
+        edit_message=AsyncMock(return_value=SimpleNamespace(success=True)),
+        delete_message=AsyncMock(side_effect=_delete),
+        handle_message=AsyncMock(),
+    )
+    return adapter, operations
 
 
 def _completion_event(*, started_at, session_id="proc_reused"):
@@ -96,6 +133,94 @@ def _stop_after_sleeps(monkeypatch, runner, count):
     monkeypatch.setattr(asyncio, "sleep", _bounded_sleep)
 
 
+def test_completed_delegated_only_pin_is_unpinned_then_deleted():
+    adapter, operations = _pinned_todo_adapter(
+        "Waiting on 2 delegated tasks 🤖"
+    )
+    runner = _runner(adapter)
+    runner._pinned_todo_messages = {("12345", "678"): 77}
+
+    cleaned = asyncio.run(
+        runner._cleanup_completed_delegation_todo_pin(_async_event())
+    )
+
+    assert cleaned is True
+    assert operations == ["unpin", "delete"]
+    adapter.edit_message.assert_not_awaited()
+    assert runner._pinned_todo_messages == {}
+
+
+def test_completed_delegation_edits_pin_when_ordinary_tasks_remain():
+    adapter, operations = _pinned_todo_adapter(
+        "Working on 1 task:\n\n"
+        "🔄 Main task\n\n"
+        "Waiting on 2 delegated tasks 🤖"
+    )
+    runner = _runner(adapter)
+    runner._pinned_todo_messages = {("12345", "678"): 77}
+
+    cleaned = asyncio.run(
+        runner._cleanup_completed_delegation_todo_pin(_async_event())
+    )
+
+    assert cleaned is True
+    adapter.edit_message.assert_awaited_once_with(
+        chat_id="12345",
+        message_id="77",
+        content="Working on 1 task:\n\n🔄 Main task",
+    )
+    assert operations == []
+    assert runner._pinned_todo_messages == {("12345", "678"): 77}
+
+
+def test_completed_delegation_does_not_touch_another_topic_pin():
+    adapter, operations = _pinned_todo_adapter(
+        "Waiting on 1 delegated task 🤖",
+        thread_id="999",
+    )
+    runner = _runner(adapter)
+    runner._pinned_todo_messages = {("12345", "999"): 77}
+
+    cleaned = asyncio.run(
+        runner._cleanup_completed_delegation_todo_pin(_async_event())
+    )
+
+    assert cleaned is False
+    adapter.edit_message.assert_not_awaited()
+    adapter.delete_message.assert_not_awaited()
+    assert operations == []
+
+
+def test_completed_delegation_waits_for_an_active_sibling_batch(monkeypatch):
+    adapter, operations = _pinned_todo_adapter(
+        "Waiting on 2 delegated tasks 🤖"
+    )
+    runner = _runner(adapter)
+    from tools import async_delegation
+
+    monkeypatch.setattr(
+        async_delegation,
+        "list_async_delegations",
+        lambda: [
+            {
+                "delegation_id": "deleg_still_running",
+                "session_key": _async_event()["session_key"],
+                "status": "running",
+            }
+        ],
+    )
+
+    cleaned = asyncio.run(
+        runner._cleanup_completed_delegation_todo_pin(_async_event())
+    )
+
+    assert cleaned is False
+    adapter._bot.get_chat.assert_not_awaited()
+    adapter.edit_message.assert_not_awaited()
+    adapter.delete_message.assert_not_awaited()
+    assert operations == []
+
+
 def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registry):
     """Byte-identical queue replays produce one turn in one gateway lifecycle."""
     isolated = queue.Queue()
@@ -119,6 +244,8 @@ def test_unroutable_async_event_is_not_requeued_forever(
     monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
     event = _async_event("deleg_desktop_or_cli")
     event["session_key"] = "20260711_unparseable_ui_session"
+    for key in ("platform", "chat_type", "chat_id", "thread_id"):
+        event.pop(key, None)
     isolated.put(event)
 
     adapter = SimpleNamespace(handle_message=AsyncMock())

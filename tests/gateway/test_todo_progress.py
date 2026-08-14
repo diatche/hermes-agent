@@ -1,6 +1,6 @@
 import json
 
-from gateway.todo_progress import TodoChecklist
+from gateway.todo_progress import TodoChecklist, without_delegated_section
 
 
 def _result(todos):
@@ -130,15 +130,48 @@ def test_delegated_task_count_mode():
         ]
     })
 
-    assert rendered == "Delegated 2 tasks 🤖"
+    assert rendered == "Waiting on 2 delegated tasks 🤖"
 
 
 def test_delegated_task_count_mode_uses_singular():
     checklist = TodoChecklist(delegated_tasks="count")
 
     assert checklist.add_delegations({"goal": "Review implementation"}) == (
-        "Delegated 1 task 🤖"
+        "Waiting on 1 delegated task 🤖"
     )
+
+
+def test_without_delegated_section_clears_delegated_only_count():
+    assert without_delegated_section("Waiting on 2 delegated tasks 🤖") == ""
+
+
+def test_without_delegated_section_preserves_ordinary_tasks():
+    rendered = (
+        "Working on 1 task:\n\n"
+        "🔄 Main task\n\n"
+        "Waiting on 2 delegated tasks 🤖"
+    )
+
+    assert without_delegated_section(rendered) == (
+        "Working on 1 task:\n\n"
+        "🔄 Main task"
+    )
+
+
+def test_without_delegated_section_supports_legacy_and_goal_renderers():
+    assert without_delegated_section("Delegated 1 task 🤖") == ""
+    assert without_delegated_section(
+        "Working on 1 task:\n\n"
+        "⬜ Main task\n\n"
+        "🤖 Delegated tasks\n"
+        "↳ Review implementation\n"
+        "↳ Verify rendering"
+    ) == "Working on 1 task:\n\n⬜ Main task"
+
+
+def test_without_delegated_section_ignores_unowned_text():
+    text = "Please wait while I delegate this task"
+    assert without_delegated_section(text) is None
 
 
 def test_delegated_goal_mode_caps_each_goal_at_80_characters():
