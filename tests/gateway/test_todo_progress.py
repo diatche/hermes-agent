@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from gateway.todo_progress import TodoChecklist, without_delegated_section
 
 
@@ -171,6 +173,17 @@ def test_without_delegated_section_supports_legacy_and_goal_renderers():
 
 def test_without_delegated_section_ignores_unowned_text():
     text = "Please wait while I delegate this task"
+    assert without_delegated_section(text) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Unrelated bot status\n\nWaiting on 2 delegated tasks 🤖",
+        "Another bot's report\n🤖 Delegated tasks\n↳ Review implementation",
+    ],
+)
+def test_without_delegated_section_rejects_bot_authored_lookalikes(text):
     assert without_delegated_section(text) is None
 
 

@@ -105,6 +105,15 @@ def _pinned_todo_adapter(text, *, thread_id="678"):
     return adapter, operations
 
 
+def _own_todo(runner, adapter, text, *, thread_id="678"):
+    key = ("12345", thread_id)
+    runner._pinned_todo_messages = {key: 77}
+    runner._pinned_todo_texts = {key: text}
+    runner._pinned_todo_adapters = {key: adapter}
+    runner._pinned_todo_revisions = {key: 1}
+    runner._todo_pin_locks = {}
+
+
 def _completion_event(*, started_at, session_id="proc_reused"):
     return {
         "type": "completion",
@@ -134,11 +143,10 @@ def _stop_after_sleeps(monkeypatch, runner, count):
 
 
 def test_completed_delegated_only_pin_is_unpinned_then_deleted():
-    adapter, operations = _pinned_todo_adapter(
-        "Waiting on 2 delegated tasks 🤖"
-    )
+    text = "Waiting on 2 delegated tasks 🤖"
+    adapter, operations = _pinned_todo_adapter(text)
     runner = _runner(adapter)
-    runner._pinned_todo_messages = {("12345", "678"): 77}
+    _own_todo(runner, adapter, text)
 
     cleaned = asyncio.run(
         runner._cleanup_completed_delegation_todo_pin(_async_event())
@@ -151,13 +159,14 @@ def test_completed_delegated_only_pin_is_unpinned_then_deleted():
 
 
 def test_completed_delegation_edits_pin_when_ordinary_tasks_remain():
-    adapter, operations = _pinned_todo_adapter(
+    text = (
         "Working on 1 task:\n\n"
         "🔄 Main task\n\n"
         "Waiting on 2 delegated tasks 🤖"
     )
+    adapter, operations = _pinned_todo_adapter(text)
     runner = _runner(adapter)
-    runner._pinned_todo_messages = {("12345", "678"): 77}
+    _own_todo(runner, adapter, text)
 
     cleaned = asyncio.run(
         runner._cleanup_completed_delegation_todo_pin(_async_event())
@@ -174,18 +183,31 @@ def test_completed_delegation_edits_pin_when_ordinary_tasks_remain():
 
 
 def test_completed_delegation_does_not_touch_another_topic_pin():
-    adapter, operations = _pinned_todo_adapter(
-        "Waiting on 1 delegated task 🤖",
-        thread_id="999",
-    )
+    text = "Waiting on 1 delegated task 🤖"
+    adapter, operations = _pinned_todo_adapter(text, thread_id="999")
     runner = _runner(adapter)
-    runner._pinned_todo_messages = {("12345", "999"): 77}
+    _own_todo(runner, adapter, text, thread_id="999")
 
     cleaned = asyncio.run(
         runner._cleanup_completed_delegation_todo_pin(_async_event())
     )
 
     assert cleaned is False
+    adapter.edit_message.assert_not_awaited()
+    adapter.delete_message.assert_not_awaited()
+    assert operations == []
+
+
+def test_completed_delegation_does_not_rediscover_ownership_after_restart():
+    adapter, operations = _pinned_todo_adapter("Waiting on 1 delegated task 🤖")
+    runner = _runner(adapter)
+
+    cleaned = asyncio.run(
+        runner._cleanup_completed_delegation_todo_pin(_async_event())
+    )
+
+    assert cleaned is False
+    adapter._bot.get_chat.assert_not_awaited()
     adapter.edit_message.assert_not_awaited()
     adapter.delete_message.assert_not_awaited()
     assert operations == []

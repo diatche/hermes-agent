@@ -4116,6 +4116,7 @@ class TurnRunner:
         adapter = self._runner._adapter_for_source(ctx.source)
         if not adapter:
             return
+        self._runner._ensure_todo_pin_state()
 
         # Skip tool progress for platforms that don't support message
         # editing (e.g. iMessage/BlueBubbles) — each progress update
@@ -4258,6 +4259,25 @@ class TurnRunner:
                     high = mid - 1
             return text[:low].rstrip() + marker
 
+        def _forget_owned_todo() -> None:
+            self._runner._pinned_todo_messages.pop(ctx._todo_pin_key, None)
+            self._runner._pinned_todo_texts.pop(ctx._todo_pin_key, None)
+            self._runner._pinned_todo_adapters.pop(ctx._todo_pin_key, None)
+            self._runner._pinned_todo_revisions.pop(ctx._todo_pin_key, None)
+
+        def _remember_owned_todo(message_id, text: str) -> None:
+            if self._runner._pinned_todo_messages.get(ctx._todo_pin_key) != message_id:
+                return
+            self._runner._pinned_todo_texts[ctx._todo_pin_key] = text
+            self._runner._pinned_todo_adapters[ctx._todo_pin_key] = adapter
+            self._runner._pinned_todo_revisions[ctx._todo_pin_key] = (
+                self._runner._pinned_todo_revisions.get(ctx._todo_pin_key, 0) + 1
+            )
+
+        todo_pin_lock = self._runner._todo_pin_locks.setdefault(
+            ctx._todo_pin_key, asyncio.Lock()
+        )
+
         async def _deliver_todo_checklist(text: str) -> None:
             """Send/edit a checklist, or delete its bubble when cleared."""
             nonlocal todo_msg_id, pinned_todo_msg_id, last_todo_text
@@ -4323,7 +4343,7 @@ class TurnRunner:
                             if str(
                                 self._runner._pinned_todo_messages.get(ctx._todo_pin_key)
                             ) == str(stale_message_id):
-                                self._runner._pinned_todo_messages.pop(ctx._todo_pin_key, None)
+                                _forget_owned_todo()
 
                     prior_message_id = self._runner._pinned_todo_messages.get(ctx._todo_pin_key)
                     if prior_message_id is not None and prior_message_id != message_id:
@@ -4338,7 +4358,7 @@ class TurnRunner:
                         )
                         if unpinned is False:
                             return
-                        self._runner._pinned_todo_messages.pop(ctx._todo_pin_key, None)
+                        _forget_owned_todo()
                     telegram_message_id = (
                         int(message_id) if str(message_id).isdigit() else message_id
                     )
@@ -4371,7 +4391,7 @@ class TurnRunner:
                     if unpinned is not False:
                         pinned_todo_msg_id = None
                         if self._runner._pinned_todo_messages.get(ctx._todo_pin_key) == message_id:
-                            self._runner._pinned_todo_messages.pop(ctx._todo_pin_key, None)
+                            _forget_owned_todo()
                 except Exception:
                     logger.debug("Failed to unpin Telegram todo checklist", exc_info=True)
 
@@ -4439,14 +4459,16 @@ class TurnRunner:
             if todo_msg_id is not None:
                 result = None
                 for attempt in range(2):
-                    try:
-                        result = await _edit_progress_message(todo_msg_id, text)
-                    except Exception:
-                        logger.debug("Todo checklist edit failed", exc_info=True)
-                        result = None
-                    if result is not None and result.success:
-                        last_todo_text = text
-                        return
+                    async with todo_pin_lock:
+                        try:
+                            result = await _edit_progress_message(todo_msg_id, text)
+                        except Exception:
+                            logger.debug("Todo checklist edit failed", exc_info=True)
+                            result = None
+                        if result is not None and result.success:
+                            last_todo_text = text
+                            _remember_owned_todo(todo_msg_id, text)
+                            return
                     if not (result is not None and getattr(result, "retryable", False)):
                         break
                     if attempt == 0:
@@ -4458,17 +4480,19 @@ class TurnRunner:
 
             result = None
             for attempt in range(2):
-                try:
-                    result = await _send_progress_text(text)
-                except Exception:
-                    logger.debug("Todo checklist send failed", exc_info=True)
-                    result = None
-                if result is not None and result.success:
-                    if result.message_id:
-                        todo_msg_id = result.message_id
-                        await _pin_todo(todo_msg_id)
-                    last_todo_text = text
-                    return
+                async with todo_pin_lock:
+                    try:
+                        result = await _send_progress_text(text)
+                    except Exception:
+                        logger.debug("Todo checklist send failed", exc_info=True)
+                        result = None
+                    if result is not None and result.success:
+                        if result.message_id:
+                            todo_msg_id = result.message_id
+                            await _pin_todo(todo_msg_id)
+                            _remember_owned_todo(todo_msg_id, text)
+                        last_todo_text = text
+                        return
                 if not (result is not None and getattr(result, "retryable", False)):
                     return
                 if attempt == 0:
@@ -6331,6 +6355,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
         # Last checklist pinned in each Telegram chat/topic across turns.
         self._pinned_todo_messages: Dict[tuple[str, str], Any] = {}
+        self._pinned_todo_texts: Dict[tuple[str, str], str] = {}
+        self._pinned_todo_adapters: Dict[tuple[str, str], BasePlatformAdapter] = {}
+        self._pinned_todo_revisions: Dict[tuple[str, str], int] = {}
+        self._todo_pin_locks: Dict[tuple[str, str], asyncio.Lock] = {}
         # Multi-profile multiplexing: adapters for NON-default profiles live
         # here, keyed by profile name then Platform. self.adapters stays the
         # default/active profile's map so the ~93 existing self.adapters[...]
@@ -23484,16 +23512,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     logger.debug("Could not release durable completion claim", exc_info=True)
 
+    def _ensure_todo_pin_state(self) -> None:
+        """Initialize todo-pin ownership state for normal and bare test runners."""
+        if not hasattr(self, "_pinned_todo_messages"):
+            self._pinned_todo_messages = {}
+        if not hasattr(self, "_pinned_todo_texts"):
+            self._pinned_todo_texts = {}
+        if not hasattr(self, "_pinned_todo_adapters"):
+            self._pinned_todo_adapters = {}
+        if not hasattr(self, "_pinned_todo_revisions"):
+            self._pinned_todo_revisions = {}
+        if not hasattr(self, "_todo_pin_locks"):
+            self._todo_pin_locks = {}
+
     async def _cleanup_completed_delegation_todo_pin(self, evt: dict) -> bool:
         """Remove the delegated suffix when the last async dispatch completes.
 
-        Telegram is the only platform with pinned todo progress today. Ownership
-        is re-established from Telegram itself so this also works after a
-        gateway restart: bot authorship, exact chat/topic, and the renderer's
-        anchored delegated grammar must all match before editing anything.
+        Telegram is the only platform with pinned todo progress today. Cleanup
+        requires live ownership state for the exact message, adapter, text, and
+        revision. After a restart we deliberately do nothing; the next normal
+        checklist update performs the existing conservative stale-pin cleanup.
         """
         if evt.get("type") != "async_delegation":
             return False
+        self._ensure_todo_pin_state()
 
         session_key = str(evt.get("session_key") or "").strip()
         delegation_id = str(evt.get("delegation_id") or "").strip()
@@ -23521,62 +23563,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source = self._build_process_event_source(evt)
         if source is None or source.platform != Platform.TELEGRAM:
             return False
-        adapter = self._adapter_for_source(source)
-        bot = getattr(adapter, "_bot", None) if adapter is not None else None
-        if bot is None or not hasattr(bot, "get_chat"):
+
+        pin_key = (str(source.chat_id), str(source.thread_id or ""))
+        message_id = self._pinned_todo_messages.get(pin_key)
+        pinned_text = self._pinned_todo_texts.get(pin_key)
+        adapter = self._pinned_todo_adapters.get(pin_key)
+        revision = self._pinned_todo_revisions.get(pin_key)
+        if message_id is None or pinned_text is None or adapter is None or revision is None:
+            # Deliberately no Telegram text-discovery fallback. If a restart
+            # lost live ownership, the next checklist's existing stale-pin
+            # reconciliation can clean it safely.
             return False
 
-        chat = await bot.get_chat(chat_id=int(source.chat_id))
-        pinned = getattr(chat, "pinned_message", None)
-        message_id = getattr(pinned, "message_id", None)
-        if message_id is None:
-            return False
-        author = getattr(pinned, "from_user", None)
-        pinned_thread_id = getattr(pinned, "message_thread_id", None)
-        if (
-            not getattr(author, "is_bot", False)
-            or str(pinned_thread_id or "") != str(source.thread_id or "")
-        ):
-            return False
-
-        pinned_text = (
-            getattr(pinned, "text", None)
-            or getattr(pinned, "caption", None)
-            or ""
-        )
         from gateway.todo_progress import without_delegated_section
 
         remaining = without_delegated_section(pinned_text)
         if remaining is None:
             return False
 
-        pin_key = (str(source.chat_id), str(source.thread_id or ""))
-        message_id_text = str(message_id)
-        if remaining:
-            result = await adapter.edit_message(
+        def _still_owned() -> bool:
+            return bool(
+                self._pinned_todo_messages.get(pin_key) == message_id
+                and self._pinned_todo_texts.get(pin_key) == pinned_text
+                and self._pinned_todo_adapters.get(pin_key) is adapter
+                and self._pinned_todo_revisions.get(pin_key) == revision
+            )
+
+        todo_pin_lock = self._todo_pin_locks.setdefault(pin_key, asyncio.Lock())
+        async with todo_pin_lock:
+            # A newer checklist revision wins and this completion becomes a
+            # harmless no-op before any provider mutation begins.
+            if not _still_owned():
+                return False
+
+            message_id_text = str(message_id)
+            if remaining:
+                result = await adapter.edit_message(
+                    chat_id=str(source.chat_id),
+                    message_id=message_id_text,
+                    content=remaining,
+                )
+                if result is None or not getattr(result, "success", False):
+                    return False
+                if _still_owned():
+                    self._pinned_todo_texts[pin_key] = remaining
+                    self._pinned_todo_revisions[pin_key] = revision + 1
+                return True
+
+            bot = getattr(adapter, "_bot", None)
+            if bot is None or not hasattr(bot, "unpin_chat_message"):
+                return False
+            unpinned = await bot.unpin_chat_message(
+                chat_id=int(source.chat_id),
+                message_id=message_id,
+            )
+            if unpinned is False:
+                return False
+            deleted = await adapter.delete_message(
                 chat_id=str(source.chat_id),
                 message_id=message_id_text,
-                content=remaining,
             )
-            return bool(result is not None and getattr(result, "success", False))
-
-        if not hasattr(bot, "unpin_chat_message"):
-            return False
-        unpinned = await bot.unpin_chat_message(
-            chat_id=int(source.chat_id),
-            message_id=message_id,
-        )
-        if unpinned is False:
-            return False
-        deleted = await adapter.delete_message(
-            chat_id=str(source.chat_id),
-            message_id=message_id_text,
-        )
-        if deleted:
-            if str(self._pinned_todo_messages.get(pin_key)) == message_id_text:
+            if deleted and _still_owned():
                 self._pinned_todo_messages.pop(pin_key, None)
-            return True
-        return False
+                self._pinned_todo_texts.pop(pin_key, None)
+                self._pinned_todo_adapters.pop(pin_key, None)
+                self._pinned_todo_revisions.pop(pin_key, None)
+                return True
+            return False
 
     def _enrich_async_delegation_routing(self, evt: dict) -> None:
         """Fill platform/chat_id/thread_id/chat_type on an async-delegation event.
