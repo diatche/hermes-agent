@@ -8,6 +8,7 @@ module performs no I/O and never mutates conversation history.
 from __future__ import annotations
 
 import json
+import re
 from collections import OrderedDict
 from typing import Any, Mapping
 
@@ -19,6 +20,56 @@ _STATUS_ICONS = {
     "cancelled": "🚫",
 }
 _DELEGATED_GOAL_MAX_CHARS = 80
+_DELEGATED_COUNT_LINE_RE = re.compile(
+    r"^(?:Waiting on [1-9]\d* delegated tasks?|Delegated [1-9]\d* tasks?) 🤖$"
+)
+_TODO_HEADING_RE = re.compile(
+    r"^(?:Working on [1-9]\d*(?: remaining)? tasks?|All tasks complete):$"
+)
+_TODO_ITEM_PREFIXES = tuple(f"{icon} " for icon in _STATUS_ICONS.values())
+
+
+def _is_rendered_todo_section(lines: list[str]) -> bool:
+    return bool(
+        len(lines) >= 3
+        and _TODO_HEADING_RE.fullmatch(lines[0])
+        and lines[1] == ""
+        and all(line.startswith(_TODO_ITEM_PREFIXES) for line in lines[2:])
+    )
+
+
+def without_delegated_section(text: str) -> str | None:
+    """Remove a renderer-owned delegated suffix from checklist text.
+
+    Returns the remaining ordinary checklist, ``""`` for a delegated-only
+    message, and ``None`` when *text* is not one of our delegated renderings.
+    The legacy ``Delegated N tasks`` shape remains recognised so pins created
+    before the wording change can still clean themselves up.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+
+    lines = text.splitlines()
+    if lines and _DELEGATED_COUNT_LINE_RE.fullmatch(lines[-1]):
+        remaining_lines = lines[:-1]
+        while remaining_lines and not remaining_lines[-1]:
+            remaining_lines.pop()
+        if remaining_lines and not _is_rendered_todo_section(remaining_lines):
+            return None
+        return "\n".join(remaining_lines)
+
+    try:
+        marker_index = lines.index("🤖 Delegated tasks")
+    except ValueError:
+        return None
+    if any(not line.startswith("↳ ") for line in lines[marker_index + 1 :]):
+        return None
+    remaining_lines = lines[:marker_index]
+    while remaining_lines and not remaining_lines[-1]:
+        remaining_lines.pop()
+    if remaining_lines and not _is_rendered_todo_section(remaining_lines):
+        return None
+    return "\n".join(remaining_lines)
 
 
 class TodoChecklist:
@@ -124,7 +175,7 @@ class TodoChecklist:
             if self._delegated_tasks == "count":
                 count = len(self._delegated)
                 noun = "task" if count == 1 else "tasks"
-                lines.append(f"Delegated {count} {noun} 🤖")
+                lines.append(f"Waiting on {count} delegated {noun} 🤖")
             elif self._delegated_tasks == "goal":
                 lines.append("🤖 Delegated tasks")
                 lines.extend(f"↳ {_truncate_goal(goal)}" for goal in self._delegated)

@@ -2065,7 +2065,7 @@ async def test_run_agent_renders_live_todo_checklist_when_tool_progress_off(monk
     assert "🔄 Run tests" in final_checklist
     assert final_checklist.index("🔄 Run tests") < final_checklist.index("✅ Inspect configuration")
     assert final_checklist.index("✅ Inspect configuration") < final_checklist.index("✅ Implement checklist")
-    assert "Delegated 2 tasks 🤖" in final_checklist
+    assert "Waiting on 2 delegated tasks 🤖" in final_checklist
     assert "↳ Review gateway integration" not in final_checklist
     assert "should stay hidden" not in "\n".join(contents)
     assert len(adapter.edits) == 2, (
@@ -2230,6 +2230,8 @@ async def test_telegram_todo_pin_removes_stale_bot_checklists_but_keeps_user_pin
         "All tasks complete:\n\n✅ Verify the implementation",
         "Delegated 1 task 🤖",
         "Delegated 2 tasks 🤖",
+        "Waiting on 1 delegated task 🤖",
+        "Waiting on 2 delegated tasks 🤖",
         "🤖 Delegated tasks\n↳ Review the implementation",
     ],
 )
