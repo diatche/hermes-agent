@@ -4360,9 +4360,6 @@ def _normalize_managed_eol(git_cmd, repo_root):
         # Never let line-ending cleanup block an update.
         pass
 
-def _is_windows() -> bool:
-    """Return whether updater lifecycle semantics are running on Windows."""
-    return sys.platform == "win32"
 
 def _desktop_app_present(desktop_dir: Path) -> bool:
     """Return whether a packaged or source Desktop build exists."""
@@ -4443,10 +4440,6 @@ def _rebuild_desktop_after_update(
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
-    if getattr(args, "no_gateway_restart", False) and _is_windows():
-        print("✗ --no-gateway-restart is only supported with an external POSIX supervisor")
-        sys.exit(2)
-
     # A managed-runtime refresh can replace site-packages before the normal
     # ``.[all]`` install runs. Snapshot while the old environment can still
     # prove which optional backends the user had activated.
@@ -5744,10 +5737,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _exit_code_path.write_text("0", encoding="utf-8")
             except OSError:
                 pass
-
-        if getattr(args, "no_gateway_restart", False):
-            print("→ Gateway/dashboard restart skipped for external maintenance supervisor")
-            return
 
         gateway_fleet_restart_incomplete = False
         # Snapshot of gateways running before we touch anything. Stays empty
