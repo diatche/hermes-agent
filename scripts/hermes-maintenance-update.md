@@ -59,14 +59,16 @@ The printed command is equivalent to:
 
 ```bash
 cd ~/.hermes/hermes-agent && \
-  ./venv/bin/hermes update --branch main --no-backup --yes --no-gateway-restart
+  ./venv/bin/hermes update --branch main --no-backup --yes
 ```
 
 Run it directly. Its stdout/stderr and any terminal interaction are therefore
 visible and connected to your terminal rather than captured by the maintenance
 wrapper. The official updater remains unchanged: it advances `main` to the
-the upstream tip it observes and performs its ordinary dependency, asset, migration,
-cache, and managed-component synchronization.
+upstream tip it observes and performs its ordinary dependency, asset, migration,
+cache, and managed-component synchronization. The custom wrapper is already
+stopped, and the current official updater does not relaunch it; lifecycle
+ownership returns to the maintenance script in the post step.
 
 ### 3. Run the printed post command
 

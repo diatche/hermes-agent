@@ -74,7 +74,7 @@ import sentence_transformers
 import transformers
 """
 OFFICIAL_UPDATE_ARGUMENTS = ("update", "--branch", "main")
-OFFICIAL_UPDATE_SUFFIX = ("--no-backup", "--yes", "--no-gateway-restart")
+OFFICIAL_UPDATE_SUFFIX = ("--no-backup", "--yes")
 
 
 class UpdateTarget(NamedTuple):

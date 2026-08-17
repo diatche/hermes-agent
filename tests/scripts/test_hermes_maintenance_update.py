@@ -398,9 +398,9 @@ def test_pre_stops_runtime_prints_handoff_and_never_runs_updater(tmp_path: Path)
     state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
     assert f"cd {repo}" in result.stdout
     assert (
-        f"{repo}/venv/bin/hermes update --branch main --no-backup --yes "
-        "--no-gateway-restart"
+        f"{repo}/venv/bin/hermes update --branch main --no-backup --yes"
     ) in result.stdout
+    assert "--no-gateway-restart" not in result.stdout
     assert "--revision" not in result.stdout
     assert f"{SCRIPT} --post" in result.stdout
     assert state["phase"] == "awaiting-official-update"
