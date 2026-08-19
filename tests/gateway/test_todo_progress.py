@@ -50,6 +50,25 @@ def test_completed_tasks_use_completion_heading():
     )
 
 
+def test_cancelled_tasks_render_after_active_tasks_with_terminal_results():
+    checklist = TodoChecklist()
+
+    rendered = checklist.update_from_result(_result([
+        {"id": "cancelled", "content": "Abandon obsolete approach", "status": "cancelled"},
+        {"id": "active", "content": "Implement safer approach", "status": "in_progress"},
+        {"id": "completed", "content": "Inspect configuration", "status": "completed"},
+        {"id": "pending", "content": "Run tests", "status": "pending"},
+    ]))
+
+    assert rendered == (
+        "Working on 2 remaining tasks:\n\n"
+        "🔄 Implement safer approach\n"
+        "⬜ Run tests\n"
+        "🚫 Abandon obsolete approach\n"
+        "✅ Inspect configuration"
+    )
+
+
 def test_empty_authoritative_result_clears_visible_tasks():
     checklist = TodoChecklist()
     checklist.update_from_result(_result([

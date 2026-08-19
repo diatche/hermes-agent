@@ -19,6 +19,7 @@ _STATUS_ICONS = {
     "completed": "✅",
     "cancelled": "🚫",
 }
+_TERMINAL_STATUSES = {"completed", "cancelled"}
 _DELEGATED_GOAL_MAX_CHARS = 80
 _DELEGATED_COUNT_LINE_RE = re.compile(
     r"^(?:Waiting on [1-9]\d* delegated tasks?|Delegated [1-9]\d* tasks?) 🤖$"
@@ -153,20 +154,26 @@ class TodoChecklist:
 
         lines: list[str] = []
         if self._items:
-            active = [item for item in self._items.values() if item["status"] != "completed"]
-            completed = [item for item in self._items.values() if item["status"] == "completed"]
+            active = [
+                item for item in self._items.values()
+                if item["status"] not in _TERMINAL_STATUSES
+            ]
+            finished = [
+                item for item in self._items.values()
+                if item["status"] in _TERMINAL_STATUSES
+            ]
             count = len(active)
             noun = "task" if count == 1 else "tasks"
             if not active:
                 heading = "All tasks complete:"
-            elif completed:
+            elif finished:
                 heading = f"Working on {count} remaining {noun}:"
             else:
                 heading = f"Working on {count} {noun}:"
             lines = [heading, ""]
             lines.extend(
                 f"{_STATUS_ICONS[item['status']]} {item['content']}"
-                for item in (*active, *completed)
+                for item in (*active, *finished)
             )
 
         if self._delegated:
