@@ -483,6 +483,10 @@ export interface GatewayEventHandlerContext {
     setCatalog: StateSetter<null | SlashCatalog>
   }
   submission: {
+    /** Submit text literally as a prompt — no slash/!/interpolation dispatch.
+     *  Used for `-q` startup queries, which are arbitrary launcher-provided
+     *  text (parity with one-shot's literal prompt handling). */
+    submitLiteralRef: MutableRefObject<(value: string) => void>
     submitRef: MutableRefObject<(value: string) => void>
   }
   system: {
@@ -552,6 +556,7 @@ export interface SlashHandlerContext {
 export interface AppLayoutActions {
   answerApproval: (choice: string) => void
   answerClarify: (answer: string) => void
+  answerClarifyQuestion: (qid: string, answer: string) => void
   answerSecret: (value: string) => void
   answerSudo: (pw: string) => void
   clearSelection: () => void
@@ -619,6 +624,7 @@ export interface AppOverlaysProps {
   completions: CompletionItem[]
   onApprovalChoice: (choice: string) => void
   onClarifyAnswer: (value: string) => void
+  onClarifyQuestionAnswer: (qid: string, value: string) => void
   onActiveSessionSelect: (sessionId: string) => void
   onActiveSessionClose: (sessionId: string) => Promise<null | SessionCloseResponse>
   onModelSelect: (value: string) => void
