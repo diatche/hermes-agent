@@ -11,7 +11,9 @@ module-level constants live in hermes_state_common.
 import logging
 import json
 import sqlite3
-from typing import Dict, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
+
+from agent.state_compaction import archive_and_compact as _bounded_archive_and_compact
 
 from hermes_constants import get_hermes_home
 from hermes_state_common import (
@@ -97,6 +99,15 @@ def schema_read_probe_statements() -> tuple:
 
 class SessionSchemaMixin:
     """See module docstring — mixin for SessionDB (Schema cluster)."""
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Install bounded publication while retaining the legacy fallback."""
+        super().__init_subclass__(**kwargs)
+        historical = cls.__dict__.get("archive_and_compact")
+        if historical is None:
+            return
+        cls._archive_and_compact_legacy = historical
+        cls.archive_and_compact = _bounded_archive_and_compact
 
     def _dedupe_legacy_system_prompts(self, cursor: sqlite3.Cursor) -> None:
         """Move inline prompt snapshots into the shared content-addressed table.
