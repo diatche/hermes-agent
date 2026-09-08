@@ -890,7 +890,7 @@ class _EmbeddedCuaDaemon:
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
-                    timeout=2.0,
+                    timeout=5.0,
                     env=env,
                 )
             except (OSError, subprocess.SubprocessError):
