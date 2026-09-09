@@ -192,9 +192,8 @@ def corrupt_db(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_strategies_never_receive_the_live_database(corrupt_db, monkeypatch):
-    """Every strategy mutates its argument in place, so the property that
-    makes them safe is simply that the argument is never the real file."""
+def test_unverifiable_canonical_database_never_reaches_strategies(corrupt_db, monkeypatch):
+    """Repair cannot safely mutate even scratch when preservation is unprovable."""
     seen: list[Path] = []
     real = hermes_state._run_repair_strategies
 
@@ -205,10 +204,7 @@ def test_strategies_never_receive_the_live_database(corrupt_db, monkeypatch):
     monkeypatch.setattr(hermes_state, "_run_repair_strategies", spy)
     repair_state_db_schema(corrupt_db)
 
-    assert seen, "the repair path did not run at all"
-    for path in seen:
-        assert path != corrupt_db
-        assert path.name.endswith(".repair-scratch")
+    assert seen == []
 
 
 # ---------------------------------------------------------------------------
@@ -259,12 +255,13 @@ def test_successful_repair_is_promoted_over_the_original(tmp_path, monkeypatch):
     # Force the "already healthy" short-circuit off so the staging path runs,
     # and have the strategy pass mark a repair after writing a marker row.
     monkeypatch.setattr(
-        hermes_state, "_db_opens_cleanly", lambda path: "forced-unhealthy"
+        hermes_state, "_db_opens_cleanly", lambda path, **_kwargs: "forced-unhealthy"
     )
 
     def fake_strategies(scratch_path, report):
         conn = sqlite3.connect(str(scratch_path))
-        conn.execute("INSERT INTO sessions (name) VALUES ('healed-on-scratch')")
+        conn.execute("CREATE TABLE repair_marker(value TEXT)")
+        conn.execute("INSERT INTO repair_marker VALUES ('healed-on-scratch')")
         conn.commit()
         conn.close()
         report["repaired"] = True
@@ -278,7 +275,7 @@ def test_successful_repair_is_promoted_over_the_original(tmp_path, monkeypatch):
 
     conn = sqlite3.connect(str(db))
     try:
-        names = [r[0] for r in conn.execute("SELECT name FROM sessions")]
+        names = [r[0] for r in conn.execute("SELECT value FROM repair_marker")]
     finally:
         conn.close()
     assert "healed-on-scratch" in names, (
@@ -303,7 +300,7 @@ def test_committed_writer_after_staging_is_never_lost(
     _make_repair_test_db(db, journal_mode=journal_mode)
 
     monkeypatch.setattr(
-        hermes_state, "_db_opens_cleanly", lambda _path: "forced-unhealthy"
+        hermes_state, "_db_opens_cleanly", lambda _path, **_kwargs: "forced-unhealthy"
     )
     ready = multiprocessing.get_context("spawn").Event()
     start = multiprocessing.get_context("spawn").Event()
@@ -317,9 +314,8 @@ def test_committed_writer_after_staging_is_never_lost(
 
     def staged_strategy(scratch_path, report):
         with sqlite3.connect(str(scratch_path)) as conn:
-            conn.execute(
-                "INSERT INTO sessions (name) VALUES ('repaired-before-race')"
-            )
+            conn.execute("CREATE TABLE repair_marker(value TEXT)")
+            conn.execute("INSERT INTO repair_marker VALUES ('repaired-before-race')")
             conn.commit()
         start.set()
         # Make the race deterministic: an unguarded implementation lets the
@@ -345,9 +341,7 @@ def test_committed_writer_after_staging_is_never_lost(
         rows = {
             body for (body,) in conn.execute("SELECT body FROM messages")
         }
-        names = {
-            name for (name,) in conn.execute("SELECT name FROM sessions")
-        }
+        names = {name for (name,) in conn.execute("SELECT value FROM repair_marker")}
     assert "repaired-before-race" in names
     if outcome == "committed":
         assert "committed-after-stage" in rows, (
@@ -361,7 +355,7 @@ def test_environmental_aborts_do_not_burn_repair_ledger(tmp_path, monkeypatch):
     db = tmp_path / "state.db"
     _make_repair_test_db(db)
     monkeypatch.setattr(
-        hermes_state, "_db_opens_cleanly", lambda _path: "forced-unhealthy"
+        hermes_state, "_db_opens_cleanly", lambda _path, **_kwargs: "forced-unhealthy"
     )
     monkeypatch.setattr(
         hermes_state,
@@ -380,9 +374,6 @@ def test_environmental_aborts_do_not_burn_repair_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(hermes_state, "_repair_scratch_space_error", lambda _path: None)
 
     def successful_strategy(scratch_path, report):
-        with sqlite3.connect(str(scratch_path)) as conn:
-            conn.execute("INSERT INTO sessions (name) VALUES ('after-aborts')")
-            conn.commit()
         report["repaired"] = True
         report["strategy"] = "after_environmental_aborts"
         return report
@@ -397,7 +388,7 @@ def test_actual_strategy_failure_still_consumes_one_attempt(tmp_path, monkeypatc
     db = tmp_path / "state.db"
     _make_repair_test_db(db)
     monkeypatch.setattr(
-        hermes_state, "_db_opens_cleanly", lambda _path: "forced-unhealthy"
+        hermes_state, "_db_opens_cleanly", lambda _path, **_kwargs: "forced-unhealthy"
     )
 
     def failed_strategy(_scratch_path, report):
@@ -419,7 +410,7 @@ def test_repair_outcome_is_recorded_while_cross_process_lock_is_held(
     db = tmp_path / "state.db"
     _make_repair_test_db(db)
     monkeypatch.setattr(
-        hermes_state, "_db_opens_cleanly", lambda _path: "forced-unhealthy"
+        hermes_state, "_db_opens_cleanly", lambda _path, **_kwargs: "forced-unhealthy"
     )
 
     def failed_strategy(_scratch_path, report):
@@ -536,7 +527,7 @@ def test_environmental_promotion_failures_do_not_burn_ledger(
     db = tmp_path / "state.db"
     _make_repair_test_db(db)
     monkeypatch.setattr(
-        hermes_state, "_db_opens_cleanly", lambda _path: "forced-unhealthy"
+        hermes_state, "_db_opens_cleanly", lambda _path, **_kwargs: "forced-unhealthy"
     )
 
     def successful_strategy(_scratch_path, report):
@@ -577,7 +568,7 @@ def test_corrupt_promotion_failure_consumes_one_attempt(tmp_path, monkeypatch):
     db = tmp_path / "state.db"
     _make_repair_test_db(db)
     monkeypatch.setattr(
-        hermes_state, "_db_opens_cleanly", lambda _path: "forced-unhealthy"
+        hermes_state, "_db_opens_cleanly", lambda _path, **_kwargs: "forced-unhealthy"
     )
 
     def successful_strategy(_scratch_path, report):
@@ -646,7 +637,7 @@ def test_failed_wal_repair_preserves_committed_rows_semantically(
         pytest.skip("SQLite/filesystem did not retain a hot WAL sidecar")
 
     monkeypatch.setattr(
-        hermes_state, "_db_opens_cleanly", lambda _path: "forced-unhealthy"
+        hermes_state, "_db_opens_cleanly", lambda _path, **_kwargs: "forced-unhealthy"
     )
 
     strategy_calls = []
@@ -768,7 +759,7 @@ def test_failed_promotion_returns_failure_and_preserves_original(tmp_path, monke
         return report
 
     monkeypatch.setattr(
-        hermes_state, "_db_opens_cleanly", lambda _path: "forced-unhealthy"
+        hermes_state, "_db_opens_cleanly", lambda _path, **_kwargs: "forced-unhealthy"
     )
     monkeypatch.setattr(hermes_state, "_copy_database_snapshot", fail_second_copy)
     monkeypatch.setattr(hermes_state, "_run_repair_strategies", fake_strategies)
@@ -803,7 +794,7 @@ def test_stale_scratch_is_removed_before_health_check(tmp_path, monkeypatch):
     scratch.write_bytes(b"crash debris" * 1000)
     checks: list[str] = []
 
-    def fake_health(_path):
+    def fake_health(_path, **_kwargs):
         checks.append("health")
         assert not scratch.exists()
         return None
@@ -826,7 +817,7 @@ def test_stale_scratch_is_removed_before_space_check(tmp_path, monkeypatch):
     checked_space = False
 
     monkeypatch.setattr(
-        hermes_state, "_db_opens_cleanly", lambda _path: "forced-unhealthy"
+        hermes_state, "_db_opens_cleanly", lambda _path, **_kwargs: "forced-unhealthy"
     )
 
     def fake_space_check(_path):
@@ -852,7 +843,7 @@ def test_stale_scratch_cleanup_failure_aborts_before_probe(tmp_path, monkeypatch
     _write_populated_db(db)
     probed = False
 
-    def fake_health(_path):
+    def fake_health(_path, **_kwargs):
         nonlocal probed
         probed = True
         return "forced-unhealthy"

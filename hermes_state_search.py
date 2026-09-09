@@ -751,6 +751,29 @@ class SessionSearchMixin:
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
         vacuum: bool = True,
     ) -> Dict[str, Any]:
+        """Run structural FTS migration only with retained offline ownership."""
+        if not self._fts_enabled:
+            return {"ok": False, "reason": "fts5_unavailable"}
+        if self.read_only:
+            return {"ok": False, "reason": "read_only"}
+        try:
+            with self._structural_maintenance_guard():
+                return self._optimize_fts_storage_locked(
+                    progress_cb=progress_cb, vacuum=vacuum
+                )
+        except RuntimeError as exc:
+            return {
+                "ok": False,
+                "reason": "structural_maintenance_requires_exclusive_access",
+                "error": str(exc),
+            }
+
+    def _optimize_fts_storage_locked(
+        self,
+        *,
+        progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+        vacuum: bool = True,
+    ) -> Dict[str, Any]:
         """Migrate a legacy v22 inline-FTS DB to the v23 external-content
         schema, foreground and to completion. Safe to re-run: if a previous
         attempt was interrupted it resumes from the progress marker.
@@ -1615,6 +1638,25 @@ class SessionSearchMixin:
             self._trigram_available = False
             self._fts_cjk_available = False
 
+    def _degrade_fts_search(self, exc: sqlite3.DatabaseError) -> None:
+        """Disable FTS for this handle after a MATCH-path database failure.
+
+        This is deliberately in-memory only. A read path may fall back to the
+        canonical ``messages`` table, but it may not write repair markers,
+        rebuild an index, or alter live schema. If the error is actually
+        generic structural corruption the canonical LIKE query will fail too
+        and propagate, preserving fail-closed behavior.
+        """
+        self._fts_stale = True
+        self._fts_enabled = False
+        self._trigram_available = False
+        self._fts_cjk_available = False
+        logger.warning(
+            "FTS search failed (%s); disabling FTS for this connection and "
+            "falling back to canonical LIKE search. No repair was attempted.",
+            exc,
+        )
+
     def _finalize_search_matches(
         self,
         matches: List[Dict[str, Any]],
@@ -1943,30 +1985,7 @@ class SessionSearchMixin:
                         "trigram/LIKE", exc_info=True,
                     )
                 except sqlite3.DatabaseError as exc:
-                    # Same corruption class as the other FTS reads: rebuild
-                    # in place once and retry; on refusal/failure fall back.
-                    if self._try_runtime_fts_rebuild(exc):
-                        try:
-                            with self._read_ctx() as conn:
-                                cjk_cursor = conn.execute(
-                                    cjk_sql, cjk_params
-                                )
-                                matches = [
-                                    dict(row) for row in cjk_cursor.fetchall()
-                                ]
-                                _trigram_succeeded = True
-                        except sqlite3.DatabaseError:
-                            logger.warning(
-                                "CJK-bigram FTS search still failing after "
-                                "in-place rebuild; falling back to "
-                                "trigram/LIKE."
-                            )
-                    else:
-                        logger.warning(
-                            "CJK-bigram FTS search hit a corruption error "
-                            "(%s) and no in-place rebuild was possible; "
-                            "falling back to trigram/LIKE.", exc,
-                        )
+                    self._degrade_fts_search(exc)
 
             if (
                 not _trigram_succeeded
@@ -2027,90 +2046,20 @@ class SessionSearchMixin:
                     # Trigram query failed at runtime — fall through to LIKE.
                     pass
                 except sqlite3.DatabaseError as exc:
-                    # Same corruption class the main FTS5 MATCH branch
-                    # self-heals above: a corrupt trigram shadow table raises
-                    # malformed / "fts5: corrupt structure record", which is a
-                    # DatabaseError (parent of the OperationalError syntax arm
-                    # caught first). Rebuild once outside the lock — the lock
-                    # is released here so rebuild_fts() can re-acquire it —
-                    # and retry the trigram query. If the rebuild is refused
-                    # (already attempted / FTS disabled / different error
-                    # class) or the retry fails again, fall through to the
-                    # LIKE substring path, which reads only the canonical
-                    # messages table, so CJK search stays available.
-                    if self._try_runtime_fts_rebuild(exc):
-                        try:
-                            with self._read_ctx() as conn:
-                                tri_cursor = conn.execute(
-                                    tri_sql, tri_params
-                                )
-                                matches = [
-                                    dict(row) for row in tri_cursor.fetchall()
-                                ]
-                                _trigram_succeeded = True
-                        except sqlite3.DatabaseError:
-                            logger.warning(
-                                "Trigram FTS search still failing after "
-                                "in-place rebuild; falling back to LIKE."
-                            )
-                    else:
-                        logger.warning(
-                            "Trigram FTS search hit a corruption error (%s) "
-                            "and no in-place rebuild was possible; falling "
-                            "back to LIKE.", exc,
-                        )
+                    self._degrade_fts_search(exc)
             if not _trigram_succeeded:
-                # Short / mixed CJK query, trigram unavailable, or trigram
-                # <3 CJK chars. Fall back to LIKE substring search.
-                # For multi-token OR queries (e.g. "广西 OR 桂林 OR 漓江"),
-                # build one LIKE condition per non-operator token so each term
-                # is matched independently (#20494).
-                non_op_tokens = [
-                    t for t in raw_query.split()
-                    if t.upper() not in {"AND", "OR", "NOT"}
-                ] or [raw_query]
-                token_clauses = []
-                like_params: list = []
-                for tok in non_op_tokens:
-                    esc = _escape_like(tok)
-                    token_clauses.append(
-                        "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
-                    )
-                    like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
-                like_where = [f"({' OR '.join(token_clauses)})"]
-                if not include_inactive:
-                    # Same visibility rule as the FTS5 paths: live rows and
-                    # compaction-archived rows are discoverable; rewind/undo
-                    # rows (active=0, compacted=0) are hidden (#38763).
-                    like_where.append("(m.active = 1 OR m.compacted = 1)")
-                if source_filter is not None:
-                    like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
-                    like_params.extend(source_filter)
-                if exclude_sources is not None:
-                    like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
-                    like_params.extend(exclude_sources)
-                if role_filter:
-                    like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
-                    like_params.extend(role_filter)
-                like_sql = f"""
-                    SELECT m.id, m.session_id, m.role,
-                           substr(m.content,
-                                  max(1, instr(m.content, ?) - 40),
-                                  120) AS snippet,
-                           m.timestamp, m.tool_name,
-                           s.source, s.model, s.started_at AS session_started
-                    FROM messages m
-                    JOIN sessions s ON s.id = m.session_id
-                    WHERE {' AND '.join(like_where)}
-                    ORDER BY m.timestamp DESC
-                    LIMIT ? OFFSET ?
-                """
-                like_params.extend([limit, offset])
-                # instr() for snippet uses first search token
-                like_params = [non_op_tokens[0]] + like_params
-                with self._read_ctx() as conn:
-                    like_cursor = conn.execute(like_sql, like_params)
-                    matches = [dict(row) for row in like_cursor.fetchall()]
+                # All CJK fallback entries, including the first query that
+                # discovers corruption, use the canonical Boolean compiler.
+                matches = self._search_messages_like_fallback(
+                    query,
+                    source_filter=source_filter,
+                    exclude_sources=exclude_sources,
+                    role_filter=role_filter,
+                    limit=limit,
+                    offset=offset,
+                    sort=sort,
+                    include_inactive=include_inactive,
+                )
         else:
             try:
                 with self._read_ctx() as conn:
@@ -2120,19 +2069,20 @@ class SessionSearchMixin:
                 # FTS5 query syntax error despite sanitization — return empty
                 return []
             except sqlite3.DatabaseError as exc:
-                # A corrupt FTS index raises the malformed / "fts5: corrupt
-                # structure record" class on the MATCH read, the same class the
-                # write path self-heals (#66296). OperationalError (query
-                # syntax) is a subclass caught above; this arm is the corruption
-                # parent. Rebuild the index in place once — the read context
-                # holds no writer lock, so rebuild_fts() can acquire it — and
-                # retry, so search self-heals for read-only sessions (cron/CLI
-                # history search) that never trigger a write to repair it first.
-                if not self._try_runtime_fts_rebuild(exc):
-                    raise
-                with self._read_ctx() as conn:
-                    cursor = conn.execute(sql, params)
-                    matches = [dict(row) for row in cursor.fetchall()]
+                self._degrade_fts_search(exc)
+                matches = self._search_messages_like_fallback(
+                    query,
+                    source_filter=source_filter,
+                    exclude_sources=exclude_sources,
+                    role_filter=role_filter,
+                    limit=limit,
+                    offset=offset,
+                    sort=sort,
+                    include_inactive=include_inactive,
+                )
+                return self._finalize_search_matches(
+                    matches, result_fields=result_fields
+                )
 
         # Deferred-rebuild supplement (schema v23): while the background
         # backfill is pending, the FTS indexes only cover rows outside the
@@ -2413,30 +2363,31 @@ class SessionSearchMixin:
         Safe to call when FTS tables don't exist (skips them).
         Returns the number of FTS indexes that were rebuilt.
         """
-        rebuilt = 0
-        with fts_rebuild_admission(getattr(self, "db_path", None)) as admitted:
-            if not admitted:
-                logger.warning(
-                    "Deferred in-place FTS rebuild: another process holds "
-                    "the rebuild authority for this state.db."
-                )
-                return 0
-            with self._lock:
-                for tbl in self._FTS_TABLES:
-                    if not self._fts_table_exists(tbl):
-                        continue
-                    try:
-                        self._conn.execute(
-                            f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')"
-                        )
-                        self._conn.commit()
-                        rebuilt += 1
-                    except sqlite3.OperationalError as exc:
-                        self._conn.rollback()
-                        logger.warning(
-                            "FTS rebuild failed for %s: %s", tbl, exc
-                        )
-        return rebuilt
+        with self._structural_maintenance_guard():
+            rebuilt = 0
+            with fts_rebuild_admission(getattr(self, "db_path", None)) as admitted:
+                if not admitted:
+                    logger.warning(
+                        "Deferred in-place FTS rebuild: another process holds "
+                        "the rebuild authority for this state.db."
+                    )
+                    return 0
+                with self._lock:
+                    for tbl in self._FTS_TABLES:
+                        if not self._fts_table_exists(tbl):
+                            continue
+                        try:
+                            self._conn.execute(
+                                f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')"
+                            )
+                            self._conn.commit()
+                            rebuilt += 1
+                        except sqlite3.OperationalError as exc:
+                            self._conn.rollback()
+                            logger.warning(
+                                "FTS rebuild failed for %s: %s", tbl, exc
+                            )
+            return rebuilt
 
     def _merge_fts_incrementally(
         self, *, max_pages: int, max_commands: Optional[int] = None

@@ -98,6 +98,12 @@ def _no_fts_rebuild_throttle(monkeypatch):
     monkeypatch.setattr(SessionDB, "_FTS_REBUILD_DUTY_FACTOR", 0.0)
 
 
+@pytest.fixture()
+def no_foreign_state_db_holders(monkeypatch):
+    """Declare the test's private temp database free of foreign holders."""
+    monkeypatch.setattr(SessionDB, "_foreign_state_db_holders", lambda _self: [])
+
+
 # =========================================================================
 # Connection lifecycle
 # =========================================================================
@@ -276,7 +282,17 @@ class TestConnectionLifecycle:
 
         assert has_live_connection(db_path) is False
 
-        # The writable heal must still take its forensic backup.
+        # Writable startup may prepare a candidate but must not promote it.
+        with pytest.raises(sqlite3.DatabaseError):
+            SessionDB(db_path=db_path, read_only=False)
+        assert list(tmp_path.glob("state.db.repair-candidate-*"))
+
+        # Explicit operator repair retains the offline promotion path and
+        # must still take its forensic backup.
+        from hermes_state import repair_state_db_schema
+
+        report = repair_state_db_schema(db_path)
+        assert report["repaired"] is True
         healed = SessionDB(db_path=db_path, read_only=False)
         healed.close()
         assert list(tmp_path.glob("*malformed-backup*"))
@@ -826,6 +842,11 @@ class TestFTS5Search:
             traced_connections.append(read_conn)
         for conn in traced_connections:
             conn.set_trace_callback(statements.append)
+        if read_conn is not db._conn:
+            # Make the traced reader available to the query under test. Merely
+            # opening it leaves it checked out, causing search to open a second
+            # untraced pool connection when the pool size exceeds one.
+            db._read_pool.put_nowait(read_conn)
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
@@ -2115,12 +2136,7 @@ class TestFtsRebuildLoopWithoutTrigram:
             db.close()
 
     def test_missing_base_trigger_still_repairs_once(self, tmp_path, monkeypatch):
-        """Control: narrowing the gate must not disable genuine repair.
-
-        A base trigger really can go missing (an earlier no-FTS5 runtime drops
-        them to keep writes alive), and rows written meanwhile are absent from
-        the index. That still has to be repaired — once, and then converge.
-        """
+        """A populated DB with a missing base trigger fails startup closed."""
         db_path = tmp_path / "state.db"
         statements = []
         self._trace(monkeypatch, statements, trigram=False)
@@ -2135,33 +2151,14 @@ class TestFtsRebuildLoopWithoutTrigram:
             db.close()
 
         statements.clear()
-        db = SessionDB(db_path=db_path)
-        try:
-            assert len(self._rebuilds(statements)) == 1
-            assert db._conn.execute(
-                "SELECT COUNT(*) FROM sqlite_master "
-                "WHERE type = 'trigger' AND name = 'messages_fts_insert'"
-            ).fetchone()[0] == 1
-        finally:
-            db.close()
-
-        # …and having repaired it, the next open is quiet again.
-        statements.clear()
-        db = SessionDB(db_path=db_path)
-        try:
-            assert self._rebuilds(statements) == []
-        finally:
-            db.close()
+        with pytest.raises(sqlite3.DatabaseError, match="refusing automatic"):
+            SessionDB(db_path=db_path)
+        assert self._rebuilds(statements) == []
 
     def test_missing_trigram_trigger_still_repairs_where_the_tokenizer_exists(
         self, tmp_path, monkeypatch
     ):
-        """Control: on a capable host a missing trigram trigger is real damage.
-
-        Only the permanently-unsatisfiable case changes. Where the trigram DDL
-        can run, a gap in those triggers means the index missed rows and must
-        still be rebuilt.
-        """
+        """A populated DB with a missing trigram trigger fails startup closed."""
         db_path = tmp_path / "state.db"
         statements = []
         self._trace(monkeypatch, statements, trigram=True)
@@ -2179,12 +2176,9 @@ class TestFtsRebuildLoopWithoutTrigram:
             db.close()
 
         statements.clear()
-        db = SessionDB(db_path=db_path)
-        try:
-            assert db._trigram_available is True
-            assert len(self._rebuilds(statements)) > 0
-        finally:
-            db.close()
+        with pytest.raises(sqlite3.DatabaseError, match="refusing automatic"):
+            SessionDB(db_path=db_path)
+        assert self._rebuilds(statements) == []
 
 
 class TestTitleUniqueness:
@@ -2902,6 +2896,7 @@ class TestStateMeta:
 
 
 
+@pytest.mark.usefixtures("no_foreign_state_db_holders")
 class TestVacuum:
     def test_vacuum_runs_without_error(self, db):
         """VACUUM must succeed on a fresh DB (no rows to reclaim)."""
@@ -3090,6 +3085,7 @@ class TestOptimizeFts:
 
 
 
+@pytest.mark.usefixtures("no_foreign_state_db_holders")
 class TestAutoMaintenance:
     def _make_old_ended(self, db, sid: str, days_old: int = 100):
         """Create a session that is ended and was started `days_old` days ago."""
@@ -3212,6 +3208,7 @@ class TestFTS5ToolCallIndexing:
 
 
 
+@pytest.mark.usefixtures("no_foreign_state_db_holders")
 class TestFTS5ToolCallMigration:
     """v11 migration: pre-existing state.db with old external-content FTS tables
     must be re-indexed so tool_name / tool_calls become searchable after upgrade."""
@@ -3319,6 +3316,7 @@ class TestFTS5ToolCallMigration:
             session_db.close()
 
 
+@pytest.mark.usefixtures("no_foreign_state_db_holders")
 class TestFTSExternalContentMigration:
     """v23 migration: inline-mode FTS tables (v11-v22) are rebuilt as
     external-content tables, and role='tool' rows are excluded from the
@@ -5034,6 +5032,7 @@ class TestInsightsToolCallIndex:
         assert "WHERE" in sql
         assert "role = 'assistant'" in sql
         assert "tool_calls IS NOT NULL" in sql
+@pytest.mark.usefixtures("no_foreign_state_db_holders")
 class TestFtsRebuildFinishWithoutTrigram:
     """An FTS index that the runtime cannot maintain must not wedge the store.
 

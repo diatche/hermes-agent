@@ -1547,14 +1547,16 @@ def _sessions_repair(_engine: HermesConsoleEngine, args: list[str]) -> str:
         if not db_path.exists():
             print(f"No session database at {db_path} (nothing to repair).")
             return
-        reason = _db_opens_cleanly(db_path)
+        reason = _db_opens_cleanly(db_path, require_repair_complete=True)
         if reason is None:
             print(f"{db_path} opens cleanly; no repair needed.")
             return
         print(f"{db_path} does not open cleanly: {reason}")
         if ns.check_only:
             return
-        report = repair_state_db_schema(db_path, backup=not ns.no_backup)
+        report = repair_state_db_schema(
+            db_path, backup=not ns.no_backup, promote=True
+        )
         if report.get("repaired"):
             if report.get("backup_path"):
                 print(f"backup: {report['backup_path']}")

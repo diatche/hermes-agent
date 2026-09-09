@@ -81,6 +81,30 @@ _HEADER_PAGE_COUNT_OFFSET = 28
 _live_lock = threading.RLock()
 # canonical path -> number of live connections opened by this process
 _live_connections: dict[str, int] = {}
+# Paths reserved for structural maintenance.  This is admission state, not
+# advisory bookkeeping: a late same-process opener is refused before its file
+# descriptor is created, closing the check/open race.
+_maintenance_reservations: set[str] = set()
+
+
+@contextlib.contextmanager
+def reserve_structural_maintenance(path: Path | str, *, expected_connections: int):
+    """Atomically reserve *path* if its tracked connection count is exact."""
+    key = _key(path)
+    with _live_lock:
+        actual = _live_connections.get(key, 0)
+        if key in _maintenance_reservations or actual != expected_connections:
+            raise RuntimeError(
+                "structural maintenance admission refused due to same-process "
+                "connection count: expected "
+                f"{expected_connections} open connection(s), found {actual}"
+            )
+        _maintenance_reservations.add(key)
+    try:
+        yield
+    finally:
+        with _live_lock:
+            _maintenance_reservations.discard(key)
 
 
 class UntrackableConnectionError(RuntimeError):
@@ -144,6 +168,19 @@ def has_live_connection(path: Path | str) -> bool:
     """Whether this process currently holds any connection to *path*."""
     with _live_lock:
         return _key(path) in _live_connections
+
+
+def live_connection_count(path: Path | str) -> int:
+    """Return this process's tracked connection count for *path*.
+
+    Structural SQLite maintenance needs a stronger answer than the boolean
+    byte-probe guard: a maintenance owner's own connection is expected, but a
+    second ``SessionDB`` (or a pooled reader) must make the operation refuse.
+    Keeping the count query beside the lifecycle registry makes that admission
+    decision use the same canonical path identity as connection tracking.
+    """
+    with _live_lock:
+        return _live_connections.get(_key(path), 0)
 
 
 class _TrackingMixin:
@@ -243,6 +280,11 @@ def connect_tracked(
     kwargs["factory"] = _tracking_factory(kwargs.get("factory", sqlite3.Connection))
 
     with _live_lock:
+        admission_key = _key(tracking_path if tracking_path is not None else path)
+        if admission_key in _maintenance_reservations:
+            raise sqlite3.OperationalError(
+                "database is reserved for structural maintenance"
+            )
         conn = opener(str(path), **kwargs)
         try:
             resolved = (

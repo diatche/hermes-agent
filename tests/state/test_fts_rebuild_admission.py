@@ -17,6 +17,7 @@ prove nothing.
 """
 
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import sqlite3
 import sys
@@ -103,8 +104,9 @@ def fast_timeout(monkeypatch):
 
 
 @pytest.fixture
-def db(tmp_path):
+def db(tmp_path, monkeypatch):
     d = SessionDB(db_path=tmp_path / "state.db")
+    monkeypatch.setattr(d, "_foreign_state_db_holders", lambda: [])
     if not d._fts_enabled:
         d.close()
         pytest.skip("FTS5 unavailable in this build")
@@ -119,6 +121,29 @@ def db(tmp_path):
 
 
 class TestRebuildFtsAdmission:
+    def test_late_same_process_opener_is_refused_for_complete_window(self, db):
+        from hermes_cli.sqlite_safe_read import connect_tracked
+
+        with db._structural_maintenance_guard():
+            with pytest.raises(sqlite3.OperationalError, match="reserved"):
+                connect_tracked(db.db_path)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    db.append_message, "s1", "user", "late write"
+                )
+                with pytest.raises(sqlite3.OperationalError, match="reserved"):
+                    future.result()
+
+    def test_nested_maintenance_is_rejected_from_non_owner_thread(self, db):
+        with db._structural_maintenance_guard():
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    lambda: db._structural_maintenance_guard().__enter__()
+                )
+                with pytest.raises(RuntimeError, match="owned by another thread"):
+                    future.result()
+
+    @pytest.mark.live_system_guard_bypass
     def test_rebuild_defers_while_another_process_holds_authority(
         self, db, fast_timeout
     ):
@@ -126,6 +151,7 @@ class TestRebuildFtsAdmission:
         with _rebuild_lock_held_by_other_process(db.db_path):
             assert db.rebuild_fts() == 0
 
+    @pytest.mark.live_system_guard_bypass
     def test_rebuild_proceeds_after_holder_releases(self, db, fast_timeout):
         with _rebuild_lock_held_by_other_process(db.db_path):
             assert db.rebuild_fts() == 0
@@ -133,6 +159,7 @@ class TestRebuildFtsAdmission:
         # caller acquires the authority and the rebuild really runs.
         assert db.rebuild_fts() >= 1
 
+    @pytest.mark.live_system_guard_bypass
     def test_rebuild_waits_out_a_short_holder(self, db, monkeypatch):
         """A holder that releases within the bounded wait does not cause deferral."""
         monkeypatch.setattr(
@@ -149,12 +176,31 @@ class TestRebuildFtsAdmission:
 
 
 class TestSchemaPathAdmission:
-    def test_startup_trigger_repair_defers_and_fails_closed(
-        self, tmp_path, fast_timeout
+    @pytest.mark.parametrize("version", [0, 1, 25])
+    def test_missing_trigger_refusal_is_independent_of_schema_version(
+        self, tmp_path, version
     ):
-        """The _init_schema trigger-repair rebuild is covered by the SAME
-        authority — deferral must leave FTS detached with the durable stale
-        breadcrumb, never triggers installed over an unrebuilt index gap."""
+        db_path = tmp_path / f"state-{version}.db"
+        d = SessionDB(db_path=db_path)
+        if not d._fts_enabled:
+            d.close()
+            pytest.skip("FTS5 unavailable in this build")
+        d.create_session("s1", source="test")
+        d.append_message("s1", "user", "canonical row")
+        d.close()
+        raw = sqlite3.connect(db_path)
+        raw.execute("DROP TRIGGER messages_fts_delete")
+        raw.execute("UPDATE schema_version SET version=?", (version,))
+        raw.commit()
+        raw.close()
+
+        with pytest.raises(sqlite3.DatabaseError, match="refusing automatic"):
+            SessionDB(db_path=db_path)
+
+    def test_startup_trigger_repair_fails_closed_without_schema_ddl(
+        self, tmp_path
+    ):
+        """Startup must not recreate triggers or rebuild populated FTS."""
         db_path = tmp_path / "state.db"
         d = SessionDB(db_path=db_path)
         if not d._fts_enabled:
@@ -171,22 +217,16 @@ class TestSchemaPathAdmission:
         raw.commit()
         raw.close()
 
-        with _rebuild_lock_held_by_other_process(db_path):
-            d2 = SessionDB(db_path=db_path)
-            try:
-                assert d2._fts_enabled is False
-            finally:
-                d2.close()
+        with pytest.raises(sqlite3.DatabaseError, match="refusing automatic"):
+            SessionDB(db_path=db_path)
 
-        # Durable state: stale breadcrumb set, no live sync triggers.
-        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
-        assert _base_fts_triggers(db_path) == set()
+        assert _meta_value(db_path, FTS_STALE_KEY) is None
+        assert len(_base_fts_triggers(db_path)) == len(_FTS_TRIGGERS) - 1
 
-    def test_stale_recovery_defers_then_succeeds_after_release(
-        self, tmp_path, fast_timeout
+    def test_stale_recovery_remains_detached_until_explicit_repair(
+        self, tmp_path
     ):
-        """_recover_stale_fts defers under contention and completes once the
-        authority is free (next open)."""
+        """Startup observes stale state but never performs structural repair."""
         db_path = tmp_path / "state.db"
         d = SessionDB(db_path=db_path)
         if not d._fts_enabled:
@@ -207,20 +247,10 @@ class TestSchemaPathAdmission:
         raw.commit()
         raw.close()
 
-        with _rebuild_lock_held_by_other_process(db_path):
-            d2 = SessionDB(db_path=db_path)
-            try:
-                assert d2._fts_enabled is False
-            finally:
-                d2.close()
-        # Deferred: breadcrumb still present, recovery not performed.
-        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
-
-        d3 = SessionDB(db_path=db_path)
+        d2 = SessionDB(db_path=db_path)
         try:
-            assert d3._fts_enabled is True
+            assert d2._fts_enabled is False
         finally:
-            d3.close()
-        # Recovered: breadcrumb cleared, triggers restored.
-        assert _meta_value(db_path, FTS_STALE_KEY) is None
-        assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
+            d2.close()
+        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+        assert _base_fts_triggers(db_path) == set()

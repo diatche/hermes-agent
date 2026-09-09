@@ -2006,14 +2006,13 @@ def _cross_process_repair_lock(db_path: Path):
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = lock_path.open("a+b")
     except OSError as exc:
-        # Read-only dir, exhausted fds, exotic filesystem: fall back to the
-        # in-process behaviour that shipped before this lock existed rather
-        # than refusing to repair a DB we could otherwise heal.
-        logger.warning(
-            "Could not open state.db repair lock %s (%s) — proceeding with "
-            "in-process serialisation only.", lock_path, exc,
+        # Without the cross-process lock there is no proof that a peer is not
+        # performing the same structural rewrite.  Repair must fail closed.
+        logger.error(
+            "Could not open state.db repair lock %s (%s) — structural "
+            "repair refused.", lock_path, exc,
         )
-        yield True
+        yield False
         return
 
     acquired = False
@@ -3007,7 +3006,9 @@ def _copy_database_snapshot(
             source.close()
 
 
-def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+def _db_opens_cleanly(
+    db_path: Path, *, require_repair_complete: bool = False
+) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
     Runs the same first-statement (``PRAGMA journal_mode``) that trips the
@@ -3032,7 +3033,93 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
         if problems:
             return "; ".join(problems[:3])
+        required_columns = {
+            "sessions": {"id", "source", "started_at"},
+            "messages": {"id", "session_id", "role", "content", "timestamp"},
+            "state_meta": {"key", "value"},
+            "schema_version": {"version"},
+        }
+        for table, required in required_columns.items():
+            columns = {
+                str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            if require_repair_complete and not required.issubset(columns):
+                missing = sorted(required - columns)
+                return f"canonical schema incomplete: {table} missing {missing}"
         conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
+        if require_repair_complete:
+            conn.execute("SELECT COUNT(*) FROM messages").fetchone()
+            stale = conn.execute(
+                "SELECT 1 FROM state_meta WHERE key IN (?, ?) LIMIT 1",
+                (FTS_STALE_KEY, FTS_CJK_STALE_KEY),
+            ).fetchone()
+            if stale is not None:
+                return "FTS repair marker remains set"
+            populated = conn.execute("SELECT 1 FROM messages LIMIT 1").fetchone()
+            fts_tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name IN "
+                    "('messages_fts','messages_fts_trigram','messages_fts_cjk')"
+                )
+            }
+            if populated is not None and "messages_fts" not in fts_tables:
+                return "populated database has no primary FTS index"
+            expected_triggers = set(_FTS_TRIGGERS[:3])
+            if "messages_fts_trigram" in fts_tables:
+                expected_triggers.update(_FTS_TRIGGERS[3:])
+            present_triggers = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                )
+            }
+            missing_triggers = sorted(expected_triggers - present_triggers)
+            if populated is not None and missing_triggers:
+                return f"FTS sync triggers missing: {missing_triggers}"
+
+            if "messages_fts_cjk" in fts_tables:
+                missing_cjk = sorted(set(_FTS_CJK_TRIGGERS) - present_triggers)
+                if populated is not None and missing_cjk:
+                    return f"CJK FTS sync triggers missing: {missing_cjk}"
+
+            # Trigger/schema checks cannot establish that rows written during
+            # an earlier trigger gap are present.  FTS5's rank=1 integrity
+            # mode compares an external-content index against its canonical
+            # content table; legacy inline indexes require an explicit exact
+            # row/content comparison instead.
+            for fts_table in sorted(fts_tables):
+                create_row = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                    (fts_table,),
+                ).fetchone()
+                create_sql = str(create_row[0] or "") if create_row else ""
+                try:
+                    if "content=" in create_sql.lower():
+                        conn.execute(
+                            f"INSERT INTO {fts_table}({fts_table}, rank) "
+                            "VALUES('integrity-check', 1)"
+                        )
+                    else:
+                        expected = (
+                            "COALESCE(content, '') || ' ' || "
+                            "COALESCE(tool_name, '') || ' ' || "
+                            "COALESCE(tool_calls, '')"
+                        )
+                        mismatch = conn.execute(
+                            f"SELECT 1 FROM ("
+                            f"SELECT id, {expected} AS content FROM messages "
+                            f"EXCEPT SELECT rowid, content FROM {fts_table} "
+                            f"UNION ALL "
+                            f"SELECT rowid, content FROM {fts_table} "
+                            f"EXCEPT SELECT id, {expected} AS content FROM messages"
+                            f") LIMIT 1"
+                        ).fetchone()
+                        if mismatch is not None:
+                            return f"FTS index contents differ from messages: {fts_table}"
+                except sqlite3.Error as exc:
+                    return f"FTS canonical-content verification failed on {fts_table}: {exc}"
 
         # FTS5 read probe: run a representative MATCH query against the
         # messages_fts* virtual tables. The FTS *write* probe below catches
@@ -3133,6 +3220,69 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         conn.close()
 
 
+def _canonical_repair_fingerprint(db_path: Path) -> Tuple[Optional[str], Optional[str]]:
+    """Return an exact digest of canonical transcript rows, or an error.
+
+    ``writable_schema`` lets SQLite ignore malformed derived schema entries
+    while reading intact canonical tables.  Every value and column name is
+    included so equal row counts cannot conceal content loss or truncation.
+    """
+    conn = _connect_repair_durable(db_path)
+    digest = hashlib.sha256()
+    try:
+        conn.execute("PRAGMA writable_schema=ON")
+        # These tables jointly define a restorable transcript.  In particular,
+        # sessions.system_prompt_hash makes system_prompts canonical even
+        # though ordinary transcript reads reach it through a LEFT JOIN, and
+        # per-model usage is durable session accounting that a repair must not
+        # silently discard.
+        for table in (
+            "system_prompts",
+            "sessions",
+            "messages",
+            "session_model_usage",
+        ):
+            columns = [
+                str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")
+            ]
+            if not columns and table in {"sessions", "messages"}:
+                return None, f"canonical table {table} is missing"
+            if not columns:
+                continue
+            if table in {"system_prompts", "session_model_usage"}:
+                if conn.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone() is None:
+                    continue
+            digest.update(json.dumps([table, columns]).encode())
+            quoted = ",".join(f'"{name.replace(chr(34), chr(34) * 2)}"' for name in columns)
+            for row in conn.execute(f"SELECT {quoted} FROM {table} ORDER BY rowid"):
+                digest.update(
+                    json.dumps(list(row), ensure_ascii=False, default=str).encode("utf-8")
+                )
+                digest.update(b"\n")
+        return digest.hexdigest(), None
+    except (sqlite3.Error, OSError) as exc:
+        return None, f"canonical data could not be verified: {exc}"
+    finally:
+        conn.close()
+
+
+_MAX_REPAIR_CANDIDATES = 3
+
+
+def _prune_repair_candidates(db_path: Path, *, reserve: int = 0) -> None:
+    """Bound prepare-only artifacts without touching forensic backups."""
+    candidates = sorted(
+        db_path.parent.glob(f"{db_path.name}.repair-candidate-*"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    keep = max(0, _MAX_REPAIR_CANDIDATES - reserve)
+    for stale in candidates[keep:]:
+        cleanup_error = _unlink_db_triple(stale)
+        if cleanup_error is not None:
+            logger.warning("Could not prune stale repair candidate %s: %s", stale, cleanup_error)
+
+
 def _live_writer_holds_db(db_path: Path) -> bool:
     """True when a connection outside this call still holds ``db_path`` open.
 
@@ -3144,9 +3294,10 @@ def _live_writer_holds_db(db_path: Path) -> bool:
     parses the schema, so this works on the malformed databases repair exists
     to handle.
 
-    Fails **open** (returns False) on anything other than a positive
-    busy/locked signal: refusing to repair a database that nobody is actually
-    holding would strand the very self-heal path this guard protects.
+    Any uncertainty opening or operating the holder probe fails closed.  A
+    malformed schema error is the sole exception: the lock statements do not
+    require schema parsing and that error describes the repair target, not an
+    uncertain holder.
 
     Scope: the WAL-index exclusive lock is what makes this detect a holder, so
     the guard is effective in WAL mode. On SQLite builds carrying the WAL-reset
@@ -3167,12 +3318,17 @@ def _live_writer_holds_db(db_path: Path) -> bool:
         return False
     except sqlite3.OperationalError as exc:
         lowered = str(exc).lower()
-        return "locked" in lowered or "busy" in lowered
+        if "malformed" in lowered or "corrupt" in lowered:
+            return False
+        if "locked" not in lowered and "busy" not in lowered:
+            logger.error("Could not inspect state.db writer ownership: %s", exc)
+        return True
     except sqlite3.DatabaseError:
         # Malformed/unreadable: no evidence of a live holder either way.
         return False
-    except Exception:
-        return False
+    except Exception as exc:
+        logger.error("Could not inspect state.db writer ownership: %s", exc)
+        return True
     finally:
         if probe is not None:
             try:
@@ -3187,7 +3343,30 @@ def _live_writer_holds_db(db_path: Path) -> bool:
                 pass
 
 
-def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
+def _same_process_state_db_connections(db_path: Path) -> int:
+    """Return tracked connections to *db_path* in this process.
+
+    OS holder scans intentionally collapse by PID and therefore cannot tell a
+    maintenance connection from another ``SessionDB`` in the same gateway.
+    The connection-lifecycle registry can, so structural work uses both.
+    Unknown/unavailable tracking fails closed with a synthetic positive count.
+    """
+    try:
+        from hermes_cli.sqlite_safe_read import live_connection_count
+
+        return live_connection_count(db_path)
+    except Exception as exc:
+        logger.warning(
+            "Could not prove state.db has no same-process connections: %s", exc
+        )
+        # Structural SessionDB maintenance expects exactly its own writer
+        # connection; repair expects zero. Two therefore rejects both modes.
+        return 2
+
+
+def repair_state_db_schema(
+    db_path: Path, *, backup: bool = True, promote: bool = True
+) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
 
@@ -3219,12 +3398,19 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     two of them running ``writable_schema`` surgery concurrently is itself a
     corruption source.
 
-    Returns a report dict: ``{repaired: bool, strategy: str|None,
-    backup_path: str|None, error: str|None}``.
+    ``promote=False`` is the automatic/startup-safe mode: repair strategies
+    may produce and verify an isolated candidate, but never copy it over the
+    active database. Explicit operator commands retain their historical
+    behaviour by using ``promote=True`` after the offline holder checks pass.
+
+    Returns a report dict including ``repaired``, ``prepared``, ``strategy``,
+    ``candidate_path``, ``backup_path`` and ``error``.
     """
     report: Dict[str, Any] = {
         "repaired": False,
+        "prepared": False,
         "strategy": None,
+        "candidate_path": None,
         "backup_path": None,
         "error": None,
     }
@@ -3274,6 +3460,13 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             # excludes writers continuously through promotion. DELETE-mode
             # readers which this probe cannot see are still rejected by the
             # later BEGIN EXCLUSIVE acquisition.
+            elif _same_process_state_db_connections(db_path):
+                report["error"] = (
+                    "this process still has an open state.db connection; "
+                    "skipped structural repair. Close all SessionDB handles "
+                    "(stop the gateway/dashboard) and retry."
+                )
+                logger.error("state.db repair skipped: %s", report["error"])
             elif _live_writer_holds_db(db_path):
                 report["error"] = (
                     "a live writer still holds state.db; skipped schema surgery "
@@ -3293,7 +3486,7 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
                 # database.journal_mode setting is the restore target.
                 before_mode = _probe_journal_mode_for_repair(db_path)
                 result = _repair_state_db_schema_locked(
-                    db_path, backup=backup, report=report
+                    db_path, backup=backup, promote=promote, report=report
                 )
                 if result.get("repaired"):
                     result["journal_mode_before"] = before_mode
@@ -3308,7 +3501,7 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             # attempt updates. A queued loser must not record at all: its
             # owner is responsible for its outcome.
             attempted = bool(result.pop("_repair_attempted", False))
-            if attempted or result.get("repaired"):
+            if (attempted and not result.get("prepared")) or result.get("repaired"):
                 _record_repair_outcome(
                     db_path, repaired=bool(result.get("repaired"))
                 )
@@ -3381,7 +3574,7 @@ def _restore_journal_mode_after_repair(db_path: Path, before_mode: Optional[str]
 
 
 def _repair_state_db_schema_locked(
-    db_path: Path, *, backup: bool, report: Dict[str, Any]
+    db_path: Path, *, backup: bool, report: Dict[str, Any], promote: bool = True
 ) -> Dict[str, Any]:
     """Repair strategies for :func:`repair_state_db_schema`.
 
@@ -3426,7 +3619,7 @@ def _repair_state_db_schema_locked(
     # repaired the file, in which case redoing the surgery would undo its
     # work on a now-healthy DB (the repair/re-corrupt cascade this lock
     # exists to break).
-    if _db_opens_cleanly(db_path) is None:
+    if _db_opens_cleanly(db_path, require_repair_complete=True) is None:
         report["repaired"] = True
         report["strategy"] = "already_healthy"
         return report
@@ -3469,6 +3662,7 @@ def _repair_state_db_schema_locked(
             logger.error("state.db repair aborted: %s", report["error"])
             return report
 
+        preserve_candidate = False
         try:
             # Reuse live_guard rather than opening a second source connection:
             # the guard owns the exclusion, so a second connection could be
@@ -3492,9 +3686,56 @@ def _repair_state_db_schema_locked(
             # budget. A later promotion failure is classified separately:
             # full disks, I/O, permission and lock failures are environmental
             # aborts, not evidence that the strategy cannot repair this image.
+            source_fingerprint, fingerprint_error = _canonical_repair_fingerprint(
+                scratch
+            )
+            if source_fingerprint is None:
+                report["error"] = fingerprint_error
+                return report
             report["_repair_attempted"] = True
             _run_repair_strategies(scratch, report)
             if report.get("repaired"):
+                candidate_fingerprint, candidate_error = (
+                    _canonical_repair_fingerprint(scratch)
+                )
+                if candidate_fingerprint is None:
+                    report["repaired"] = False
+                    report["error"] = candidate_error
+                elif candidate_fingerprint != source_fingerprint:
+                    report["repaired"] = False
+                    report["error"] = (
+                        "repair candidate did not preserve canonical session/message "
+                        "rows and content; promotion refused"
+                    )
+            if report.get("repaired"):
+                if not promote:
+                    _prune_repair_candidates(db_path, reserve=1)
+                    candidate = db_path.with_name(
+                        f"{db_path.name}.repair-candidate-"
+                        f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+                    )
+                    suffix = 0
+                    while candidate.exists():
+                        suffix += 1
+                        candidate = db_path.with_name(
+                            f"{db_path.name}.repair-candidate-"
+                            f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{suffix}"
+                        )
+                    scratch.rename(candidate)
+                    preserve_candidate = True
+                    report["candidate_path"] = str(candidate)
+                    report["prepared"] = True
+                    report["repaired"] = False
+                    report["error"] = (
+                        "verified repair candidate prepared; offline operator "
+                        "promotion is required"
+                    )
+                    logger.warning(
+                        "state.db repair candidate verified at %s; automatic "
+                        "promotion was refused",
+                        candidate,
+                    )
+                    return report
                 try:
                     # Do not os.replace the live DB: Windows rejects
                     # replacement under open handles, while POSIX would leave
@@ -3539,7 +3780,7 @@ def _repair_state_db_schema_locked(
         finally:
             # Never leave a half-repaired file beside the DB for a later probe
             # — or a later human — to mistake for the real thing.
-            cleanup_error = _unlink_db_triple(scratch)
+            cleanup_error = None if preserve_candidate else _unlink_db_triple(scratch)
             if cleanup_error is not None:
                 logger.warning(
                     "Could not remove state.db repair snapshot after repair: %s",
@@ -3606,7 +3847,7 @@ def _run_repair_strategies(
                     continue
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly(db_path, require_repair_complete=True) is None:
             report["repaired"] = True
             report["strategy"] = "rebuild_fts"
             logger.warning(
@@ -3633,7 +3874,7 @@ def _run_repair_strategies(
             conn.commit()
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly(db_path, require_repair_complete=True) is None:
             report["repaired"] = True
             report["strategy"] = "reindex_btree"
             logger.warning(
@@ -3664,7 +3905,7 @@ def _run_repair_strategies(
             conn.commit()
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly(db_path, require_repair_complete=True) is None:
             report["repaired"] = True
             report["strategy"] = "dedup_schema"
             logger.warning(
@@ -3696,9 +3937,33 @@ def _run_repair_strategies(
             # the single most damaging operation to lose halfway.
             _reapply_durability_barriers(conn)
             conn.execute("VACUUM")
+            # Strategy 2 must produce a complete reopenable database itself;
+            # relying on ordinary startup to restore synchronization is no
+            # longer safe because startup correctly refuses populated gaps.
+            conn.executescript(FTS_SQL)
+            try:
+                conn.executescript(FTS_TRIGRAM_SQL)
+            except sqlite3.OperationalError as exc:
+                if not SessionDB._is_fts5_unavailable_error(exc):
+                    raise
+            conn.execute(
+                "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"
+            )
+            try:
+                conn.execute(
+                    "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+                    "VALUES('rebuild')"
+                )
+            except sqlite3.OperationalError:
+                pass
+            conn.execute(
+                "DELETE FROM state_meta WHERE key IN (?, ?)",
+                (FTS_STALE_KEY, FTS_CJK_STALE_KEY),
+            )
+            conn.commit()
         finally:
             conn.close()
-        reason = _db_opens_cleanly(db_path)
+        reason = _db_opens_cleanly(db_path, require_repair_complete=True)
         if reason is None:
             report["repaired"] = True
             report["strategy"] = "drop_fts_rebuild"
@@ -4571,14 +4836,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # a momentary blip into a permanent global convoy. Expires after
         # _READ_OPEN_RETRY_SECONDS so the read path self-heals.
         self._read_open_failed_at = 0.0
+        self._structural_maintenance_active = False
+        self._structural_maintenance_thread_id: Optional[int] = None
         self._wal_active = False
         self._write_count = 0
-        # One-shot guard for the runtime FTS rebuild recovery on the write
-        # path. A corrupt FTS shadow table makes EVERY message write raise
-        # the malformed/corrupt error class via the sync triggers; we repair
-        # in place at most once per SessionDB instance so a genuinely
-        # unrecoverable database can't put writers into a rebuild loop.
-        self._fts_runtime_rebuild_attempted = False
         # One-shot guard for the usermerge-floor config write on the
         # incremental FTS merge cadence (see _merge_fts_incrementally).
         self._fts_usermerge_floor_applied = False
@@ -4767,15 +5028,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if not is_malformed_schema_error(exc) or not _claim_repair_attempt(self.db_path):
                     raise
                 logger.error(
-                    "state.db schema is malformed (%s) — attempting automatic "
-                    "repair (a backup copy is made first).", exc,
+                    "state.db schema is malformed (%s) — preparing a verified "
+                    "repair candidate without promoting it (a backup copy is "
+                    "made first).",
+                    exc,
                 )
                 try:
                     if self._conn is not None:
                         self._conn.close()
                 except Exception:
                     pass
-                report = repair_state_db_schema(self.db_path)
+                report = repair_state_db_schema(self.db_path, promote=False)
                 if not report.get("repaired"):
                     raise
                 _connect_and_init_with_lock_patience()
@@ -4826,7 +5089,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         query observes everything committed so far — read-your-writes holds
         for the flush-then-search patterns in a turn.
         """
-        if not self._wal_active or self.read_only:
+        if (
+            not self._wal_active
+            or self.read_only
+            or self._structural_maintenance_active
+        ):
             return None
         with self._read_conns_lock:
             if self._read_conns_closed:
@@ -4957,7 +5224,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         take a permit, so peak live connections is bounded by _READ_POOL_MAX no
         matter how many threads miss simultaneously.
         """
-        if not self._wal_active or self.read_only:
+        if (
+            not self._wal_active
+            or self.read_only
+            or self._structural_maintenance_active
+        ):
             return None
         try:
             return self._read_pool.get_nowait()
@@ -5292,6 +5563,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # SQLite build — some surface it as InterfaceError, which lives
         # OUTSIDE DatabaseError and escaped the retry net entirely on
         # attempt 0 — so the check is message-scoped, not class-scoped.
+        if (
+            self._structural_maintenance_active
+            and self._structural_maintenance_thread_id != threading.get_ident()
+        ):
+            raise sqlite3.OperationalError(
+                "database is reserved for structural maintenance"
+            )
+
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
 
@@ -5357,17 +5636,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.DatabaseError as exc:
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
-                # Corrupt FTS shadow tables make every write raise the
-                # malformed/corrupt error class through the FTS sync triggers
-                # while the canonical messages table is intact. Recover here,
-                # at the shared persistence boundary, so every caller gets the
-                # same guarantee. First try the cheap in-place repair. If that
-                # one-shot path is unavailable or corruption recurs, detach the
-                # derived indexes and retry against the canonical tables.
-                if self._try_runtime_fts_rebuild(exc):
-                    continue
-                if self._enter_fts_fail_open(exc):
-                    continue
+                # A write error is not an authority to rebuild FTS or alter
+                # triggers on the live database. Even a proven FTS virtual-
+                # table failure cannot be detached safely with today's trigger
+                # schema (DROP TRIGGER is structural DDL), so persistence
+                # fails closed and explicit offline repair remains available.
                 raise
             except sqlite3.Error as exc:
                 # Catch-all for builds that surface 'no more rows available'
@@ -5409,22 +5682,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @staticmethod
     def _is_fts_write_corruption_error(exc: sqlite3.DatabaseError) -> bool:
-        """True for the error class a corrupt FTS index raises on writes.
+        """Return true only when SQLite identifies corruption as FTS-scoped.
 
-        SQLite's message for a corrupt FTS index varies by version: older
-        builds raise the generic ``database disk image is malformed`` (covered
-        by :func:`is_malformed_db_error`); newer builds raise the FTS5-specific
-        ``fts5: corrupt structure record for table "messages_fts"``. Both mean
-        the same thing for the write path: the canonical rows are fine, the
-        FTS shadow tables are not.  The FTS-only rebuild and fail-open
-        detach are safe here because they only touch derived indexes; if the
-        damage is actually in a canonical B-tree, the rebuild itself fails and
-        the write propagates.
+        Newer SQLite builds include ``fts5`` in the error text.  Older builds
+        may emit only ``database disk image is malformed`` while exposing the
+        extended ``SQLITE_CORRUPT_VTAB`` result code.  A bare
+        ``SQLITE_CORRUPT``/malformed-image error is structural and must not
+        trigger live FTS maintenance: it does not prove that canonical B-trees
+        are intact.
         """
-        if is_malformed_db_error(exc):
-            return True
+        corrupt_vtab = getattr(sqlite3, "SQLITE_CORRUPT_VTAB", 267)
+        error_code = getattr(exc, "sqlite_errorcode", None)
+        if error_code is not None:
+            return error_code == corrupt_vtab
         msg = str(exc).lower()
-        return "fts5" in msg and "corrupt" in msg
+        return msg.startswith("fts5:") and "corrupt structure" in msg
 
     def _foreign_state_db_holders(self) -> List[Tuple[int, str]]:
         """Return foreign processes holding this DB or its WAL sidecars.
@@ -5444,9 +5716,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # processes can block for minutes on device-backed handles.
         if _IS_WINDOWS:
             return []
-        if psutil is None:
-            return [(-1, "open-file scan unavailable")]
-
         def _canonical(path: str) -> str:
             clean = path.removesuffix(" (deleted)")
             return os.path.normcase(os.path.abspath(clean))
@@ -5505,6 +5774,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return holders or [(-1, f"open-file scan failed: {exc}")]
             return holders
 
+        if psutil is None:
+            return [(-1, "open-file scan unavailable")]
+
         # macOS / BSD: use psutil.open_files().  macOS does not use the
         # "(deleted)" suffix convention, so psutil's filtering is safe here.
         try:
@@ -5529,6 +5801,128 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return holders or [(-1, f"open-file scan failed: {exc}")]
         return holders
+
+    def _structural_maintenance_error(self) -> Optional[str]:
+        """Return why this handle cannot safely run structural maintenance."""
+        same_process = _same_process_state_db_connections(self.db_path)
+        # The writer connection owned by this SessionDB is expected. Any
+        # additional tracked connection is a peer or an active pooled reader.
+        if same_process != 1:
+            return (
+                "structural state.db maintenance requires exactly one open "
+                f"same-process connection (found {same_process}); close all "
+                "other SessionDB handles and retry"
+            )
+        foreign = self._foreign_state_db_holders()
+        concrete_foreign = [holder for holder in foreign if holder[0] > 0]
+        if concrete_foreign:
+            return (
+                "structural state.db maintenance requires zero foreign "
+                f"database/WAL holders (found {concrete_foreign}); stop the "
+                "gateway and other Hermes processes, then retry"
+            )
+        if foreign:
+            return (
+                "could not prove that state.db has zero foreign database/WAL "
+                f"holders ({foreign}); structural maintenance fails closed"
+            )
+        return None
+
+    def _drain_idle_read_connections_for_maintenance(self) -> None:
+        """Close this handle's idle pooled readers before offline work.
+
+        An idle connection in our own pool is not a peer and is safe to close.
+        A reader currently borrowed by another thread is absent from the pool,
+        remains in the tracked-connection count, and therefore still makes the
+        structural admission check fail closed.
+        """
+        while True:
+            try:
+                conn = self._read_pool.get_nowait()
+            except queue.Empty:
+                return
+            self._close_read_conn(conn)
+
+    @contextmanager
+    def _structural_maintenance_guard(self):
+        """Admit one structural operation only after proving offline access.
+
+        The process repair lock serializes cooperating maintenance and
+        SQLite exclusive locking is retained for the entire operation.
+        """
+        # Nested helpers (vacuum -> optimize_fts) inherit the outer retained
+        # ownership instead of attempting to acquire the repair lock again.
+        if self._structural_maintenance_active:
+            if self._structural_maintenance_thread_id != threading.get_ident():
+                raise RuntimeError(
+                    "nested structural maintenance is owned by another thread"
+                )
+            yield
+            return
+
+        # Stop this handle from lending/opening readers before draining its
+        # idle pool. Borrowed readers and independent SessionDB handles remain
+        # tracked, so the admission check below rejects them.
+        self._structural_maintenance_active = True
+        self._structural_maintenance_thread_id = threading.get_ident()
+        reopen_writer = False
+        try:
+            self._drain_idle_read_connections_for_maintenance()
+            from hermes_cli.sqlite_safe_read import reserve_structural_maintenance
+
+            with reserve_structural_maintenance(
+                self.db_path, expected_connections=1
+            ):
+                blocker = self._structural_maintenance_error()
+                if blocker:
+                    raise RuntimeError(blocker)
+                with _cross_process_repair_lock(self.db_path) as admitted:
+                    if not admitted:
+                        raise RuntimeError(
+                            "another process holds the state.db structural "
+                            "maintenance lock; stop it and retry"
+                        )
+                    with self._lock:
+                        self._conn.execute("PRAGMA locking_mode=EXCLUSIVE")
+                        self._conn.execute("BEGIN EXCLUSIVE")
+                        self._conn.execute("ROLLBACK")
+                    try:
+                        yield
+                    finally:
+                        with self._lock:
+                            # In WAL mode an EXCLUSIVE locking-mode connection
+                            # retains its file locks for the lifetime of the
+                            # connection; merely selecting NORMAL again does
+                            # not reliably release them.  Close while the
+                            # same-process reservation and cross-process lock
+                            # still exclude every contender, then reopen only
+                            # after those guards unwind.  This preserves the
+                            # uninterrupted exclusive maintenance window and
+                            # prevents the returned SessionDB from pinning all
+                            # subsequent pooled readers behind SQLITE_LOCKED.
+                            conn, self._conn = self._conn, None
+                            self._close_connection_quietly(conn)
+                            reopen_writer = True
+        finally:
+            if reopen_writer:
+                with self._lock:
+                    self._conn = _connect_tracked_db(
+                        str(self.db_path),
+                        check_same_thread=False,
+                        timeout=1.0,
+                        isolation_level=None,
+                    )
+                    self._conn.row_factory = sqlite3.Row
+                    self._wal_active = (
+                        apply_wal_with_fallback(
+                            self._conn, db_label="state.db"
+                        ) == "wal"
+                    )
+                    apply_database_pragmas(self._conn, db_label="state.db")
+                    self._conn.execute("PRAGMA foreign_keys=ON")
+                    self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
+            self._structural_maintenance_thread_id = None
+            self._structural_maintenance_active = False
 
     def _reap_inactive_orphan_desktop_holders(
         self, holders: List[Tuple[int, str]], *, min_age_seconds: float
@@ -5590,127 +5984,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except Exception:
                 pass
         return signalled
-
-    def _try_runtime_fts_rebuild(self, exc: sqlite3.DatabaseError) -> bool:
-        """One-shot in-place FTS rebuild after a corrupt-index write failure.
-
-        Returns True when a rebuild was performed and the failed write should
-        be retried; False when the error isn't the FTS-corruption class, FTS
-        is disabled, or a rebuild was already attempted for this instance.
-
-        Delegates to :meth:`rebuild_fts` (the FTS5 ``'rebuild'`` command —
-        index rewritten from the canonical messages table, zero message-row
-        mutation). Safe to call from ``_execute_write``'s except path: the
-        failed transaction was rolled back and ``self._lock`` released before
-        the exception propagated, and ``rebuild_fts`` re-acquires it.
-        E2E-verified: a corrupted ``messages_fts_data`` shadow table rejects
-        every append; after the in-place rebuild the same append succeeds and
-        search works again.
-        """
-        if self._fts_runtime_rebuild_attempted:
-            return False
-        if not self._fts_enabled:
-            return False
-        if not self._is_fts_write_corruption_error(exc):
-            return False
-        # Set the one-shot flag before the foreign-holder check: even when
-        # the rebuild is skipped, the fail-open path that follows persists
-        # the FTS_STALE_KEY marker so the next process startup will retry
-        # via _recover_stale_fts (which has its own holder guard). Setting
-        # the flag here also avoids re-running the expensive psutil scan on
-        # every subsequent corrupted write through this instance.
-        self._fts_runtime_rebuild_attempted = True
-        foreign_holders = self._foreign_state_db_holders()
-        if foreign_holders:
-            logger.warning(
-                "Skipping automatic state.db FTS rebuild while foreign "
-                "processes hold the database or WAL sidecars (%s); detaching "
-                "FTS sync so canonical writes can continue.",
-                foreign_holders,
-            )
-            return False
-        logger.warning(
-            "state.db write failed with an FTS-corruption error (%s) — "
-            "attempting one-shot in-place FTS rebuild; canonical message "
-            "rows are preserved.", exc,
-        )
-        try:
-            rebuilt = self.rebuild_fts()
-        except Exception as rebuild_exc:
-            logger.error(
-                "In-place FTS rebuild failed (%s); the database needs the "
-                "full offline repair path (repair_state_db_schema).",
-                rebuild_exc,
-            )
-            return False
-        if not rebuilt:
-            logger.error(
-                "In-place FTS rebuild made no progress; the database needs "
-                "the full offline repair path (repair_state_db_schema)."
-            )
-            return False
-        logger.warning(
-            "state.db FTS indexes rebuilt in place (%d); retrying the failed write.",
-            rebuilt,
-        )
-        return True
-
-    def _enter_fts_fail_open(self, exc: sqlite3.DatabaseError) -> bool:
-        """Detach corrupt FTS indexes so canonical writes can continue.
-
-        The stale breadcrumb and trigger removal commit atomically. Its
-        ordering is load-bearing: after triggers are absent, new canonical
-        rows create an index gap of unknown extent, so another process must
-        never reinstall the triggers without first rebuilding every row.
-        """
-        if not self._fts_enabled or not self._is_fts_write_corruption_error(exc):
-            return False
-
-        try:
-            with self._lock:
-                self._conn.execute("BEGIN IMMEDIATE")
-                try:
-                    self._conn.execute(
-                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
-                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                        (FTS_STALE_KEY,),
-                    )
-                    cjk_triggers_present = self._conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
-                        f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
-                        "LIMIT 1",
-                        _FTS_CJK_TRIGGERS,
-                    ).fetchone()
-                    if cjk_triggers_present:
-                        self._conn.execute(
-                            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
-                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            (FTS_CJK_STALE_KEY,),
-                        )
-                    self._drop_all_fts_triggers(self._conn.cursor())
-                    self._conn.commit()
-                except BaseException:
-                    self._conn.rollback()
-                    raise
-        except sqlite3.Error as detach_exc:
-            logger.error(
-                "Could not detach corrupt FTS indexes; canonical write still "
-                "cannot proceed: %s",
-                detach_exc,
-            )
-            return False
-
-        self._fts_stale = True
-        self._fts_enabled = False
-        self._trigram_available = False
-        self._fts_cjk_available = False
-        logger.error(
-            "state.db FTS indexes remain corrupt (%s); disabled FTS sync and "
-            "retrying the canonical write. Search temporarily uses LIKE until "
-            "a later SessionDB open rebuilds the indexes.",
-            exc,
-        )
-        return True
 
     def _try_wal_checkpoint(self) -> None:
         """Best-effort PASSIVE WAL checkpoint.  Never raises.
@@ -14935,37 +15208,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Returns the number of FTS indexes that were optimized (0 if the
         merge step failed or no FTS tables exist).
         """
-        # Merge FTS5 segments before VACUUM so the freed pages are returned
-        # to the OS in the same pass. optimize_fts() manages its own lock.
-        optimized = 0
-        try:
-            optimized = self.optimize_fts()
-        except Exception as exc:
-            logger.warning("FTS optimize before VACUUM failed: %s", exc)
-        # VACUUM cannot be executed inside a transaction.
-        with self._lock:
-            # Best-effort WAL checkpoint first, then VACUUM. PASSIVE, not
-            # TRUNCATE: a manual `hermes sessions vacuum` runs in a transient
-            # CLI process, and a TRUNCATE reset here would race a live gateway
-            # writer and tear B-tree pages (#45383). VACUUM folds the WAL back
-            # itself; journal_size_limit bounds the file.
+        with self._structural_maintenance_guard():
+            # Merge FTS5 segments before VACUUM so the freed pages are returned
+            # to the OS in the same pass. optimize_fts() manages its own lock.
+            optimized = 0
             try:
-                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                optimized = self.optimize_fts()
             except Exception as exc:
-                logger.debug("WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc)
-            self._conn.execute("VACUUM")
-            # ...and again afterwards. VACUUM rewrites every page THROUGH the
-            # WAL, so the pre-VACUUM checkpoint above does nothing for the
-            # slack VACUUM itself creates: on a 3.0 GB database it left a
-            # 3.07 GB state.db-wal behind, so `sessions optimize` reported
-            # "reclaimed -11.2 MB" while actually consuming 3 GB of disk and
-            # filling the host to 100%. Truncating here is what makes the
-            # command a net win instead of a net loss on large databases.
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception as exc:
-                logger.debug("WAL checkpoint (TRUNCATE) after VACUUM failed: %s", exc)
-        return optimized
+                logger.warning("FTS optimize before VACUUM failed: %s", exc)
+            # VACUUM cannot be executed inside a transaction.
+            with self._lock:
+                try:
+                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except Exception as exc:
+                    logger.debug(
+                        "WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc
+                    )
+                self._conn.execute("VACUUM")
+                try:
+                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception as exc:
+                    logger.debug(
+                        "WAL checkpoint (TRUNCATE) after VACUUM failed: %s", exc
+                    )
+            return optimized
 
     def maybe_auto_prune_and_vacuum(
         self,

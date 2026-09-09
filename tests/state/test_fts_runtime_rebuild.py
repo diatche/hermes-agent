@@ -1,4 +1,4 @@
-"""Runtime FTS-corruption self-heal on the SessionDB write path (#65637 class).
+"""Runtime FTS-corruption safety on the SessionDB read/write paths.
 
 A corrupted FTS5 shadow table (``messages_fts_data``) makes every message
 write raise ``sqlite3.DatabaseError: database disk image is malformed``
@@ -7,10 +7,9 @@ intact. Before this fix the gateway swallowed the failure at debug level and
 the in-memory session advanced while disk silently fell behind — surfacing
 later as "Persisted transcript lagged live cached history" amnesia.
 
-The fix: ``_execute_write`` first attempts a one-shot in-place FTS rebuild.
-If corruption persists, it records a durable stale marker, detaches the FTS
-sync triggers, and retries the canonical write. Search degrades to ``LIKE``
-until a later open atomically rebuilds the index and restores the triggers.
+Runtime writes fail closed without rebuilding or changing schema. FTS reads
+degrade in memory to canonical LIKE search. Structural recovery is reserved
+for explicit offline maintenance.
 """
 
 import json
@@ -32,6 +31,7 @@ from hermes_state import (
     _FTS_TRIGGERS,
     _concrete_state_db_holder_pids,
     _is_inactive_orphan_desktop_holder,
+    repair_state_db_schema,
 )
 
 
@@ -275,13 +275,33 @@ class TestRuntimeFtsRebuild:
         # Cleanup
         os.chmod(proc_root / "222" / "fd", 0o755)
 
-    def test_corruption_error_classification_covers_both_sqlite_messages(self):
-        """SQLite's message for a corrupt FTS index varies by version: older
-        builds raise the generic malformed-image error, newer builds raise an
-        FTS5-specific one. Both must trigger the self-heal."""
-        assert SessionDB._is_fts_write_corruption_error(
-            sqlite3.DatabaseError("database disk image is malformed")
+    def test_corruption_error_classification_requires_fts_evidence(self):
+        """Generic structural corruption must not enter live FTS repair.
+
+        Older SQLite builds may use the generic malformed-image text for an FTS
+        virtual-table failure, but still expose SQLITE_CORRUPT_VTAB.  Preserve
+        that route while failing closed for unscoped SQLITE_CORRUPT errors.
+        """
+        generic = sqlite3.DatabaseError("database disk image is malformed")
+        assert not SessionDB._is_fts_write_corruption_error(generic)
+
+        structural = sqlite3.DatabaseError("database disk image is malformed")
+        structural.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
+        structural.sqlite_errorname = "SQLITE_CORRUPT"
+        assert not SessionDB._is_fts_write_corruption_error(structural)
+
+        fts_virtual_table = sqlite3.DatabaseError("database disk image is malformed")
+        fts_virtual_table.sqlite_errorcode = sqlite3.SQLITE_CORRUPT_VTAB
+        fts_virtual_table.sqlite_errorname = "SQLITE_CORRUPT_VTAB"
+        assert SessionDB._is_fts_write_corruption_error(fts_virtual_table)
+
+        contradictory = sqlite3.IntegrityError(
+            'fts5: corrupt structure record for table "messages_fts"'
         )
+        contradictory.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_TRIGGER
+        contradictory.sqlite_errorname = "SQLITE_CONSTRAINT_TRIGGER"
+        assert not SessionDB._is_fts_write_corruption_error(contradictory)
+
         assert SessionDB._is_fts_write_corruption_error(
             sqlite3.DatabaseError(
                 'fts5: corrupt structure record for table "messages_fts"'
@@ -291,7 +311,175 @@ class TestRuntimeFtsRebuild:
             sqlite3.DatabaseError("no such table: nothing_fts_related")
         )
 
-    def test_append_self_heals_after_fts_corruption(self, db, tmp_path):
+    def test_structural_corruption_propagates_without_live_fts_mutation(
+        self, db, tmp_path, monkeypatch
+    ):
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+
+        rebuild_called = False
+
+        def _unexpected_rebuild():
+            nonlocal rebuild_called
+            rebuild_called = True
+            raise AssertionError("structural corruption must not rebuild FTS")
+
+        monkeypatch.setattr(db, "rebuild_fts", _unexpected_rebuild)
+        structural = sqlite3.DatabaseError("database disk image is malformed")
+        structural.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
+        structural.sqlite_errorname = "SQLITE_CORRUPT"
+
+        with pytest.raises(sqlite3.DatabaseError) as caught:
+            db._execute_write(lambda _conn: (_ for _ in ()).throw(structural))
+
+        assert caught.value is structural
+        assert rebuild_called is False
+        assert db._fts_stale is False
+        assert _meta_value(tmp_path / "state.db", FTS_STALE_KEY) is None
+        assert _base_fts_triggers(tmp_path / "state.db") == set(_FTS_TRIGGERS)
+
+    def test_fts_looking_constraint_error_does_not_mutate_fts(
+        self, db, tmp_path, monkeypatch
+    ):
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+
+        rebuild_called = False
+
+        def _unexpected_rebuild():
+            nonlocal rebuild_called
+            rebuild_called = True
+            raise AssertionError("contradictory error code must fail closed")
+
+        monkeypatch.setattr(db, "rebuild_fts", _unexpected_rebuild)
+        contradictory = sqlite3.IntegrityError(
+            'fts5: corrupt structure record for table "messages_fts"'
+        )
+        contradictory.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_TRIGGER
+        contradictory.sqlite_errorname = "SQLITE_CONSTRAINT_TRIGGER"
+
+        with pytest.raises(sqlite3.IntegrityError) as caught:
+            db._execute_write(lambda _conn: (_ for _ in ()).throw(contradictory))
+
+        assert caught.value is contradictory
+        assert rebuild_called is False
+        assert db._fts_stale is False
+        assert _meta_value(tmp_path / "state.db", FTS_STALE_KEY) is None
+        assert _base_fts_triggers(tmp_path / "state.db") == set(_FTS_TRIGGERS)
+
+    def test_proven_fts_write_corruption_fails_closed_without_live_ddl(
+        self, db, tmp_path, monkeypatch
+    ):
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db_path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "preserved seed")
+        triggers_before = _base_fts_triggers(db_path)
+        _corrupt_fts(db_path)
+
+        rebuild_called = False
+        drop_called = False
+
+        def _unexpected_rebuild():
+            nonlocal rebuild_called
+            rebuild_called = True
+            raise AssertionError("ordinary writes must not rebuild FTS")
+
+        def _unexpected_drop(_cursor):
+            nonlocal drop_called
+            drop_called = True
+            raise AssertionError("ordinary writes must not drop FTS triggers")
+
+        monkeypatch.setattr(db, "rebuild_fts", _unexpected_rebuild)
+        monkeypatch.setattr(db, "_drop_all_fts_triggers", _unexpected_drop)
+
+        with pytest.raises(
+            sqlite3.DatabaseError,
+            match="fts5: corrupt structure|database disk image is malformed",
+        ):
+            db.append_message("s1", "user", "must not commit")
+
+        assert rebuild_called is False
+        assert drop_called is False
+        assert _message_contents(db_path) == ["preserved seed"]
+        assert _meta_value(db_path, FTS_STALE_KEY) is None
+        assert _base_fts_triggers(db_path) == triggers_before
+
+    def test_corrupt_fts_search_degrades_to_canonical_like_without_rebuild(
+        self, db, tmp_path, monkeypatch
+    ):
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db_path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "canonical searchable needle")
+        triggers_before = _base_fts_triggers(db_path)
+        _corrupt_fts(db_path)
+
+        monkeypatch.setattr(
+            db,
+            "rebuild_fts",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("search must not rebuild FTS")
+            ),
+        )
+        results = db.search_messages("searchable needle")
+
+        assert results
+        assert any("searchable needle" in row["snippet"] for row in results)
+        assert db._fts_stale is True
+        assert db._fts_enabled is False
+        assert _meta_value(db_path, FTS_STALE_KEY) is None
+        assert _base_fts_triggers(db_path) == triggers_before
+
+    def test_first_cjk_corruption_fallback_preserves_boolean_semantics(
+        self, db, tmp_path
+    ):
+        if not db._trigram_available:
+            pytest.skip("trigram tokenizer unavailable in this build")
+        db.create_session("cjk", source="test")
+        db.append_message("cjk", "user", "大别山 keep")
+        db.append_message("cjk", "user", "广西 keep")
+        db.append_message("cjk", "user", "大别山 禁止")
+        db._fts_cjk_available = False
+        _corrupt_trigram_fts(tmp_path / "state.db")
+
+        rows = db.search_messages("大别山 NOT 禁止 OR 广西", sort="oldest")
+        snippets = [row["snippet"] for row in rows]
+        assert len(rows) == 2
+        assert any("大别山 keep" in snippet for snippet in snippets)
+        assert any("广西 keep" in snippet for snippet in snippets)
+        assert all("禁止" not in snippet for snippet in snippets)
+
+    def test_same_process_peer_blocks_all_structural_work(self, db, tmp_path):
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        peer = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            with pytest.raises(RuntimeError, match="same-process connection"):
+                db.rebuild_fts()
+            with pytest.raises(RuntimeError, match="same-process connection"):
+                db.vacuum()
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is False
+            assert result["reason"] == (
+                "structural_maintenance_requires_exclusive_access"
+            )
+            assert "same-process connection" in result["error"]
+
+            repair = repair_state_db_schema(
+                tmp_path / "state.db", backup=False
+            )
+            assert repair["repaired"] is False
+            assert "open state.db connection" in repair["error"]
+        finally:
+            peer.close()
+
+    # Historical self-heal tests below document the removed unsafe behavior.
+    # They intentionally are not collected; the regression tests above assert
+    # the replacement fail-closed contract.
+    def obsolete_append_self_heals_after_fts_corruption(self, db, tmp_path):
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
         db.create_session("s1", source="test")
@@ -307,7 +495,7 @@ class TestRuntimeFtsRebuild:
             "healed append",
         ]
 
-    def test_search_works_after_self_heal(self, db, tmp_path):
+    def obsolete_search_works_after_self_heal(self, db, tmp_path):
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
         db.create_session("s1", source="test")
@@ -322,7 +510,7 @@ class TestRuntimeFtsRebuild:
         raw.close()
         assert len(hits) == 1
 
-    def test_search_messages_self_heals_after_fts_corruption(self, db, tmp_path):
+    def obsolete_search_messages_self_heals_after_fts_corruption(self, db, tmp_path):
         """A read-only session that only SEARCHES (no write after corruption)
         must self-heal too. The MATCH read raises the corruption class
         (DatabaseError / 'fts5: corrupt structure record'), NOT the
@@ -345,7 +533,7 @@ class TestRuntimeFtsRebuild:
         assert results  # non-empty: the rebuilt index matched the query
         assert any("needle" in (r.get("snippet") or "") for r in results)
 
-    def test_trigram_search_self_heals_after_fts_corruption(self, db, tmp_path):
+    def obsolete_trigram_search_self_heals_after_fts_corruption(self, db, tmp_path):
         """The CJK/trigram MATCH branch has the same read-corruption exposure
         as the main FTS5 branch: it caught only OperationalError (query
         syntax), so a corrupt trigram shadow table raised DatabaseError
@@ -372,7 +560,7 @@ class TestRuntimeFtsRebuild:
         assert any(">>>" in (r.get("snippet") or "") for r in results)
 
 
-    def test_second_corruption_fails_open_and_rebuilds_on_reopen(
+    def obsolete_second_corruption_fails_open_and_rebuilds_on_reopen(
         self, db, tmp_path
     ):
         if not db._fts_enabled:
@@ -415,7 +603,7 @@ class TestRuntimeFtsRebuild:
         finally:
             reopened.close()
 
-    def test_failed_in_place_rebuild_fails_open(self, db, tmp_path, monkeypatch):
+    def obsolete_failed_in_place_rebuild_fails_open(self, db, tmp_path, monkeypatch):
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
         db_path = tmp_path / "state.db"
@@ -433,7 +621,7 @@ class TestRuntimeFtsRebuild:
         assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         assert _base_fts_triggers(db_path) == set()
 
-    def test_foreign_holder_skips_runtime_rebuild_and_fails_open(
+    def obsolete_foreign_holder_skips_runtime_rebuild_and_fails_open(
         self, db, tmp_path, monkeypatch
     ):
         if not db._fts_enabled:
@@ -457,7 +645,7 @@ class TestRuntimeFtsRebuild:
         assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         assert _base_fts_triggers(db_path) == set()
 
-    def test_stale_search_preserves_not_semantics(self, db, tmp_path, monkeypatch):
+    def obsolete_stale_search_preserves_not_semantics(self, db, tmp_path, monkeypatch):
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
         db_path = tmp_path / "state.db"
@@ -481,7 +669,7 @@ class TestRuntimeFtsRebuild:
         assert any("python language guide" in snippet for snippet in snippets)
         assert all("java" not in snippet for snippet in snippets)
 
-    def test_existing_peer_observes_fail_open_marker(
+    def obsolete_existing_peer_observes_fail_open_marker(
         self, db, tmp_path, monkeypatch
     ):
         if not db._fts_enabled:
@@ -506,7 +694,7 @@ class TestRuntimeFtsRebuild:
         finally:
             peer.close()
 
-    def test_failed_startup_rebuild_keeps_fts_detached(
+    def obsolete_failed_startup_rebuild_keeps_fts_detached(
         self, db, tmp_path, monkeypatch
     ):
         if not db._fts_enabled:
@@ -539,7 +727,7 @@ class TestRuntimeFtsRebuild:
         finally:
             reopened.close()
 
-    def test_foreign_holder_defers_startup_stale_rebuild(
+    def obsolete_foreign_holder_defers_startup_stale_rebuild(
         self, db, tmp_path, monkeypatch
     ):
         if not db._fts_enabled:
@@ -572,7 +760,7 @@ class TestRuntimeFtsRebuild:
         finally:
             reopened.close()
 
-    def test_repeated_deferrals_reap_inactive_orphan_then_rebuild(
+    def obsolete_repeated_deferrals_reap_inactive_orphan_then_rebuild(
         self, db, tmp_path, monkeypatch
     ):
         if not db._fts_enabled:
@@ -625,7 +813,7 @@ class TestRuntimeFtsRebuild:
         finally:
             reopened.close()
 
-    def test_legacy_inline_fts_fails_open_and_recovers(self, tmp_path, monkeypatch):
+    def obsolete_legacy_inline_fts_fails_open_and_recovers(self, tmp_path, monkeypatch):
         db_path = tmp_path / "legacy-state.db"
         raw = sqlite3.connect(str(db_path))
         raw.executescript(SCHEMA_SQL)

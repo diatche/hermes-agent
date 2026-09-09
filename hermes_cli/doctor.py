@@ -2056,14 +2056,18 @@ def run_doctor(args):
             # repaired in place with --fix).
             from hermes_state import _db_opens_cleanly, repair_state_db_schema
 
-            _write_reason = _db_opens_cleanly(state_db_path)
+            _write_reason = _db_opens_cleanly(
+                state_db_path, require_repair_complete=True
+            )
             if _write_reason is not None:
                 check_warn(
                     f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)",
                     f"({_write_reason})",
                 )
                 if should_fix:
-                    report = repair_state_db_schema(state_db_path)
+                    report = repair_state_db_schema(
+                        state_db_path, promote=True
+                    )
                     if report.get("repaired"):
                         backup_name = (
                             Path(report["backup_path"]).name
@@ -2101,7 +2105,9 @@ def run_doctor(args):
                     f"({e})",
                 )
                 if should_fix:
-                    report = repair_state_db_schema(state_db_path)
+                    report = repair_state_db_schema(
+                        state_db_path, promote=True
+                    )
                     if report.get("repaired"):
                         try:
                             conn = sqlite3.connect(str(state_db_path))

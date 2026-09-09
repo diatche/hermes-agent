@@ -14,11 +14,13 @@ sqlite_master surgery path recovers the canonical data and self-heals on open.
 """
 import contextlib
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -112,6 +114,103 @@ def test_repaired_db_search_works(tmp_path):
         db.close()
 
 
+def test_prepare_only_keeps_live_database_unmodified(tmp_path):
+    """Automatic repair may verify a candidate but must not promote it."""
+    from hermes_state import _db_opens_cleanly
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_duplicate_fts(db_path)
+    reason_before = _db_opens_cleanly(db_path)
+
+    report = repair_state_db_schema(db_path, backup=False, promote=False)
+
+    assert report["repaired"] is False
+    assert report["prepared"] is True
+    assert report["error"] == (
+        "verified repair candidate prepared; offline operator promotion is required"
+    )
+    candidate = Path(report["candidate_path"])
+    assert candidate.exists()
+    assert _db_opens_cleanly(candidate) is None
+    assert _db_opens_cleanly(db_path) == reason_before
+
+
+def test_repeated_successful_preparation_does_not_exhaust_explicit_repair(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_duplicate_fts(db_path)
+    monkeypatch.setattr(hermes_state, "_repair_attempted_paths", set())
+
+    for _ in range(6):
+        prepared = repair_state_db_schema(db_path, backup=False, promote=False)
+        assert prepared["prepared"] is True
+        assert len(list(tmp_path.glob("state.db.repair-candidate-*"))) <= 3
+    promoted = repair_state_db_schema(db_path, backup=False, promote=True)
+    assert promoted["repaired"] is True
+    reopened = SessionDB(db_path=db_path)
+    try:
+        reopened.create_session("after", source="test")
+        reopened.append_message("after", "user", "repair lifecycle needle")
+        assert reopened.search_messages("lifecycle needle")
+        reopened._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE messages SET content=? WHERE session_id=?",
+                ("updated lifecycle needle", "after"),
+            )
+        )
+        assert reopened.search_messages("updated lifecycle")
+        reopened._execute_write(
+            lambda conn: conn.execute(
+                "DELETE FROM messages WHERE session_id=?", ("after",)
+            )
+        )
+    finally:
+        reopened.close()
+
+
+def test_candidate_missing_canonical_table_is_never_promoted(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_duplicate_fts(db_path)
+
+    def destructive_candidate(path, report):
+        conn = sqlite3.connect(path)
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute("DELETE FROM sqlite_master WHERE name='messages'")
+        conn.execute("PRAGMA writable_schema=OFF")
+        conn.commit()
+        conn.close()
+        report.update(repaired=True, strategy="bad-test-candidate")
+        return report
+
+    monkeypatch.setattr(hermes_state, "_run_repair_strategies", destructive_candidate)
+    report = repair_state_db_schema(db_path, backup=False)
+    assert report["repaired"] is False
+    assert "canonical" in report["error"] or "preserve" in report["error"]
+    assert hermes_state._db_opens_cleanly(db_path) is not None
+
+
+def test_startup_prepares_candidate_but_never_promotes(tmp_path, monkeypatch):
+    """Constructor recovery is prepare-only and leaves the active path bad."""
+    from hermes_state import _db_opens_cleanly
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_duplicate_fts(db_path)
+    monkeypatch.setattr(hermes_state, "_repair_attempted_paths", set())
+
+    with pytest.raises(sqlite3.DatabaseError, match="malformed database schema"):
+        SessionDB(db_path=db_path)
+
+    candidates = list(tmp_path.glob("state.db.repair-candidate-*"))
+    assert len(candidates) == 1
+    assert _db_opens_cleanly(candidates[0]) is None
+    assert _db_opens_cleanly(db_path) is not None
+
+
 
 
 def test_auto_heal_attempted_once_per_process(tmp_path, monkeypatch):
@@ -121,11 +220,12 @@ def test_auto_heal_attempted_once_per_process(tmp_path, monkeypatch):
     _corrupt_duplicate_fts(db_path)
     monkeypatch.setattr(hermes_state, "_repair_attempted_paths", set())
 
-    calls = {"n": 0}
+    calls = {"n": 0, "kwargs": []}
     real_repair = hermes_state.repair_state_db_schema
 
     def fake_repair(path, **kw):
         calls["n"] += 1
+        calls["kwargs"].append(kw)
         # Pretend repair failed so the guard's one-shot behavior is exercised.
         return {"repaired": False, "strategy": None, "backup_path": None, "error": "x"}
 
@@ -136,6 +236,7 @@ def test_auto_heal_attempted_once_per_process(tmp_path, monkeypatch):
     with pytest.raises(sqlite3.DatabaseError):
         SessionDB(db_path=db_path)
     assert calls["n"] == 1  # repair attempted only once across both opens
+    assert calls["kwargs"] == [{"promote": False}]
 
     monkeypatch.setattr(hermes_state, "repair_state_db_schema", real_repair)
 
@@ -464,6 +565,7 @@ def _lock_held_by_other_process(db_path: Path, hold_seconds: float = 30.0):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock test")
+@pytest.mark.live_system_guard_bypass
 def test_repair_skips_surgery_while_another_process_holds_the_lock(
     tmp_path, monkeypatch
 ):
@@ -485,6 +587,7 @@ def test_repair_skips_surgery_while_another_process_holds_the_lock(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock test")
+@pytest.mark.live_system_guard_bypass
 def test_repair_reports_success_when_the_holder_already_healed_the_db(
     tmp_path, monkeypatch
 ):
@@ -840,3 +943,128 @@ def test_repair_honors_configured_delete_mode(tmp_path, monkeypatch):
 
     assert report["repaired"] is True
     assert _mode_of(db_path) == "delete"
+
+
+def test_canonical_fingerprint_includes_prompt_and_usage_dependencies(tmp_path):
+    db_path = tmp_path / "state.db"
+    sid = _build_healthy_db(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute("INSERT INTO system_prompts(hash, prompt) VALUES('h', 'prompt one')")
+    conn.execute("UPDATE sessions SET system_prompt_hash='h' WHERE id=?", (sid,))
+    conn.execute(
+        "INSERT INTO session_model_usage(session_id, model) VALUES(?, 'model-a')",
+        (sid,),
+    )
+    conn.commit()
+    conn.close()
+
+    before, error = hermes_state._canonical_repair_fingerprint(db_path)
+    assert error is None
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE system_prompts SET prompt='prompt two' WHERE hash='h'")
+    conn.commit()
+    conn.close()
+    after_prompt, _ = hermes_state._canonical_repair_fingerprint(db_path)
+    assert after_prompt != before
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "UPDATE session_model_usage SET input_tokens=1 WHERE session_id=?", (sid,)
+    )
+    conn.commit()
+    conn.close()
+    after_usage, _ = hermes_state._canonical_repair_fingerprint(db_path)
+    assert after_usage != after_prompt
+
+
+def test_repair_complete_probe_detects_and_repairs_canonical_fts_gap(tmp_path):
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO messages_fts(messages_fts,rowid,content,tool_name,tool_calls) "
+        "SELECT 'delete',id,content,tool_name,tool_calls FROM messages LIMIT 1"
+    )
+    conn.commit()
+    conn.close()
+
+    assert hermes_state._db_opens_cleanly(db_path) is None
+    reason = hermes_state._db_opens_cleanly(
+        db_path, require_repair_complete=True
+    )
+    assert reason is not None and "canonical-content verification" in reason
+    report = repair_state_db_schema(db_path, backup=False, promote=True)
+    assert report["repaired"] is True
+    assert hermes_state._db_opens_cleanly(
+        db_path, require_repair_complete=True
+    ) is None
+
+
+def test_repair_lock_open_failure_refuses_structural_repair(tmp_path):
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    with patch.object(Path, "open", side_effect=OSError("read-only lock dir")):
+        with hermes_state._cross_process_repair_lock(db_path) as acquired:
+            assert acquired is False
+
+
+def test_writer_holder_probe_uncertainty_fails_closed(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    db_path.touch()
+    monkeypatch.setattr(
+        hermes_state,
+        "_connect_repair_durable",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("inspection failed")),
+    )
+    assert hermes_state._live_writer_holds_db(db_path) is True
+
+
+def test_actual_cli_repair_lifecycle_detects_content_gap(tmp_path):
+    """The real CLI check and repair paths use repair-complete validation."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO messages_fts(messages_fts,rowid,content,tool_name,tool_calls) "
+        "SELECT 'delete',id,content,tool_name,tool_calls FROM messages LIMIT 1"
+    )
+    conn.commit()
+    conn.close()
+
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+    root = Path(__file__).resolve().parents[1]
+    check = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "sessions", "repair", "--check-only"],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert check.returncode == 0
+    assert "does not open cleanly" in check.stdout
+    assert hermes_state._db_opens_cleanly(
+        db_path, require_repair_complete=True
+    ) is not None
+
+    repaired = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "sessions",
+            "repair",
+            "--no-backup",
+        ],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert repaired.returncode == 0, repaired.stderr
+    assert "Repaired" in repaired.stdout
+    assert hermes_state._db_opens_cleanly(
+        db_path, require_repair_complete=True
+    ) is None

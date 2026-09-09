@@ -141,7 +141,7 @@ def cmd_sessions(args, sessions_parser=None):
         if not db_path.exists():
             print(f"No session database at {db_path} (nothing to repair).")
             return
-        reason = _db_opens_cleanly(db_path)
+        reason = _db_opens_cleanly(db_path, require_repair_complete=True)
         if reason is None:
             print(f"✓ {db_path} opens cleanly — no repair needed.")
             return
@@ -150,7 +150,9 @@ def cmd_sessions(args, sessions_parser=None):
             return
         print("Repairing (a backup copy is made first)…")
         report = repair_state_db_schema(
-            db_path, backup=not getattr(args, "no_backup", False)
+            db_path,
+            backup=not getattr(args, "no_backup", False),
+            promote=True,
         )
         if report.get("repaired"):
             if report.get("backup_path"):
