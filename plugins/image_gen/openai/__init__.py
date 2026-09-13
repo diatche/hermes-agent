@@ -1,9 +1,10 @@
 """OpenAI image generation backend.
 
-Exposes OpenAI's ``gpt-image-2`` model at three quality tiers as an
-:class:`ImageGenProvider` implementation. The tiers are implemented as
-three virtual model IDs so the ``hermes tools`` model picker and the
-``image_gen.model`` config key behave like any other multi-model backend:
+Exposes OpenAI's ``gpt-image-2`` quality tiers and the ``gpt-image-2.5-flare``
+and ``gpt-image-2.5-sunburst`` API models through the
+:class:`ImageGenProvider` implementation. The legacy tiers are virtual model
+IDs so the ``hermes tools`` model picker and ``image_gen.model`` config key
+behave like any other multi-model backend:
 
     gpt-image-2-low     ~15s   fastest, good for iteration
     gpt-image-2-medium  ~40s   default — balanced
@@ -58,18 +59,35 @@ _MODELS: Dict[str, Dict[str, Any]] = {
         "speed": "~15s",
         "strengths": "Fast iteration, lowest cost",
         "quality": "low",
+        "api_model": API_MODEL,
     },
     "gpt-image-2-medium": {
         "display": "GPT Image 2 (Medium)",
         "speed": "~40s",
         "strengths": "Balanced — default",
         "quality": "medium",
+        "api_model": API_MODEL,
     },
     "gpt-image-2-high": {
         "display": "GPT Image 2 (High)",
         "speed": "~2min",
         "strengths": "Highest fidelity, strongest prompt adherence",
         "quality": "high",
+        "api_model": API_MODEL,
+    },
+    "gpt-image-2.5-flare": {
+        "display": "GPT Image 2.5 Flare (Auto)",
+        "speed": "Fast",
+        "strengths": "Everyday image generation and editing",
+        "quality": "auto",
+        "api_model": "gpt-image-2.5-flare",
+    },
+    "gpt-image-2.5-sunburst": {
+        "display": "GPT Image 2.5 Sunburst (Auto)",
+        "speed": "Slower",
+        "strengths": "Precision generation and editing",
+        "quality": "auto",
+        "api_model": "gpt-image-2.5-sunburst",
     },
 }
 
@@ -298,7 +316,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
 
             try:
                 response = client.images.edit(
-                    model=API_MODEL,
+                    model=meta["api_model"],
                     image=files if len(files) > 1 else files[0],
                     prompt=prompt,
                     size=size,  # type: ignore[arg-type]  # _SIZES values are valid gpt-image sizes
@@ -319,7 +337,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
             # gpt-image-2 returns b64_json unconditionally and REJECTS
             # ``response_format`` as an unknown parameter. Don't send it.
             payload: Dict[str, Any] = {
-                "model": API_MODEL,
+                "model": meta["api_model"],
                 "prompt": prompt,
                 "size": size,
                 "n": 1,

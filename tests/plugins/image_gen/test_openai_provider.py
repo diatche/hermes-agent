@@ -57,9 +57,15 @@ class TestMetadata:
     def test_default_model(self, provider):
         assert provider.default_model() == "gpt-image-2-medium"
 
-    def test_list_models_three_tiers(self, provider):
+    def test_list_models_includes_gpt_image_2_and_2_5(self, provider):
         ids = [m["id"] for m in provider.list_models()]
-        assert ids == ["gpt-image-2-low", "gpt-image-2-medium", "gpt-image-2-high"]
+        assert ids == [
+            "gpt-image-2-low",
+            "gpt-image-2-medium",
+            "gpt-image-2-high",
+            "gpt-image-2.5-flare",
+            "gpt-image-2.5-sunburst",
+        ]
 
     def test_catalog_entries_have_display_speed_strengths(self, provider):
         for entry in provider.list_models():
@@ -189,6 +195,24 @@ class TestGenerate:
         assert fake_client.images.generate.call_args.kwargs["quality"] == expected_quality
         # Always the same underlying API model regardless of tier.
         assert fake_client.images.generate.call_args.kwargs["model"] == "gpt-image-2"
+
+    def test_gpt_image_2_5_flare_selection_reaches_api(self, provider, tmp_path):
+        import yaml
+
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({"image_gen": {"openai": {"model": "gpt-image-2.5-flare"}}})
+        )
+        fake_client = MagicMock()
+        fake_client.images.generate.return_value = _fake_response(b64=_b64_png())
+
+        with _patched_openai(fake_client):
+            result = provider.generate("a cat")
+
+        assert result["success"] is True
+        assert result["model"] == "gpt-image-2.5-flare"
+        assert result["quality"] == "auto"
+        assert fake_client.images.generate.call_args.kwargs["model"] == "gpt-image-2.5-flare"
+        assert fake_client.images.generate.call_args.kwargs["quality"] == "auto"
 
     @pytest.mark.parametrize("aspect,expected_size", [
         ("landscape", "1536x1024"),
