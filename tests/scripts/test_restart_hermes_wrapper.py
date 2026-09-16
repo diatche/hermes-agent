@@ -35,6 +35,11 @@ def _environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
         "health-python",
         f"#!/bin/sh\nprintf 'health %s\\n' \"$*\" >> '{calls}'\nexit 0\n",
     )
+    runtime_python = _command(
+        fake_bin,
+        "runtime-python",
+        "#!/bin/sh\ncat >/dev/null\nexit 0\n",
+    )
     plist = tmp_path / "wrapper.plist"
     plist.write_text("plist\n", encoding="utf-8")
 
@@ -75,6 +80,7 @@ def _environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
             "HERMES_WRAPPER_ENTRYPOINT": str(entrypoint),
             "HERMES_WRAPPER_HEALTH_SCRIPT": str(health),
             "HERMES_WRAPPER_HEALTH_PYTHON": str(python),
+            "HERMES_WRAPPER_PYTHON": str(runtime_python),
             "HERMES_WRAPPER_KILL_BIN": str(fake_bin / "kill-command"),
             "HERMES_WRAPPER_LOG_DIR": str(tmp_path / "logs"),
             "HERMES_WRAPPER_START_WAIT": "2",
@@ -207,7 +213,7 @@ def test_status_requires_loaded_job_and_listening_port(tmp_path: Path) -> None:
     assert "port 9119 is not listening" in unhealthy.stdout
 
 
-def test_update_quiescence_only_requires_unloaded_job_and_free_port(tmp_path: Path) -> None:
+def test_update_quiescence_requires_no_detected_hermes_runtime(tmp_path: Path) -> None:
     env, _, listener = _environment(tmp_path)
     listener.unlink()
 
@@ -220,4 +226,23 @@ def test_update_quiescence_only_requires_unloaded_job_and_free_port(tmp_path: Pa
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "wrapper unloaded and port 9119 is free" in result.stdout
+    assert "Update quiescence verified" in result.stdout
+
+
+def test_update_quiescence_fails_closed_when_runtime_matcher_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    env, _, listener = _environment(tmp_path)
+    listener.unlink()
+    env["HERMES_WRAPPER_PYTHON"] = str(tmp_path / "missing-python")
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--assert-update-quiescence"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "matcher-unavailable" in result.stderr

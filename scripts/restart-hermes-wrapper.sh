@@ -167,12 +167,89 @@ detach_restart() {
   launchctl submit -l "$worker_label" -- /bin/bash -lc "$command"
 }
 
-assert_update_quiescence() {
-  if ! job_is_loaded && port_is_free; then
-    echo "Update quiescence verified: wrapper unloaded and port $PORT is free"
+loaded_official_gateway_labels() {
+  launchctl list 2>/dev/null | awk '$3 ~ /^ai[.]hermes[.]gateway($|-)/ { print $3 }'
+}
+
+wrapper_app_pids() {
+  ps -axo pid=,command= | awk -v wrapper="$APP/Contents/MacOS/HermesGateway" '
+    {
+      command = $0
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", command)
+      if (command == wrapper || index(command, wrapper " ") == 1) print $1
+    }'
+}
+
+hermes_runtime_pids() {
+  local python_bin="${HERMES_WRAPPER_PYTHON:-$REPO/venv/bin/python}" output
+  if [[ ! -x "$python_bin" ]]; then
+    echo "matcher-unavailable"
     return 0
   fi
-  echo "ERROR: update quiescence requires wrapper unloaded and port $PORT free" >&2
+  if ! output="$(
+    ps -axo pid=,ppid=,command= | PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" \
+      "$python_bin" -c '
+import os
+import sys
+from gateway.status import looks_like_dashboard_runtime_command_line, looks_like_gateway_runtime_command_line
+records = []
+parents = {}
+for line in sys.stdin:
+    parts = line.strip().split(None, 2)
+    if len(parts) != 3:
+        continue
+    try:
+        pid, parent = int(parts[0]), int(parts[1])
+    except ValueError:
+        continue
+    records.append((pid, parts[2]))
+    parents[pid] = parent
+excluded = {os.getpid()}
+pid = os.getppid()
+while pid > 1 and pid not in excluded:
+    excluded.add(pid)
+    pid = parents.get(pid, 0)
+for pid, command in records:
+    if pid not in excluded and (
+        looks_like_gateway_runtime_command_line(command)
+        or looks_like_dashboard_runtime_command_line(command)
+    ):
+        print(pid)
+'
+  )"; then
+    echo "matcher-unavailable"
+    return 0
+  fi
+  printf '%s\n' "$output" | awk 'NF'
+}
+
+listener_pids() {
+  lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sort -nu
+}
+
+assert_update_quiescence() {
+  local stable=0
+  for _ in {1..40}; do
+    if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 \
+      && [[ -z "$(wrapper_app_pids)" ]] \
+      && [[ -z "$(hermes_runtime_pids)" ]] \
+      && [[ -z "$(listener_pids)" ]] \
+      && [[ -z "$(loaded_official_gateway_labels)" ]]; then
+      stable=$((stable + 1))
+      if (( stable >= 12 )); then
+        echo "Update quiescence verified"
+        return 0
+      fi
+    else
+      stable=0
+    fi
+    sleep 0.25
+  done
+  echo "ERROR: Hermes update quiescence could not be established" >&2
+  loaded_official_gateway_labels >&2 || true
+  wrapper_app_pids >&2 || true
+  hermes_runtime_pids >&2 || true
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >&2 || true
   return 1
 }
 
