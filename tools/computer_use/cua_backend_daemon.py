@@ -187,7 +187,7 @@ class _EmbeddedCuaDaemon:
 
     def _socket_ready(self, env: Dict[str, str]) -> bool:
         """``cua-driver status --socket`` exits 0 once the private daemon accepts connections."""
-        probe = _cb()._run_quiet([self._command, "status", "--socket", self.socket_path], timeout=2.0, env=env, swallow=_QUIET_ERRORS)
+        probe = _cb()._run_quiet([self._command, "status", "--socket", self.socket_path], timeout=5.0, env=env, swallow=_QUIET_ERRORS)
         return probe is not None and probe.returncode == 0
 
     def proxy_invocation(self) -> Tuple[str, List[str]]:
