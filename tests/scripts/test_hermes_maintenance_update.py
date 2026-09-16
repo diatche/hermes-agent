@@ -78,7 +78,7 @@ def _make_repo(tmp_path: Path, *, conflict: bool = False) -> tuple[Path, str]:
         "venv/bin/hermes",
         "#!/bin/sh\nset -eu\n"
         "if [ \"${1:-}\" = update ] && [ \"${2:-}\" = --help ]; then\n"
-        "  echo 'usage: hermes update [--backup] [--no-gateway-restart]'\n"
+        "  echo 'usage: hermes update [--no-backup]'\n"
         "  exit 0\n"
         "fi\n"
         f"printf '%s\\n' \"$*\" >> {updater_calls!s}\n"
@@ -152,7 +152,7 @@ def _fake_official_updater(tmp_path: Path) -> tuple[Path, Path]:
         "fake-hermes",
         "#!/bin/sh\nset -eu\n"
         "if [ \"${1:-}\" = update ] && [ \"${2:-}\" = --help ]; then\n"
-        "  echo 'usage: hermes update [--backup] [--no-gateway-restart]'\n"
+        "  echo 'usage: hermes update [--no-backup]'\n"
         "  exit 0\n"
         "fi\n"
         f"printf '%s\\n' \"$*\" >> {calls!s}\n"
@@ -220,6 +220,7 @@ def _args(repo: Path, state_dir: Path, wrapper: Path, health: Path) -> Namespace
         state_dir=state_dir,
         wrapperctl=wrapper,
         health_script=health,
+        backup_root=None,
         updater_executable=updater,
         remote="origin",
         upstream_branch="main",
@@ -237,6 +238,24 @@ def test_default_health_timeout_is_bounded_for_multi_gigabyte_state_checks() -> 
     timeout = module._parser().parse_args([]).health_timeout
 
     assert 600 <= timeout <= 1800
+
+
+def test_external_backup_gate_requires_complete_recent_generation(tmp_path: Path) -> None:
+    module = _load_script_module()
+    generation = tmp_path / "generations" / "20260916T000000Z-test-daily"
+    archive = _write(generation, "archive.zip", "verified bytes")
+    manifest = {
+        "archive": "archive.zip",
+        "size_bytes": archive.stat().st_size,
+        "source": str(Path.home() / ".hermes"),
+    }
+    manifest_path = _write(generation, "manifest.json", json.dumps(manifest))
+
+    assert module._assert_fresh_verified_backup(tmp_path) == manifest_path
+
+    archive.write_text("wrong size", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="size does not match"):
+        module._assert_fresh_verified_backup(tmp_path)
 
 
 def test_public_help_exposes_pre_post_check_and_help() -> None:
@@ -464,14 +483,14 @@ def test_pre_stops_runtime_prints_handoff_and_never_runs_updater(tmp_path: Path)
     state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
     assert f"cd {repo}" in result.stdout
     assert (
-        f"{repo}/venv/bin/hermes update --branch main --backup --yes --no-gateway-restart"
+        f"{repo}/venv/bin/hermes update --branch main --no-backup --yes"
     ) in result.stdout
     assert "--revision" not in result.stdout
     assert f"{Path(sys.executable).resolve()} {SCRIPT} --post" in result.stdout
     assert state["phase"] == "awaiting-official-update"
 
 
-def test_pre_refuses_unsupported_gateway_restart_opt_out_before_stop(
+def test_pre_refuses_unsupported_backup_opt_out_before_stop(
     tmp_path: Path,
 ) -> None:
     repo, _ = _make_repo(tmp_path)
@@ -500,7 +519,7 @@ def test_pre_refuses_unsupported_gateway_restart_opt_out_before_stop(
     )
 
     assert result.returncode == 1
-    assert "does not support --no-gateway-restart" in result.stderr
+    assert "does not support --no-backup" in result.stderr
     assert calls.read_text(encoding="utf-8").splitlines() == ["--status"]
 
 

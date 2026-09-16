@@ -47,6 +47,7 @@ DEFAULT_REPO = Path.home() / ".hermes" / "hermes-agent"
 DEFAULT_STATE_DIR = Path.home() / ".hermes" / "local" / "update"
 DEFAULT_WRAPPERCTL = Path.home() / ".hermes" / "local" / "bin" / "hermes-gateway-wrapperctl"
 DEFAULT_HEALTH_SCRIPT = Path.home() / ".hermes" / "local" / "health" / "hermes_core_health.py"
+DEFAULT_BACKUP_ROOT = Path("/Volumes/SamsungS3/Backups/Hermes")
 
 ZERO_OID = "0" * 40
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -74,8 +75,9 @@ import sentence_transformers
 import transformers
 """
 OFFICIAL_UPDATE_ARGUMENTS = ("update", "--branch", "main")
-OFFICIAL_UPDATE_SUFFIX = ("--backup", "--yes", "--no-gateway-restart")
+OFFICIAL_UPDATE_SUFFIX = ("--no-backup", "--yes")
 SHALLOW_DEEPEN_COMMITS = 4096
+MAX_BACKUP_AGE_SECONDS = 4 * 60 * 60
 
 
 class UpdateTarget(NamedTuple):
@@ -231,20 +233,75 @@ def _wrapper(
 
 
 def _official_update_arguments(updater: Path, repo: Path, timeout: float) -> tuple[str, ...]:
-    """Verify the invoked updater parser before printing its exact command."""
+    """Verify the invoked updater parser before printing its exact command.
+
+    The separate Samsung generation is the fail-closed backup.  The built-in
+    full backup is deliberately disabled because it writes beneath HERMES_HOME,
+    may continue after backup failure, and this host's included backup set is
+    larger than the remaining internal free space.
+    """
     help_result = _run(
         (str(updater), "update", "--help"), cwd=repo, timeout=timeout
     )
     help_text = f"{help_result.stdout}\n{help_result.stderr}"
     if help_result.returncode:
         raise RuntimeError("could not verify the official Hermes updater CLI")
-    for required in ("--backup", "--no-gateway-restart"):
+    for required in ("--no-backup",):
         if not re.search(rf"(?<![\w-]){re.escape(required)}(?![\w-])", help_text):
             raise RuntimeError(
                 f"official Hermes updater does not support {required}; "
                 "refusing to invent or omit the required safety option"
             )
     return (*OFFICIAL_UPDATE_ARGUMENTS, *OFFICIAL_UPDATE_SUFFIX)
+
+
+def _assert_fresh_verified_backup(
+    backup_root: Path, *, max_age_seconds: float = MAX_BACKUP_AGE_SECONDS,
+) -> Path:
+    """Require a recent completed immutable Samsung backup generation.
+
+    ``backup_hermes_to_samsung.sh`` has already zip-tested and SHA-verified the
+    archive before publishing the manifest.  This gate proves the real volume
+    is mounted, then binds maintenance to the newest complete generation by
+    validating its manifest, archive size, source, and age.
+    """
+    if len(backup_root.parts) >= 3 and backup_root.parts[1] == "Volumes":
+        volume_path = Path(backup_root.anchor, *backup_root.parts[1:3])
+        if not volume_path.exists() or not os.path.ismount(volume_path):
+            raise RuntimeError(f"verified backup volume is not mounted: {volume_path}")
+    generation_root = backup_root / "generations"
+    manifests = sorted(
+        generation_root.glob("*/manifest.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not manifests:
+        raise RuntimeError(f"no verified Hermes backup generation found under {generation_root}")
+    manifest_path = manifests[0]
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        archive_name = str(payload["archive"])
+        expected_size = int(payload["size_bytes"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"latest Hermes backup manifest is malformed: {manifest_path}") from exc
+    if payload.get("source") != str(Path.home() / ".hermes"):
+        raise RuntimeError("latest Hermes backup generation has the wrong source root")
+    if Path(archive_name).name != archive_name or archive_name != "archive.zip":
+        raise RuntimeError("latest Hermes backup manifest has an unsafe archive path")
+    archive = manifest_path.parent / archive_name
+    try:
+        actual_size = archive.stat().st_size
+        age = datetime.now(timezone.utc).timestamp() - manifest_path.stat().st_mtime
+    except OSError as exc:
+        raise RuntimeError("latest Hermes backup archive is missing or unreadable") from exc
+    if expected_size <= 0 or actual_size != expected_size:
+        raise RuntimeError("latest Hermes backup archive size does not match its verified manifest")
+    if age < -300 or age > max_age_seconds:
+        raise RuntimeError(
+            "latest verified Hermes backup is stale; run "
+            "~/.hermes/scripts/backup/backup_hermes_to_samsung.sh daily"
+        )
+    return manifest_path
 
 
 def _health(health_script: Path, repo: Path, timeout: float) -> None:
@@ -810,6 +867,13 @@ def _run_pre_locked(
     try:
         _progress("Checking for interrupted maintenance to recover")
         _recover_interrupted(args, repo, state_dir)
+        backup_root = getattr(args, "backup_root", None)
+        if backup_root is None and repo == DEFAULT_REPO.resolve():
+            backup_root = DEFAULT_BACKUP_ROOT
+        backup_manifest: Path | None = None
+        if backup_root is not None:
+            _progress("Verifying a fresh immutable Samsung backup generation")
+            backup_manifest = _assert_fresh_verified_backup(backup_root.resolve())
         _progress("Validating the diatche checkout and gateway wrapper")
         _assert_checkout(repo, "diatche")
         _wrapper(args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout)
@@ -844,6 +908,7 @@ def _run_pre_locked(
             branch_oid=target.branch_oid,
             target_skew=target_skew,
             target_label=target.label,
+            backup_manifest=str(backup_manifest) if backup_manifest else "fixture-mode-not-required",
             candidate_ref=candidate_ref,
             origin_ref=origin_ref,
             origin_old=origin_old,
@@ -983,6 +1048,16 @@ def _run_post_locked(
             target_oid=upstream_oid,
             branch_oid=branch_oid,
             integration_old=integration_old,
+        )
+        _progress("Rebuilding and validating the pinned candidate after dependency update")
+        post_candidate_ref, post_candidate_oid = _build_candidate(
+            repo, state_dir, f"post-{journal['run_id']}", integration_old, upstream_oid
+        )
+        candidate_oid = post_candidate_oid
+        journal.update(
+            integration_new=candidate_oid,
+            candidate_ref=post_candidate_ref,
+            post_update_candidate_sha=candidate_oid,
         )
         journal.update(
             phase="official-updated", owner_pid=os.getpid(), updated_at=_now()
@@ -1191,6 +1266,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR, help=hidden)
     parser.add_argument("--wrapperctl", type=Path, default=DEFAULT_WRAPPERCTL, help=hidden)
     parser.add_argument("--health-script", type=Path, default=DEFAULT_HEALTH_SCRIPT, help=hidden)
+    parser.add_argument("--backup-root", type=Path, default=None, help=hidden)
     parser.add_argument("--updater-executable", type=Path, default=None, help=hidden)
     parser.add_argument("--remote", default="origin", help=hidden)
     parser.add_argument("--upstream-branch", default="main", help=hidden)

@@ -18,16 +18,32 @@ provenance proofs, or hypothetical concurrent-writer policy to it.
 
 ## Usage
 
-### 0. Quiesce services the wrapper does not own
+### 0. Create the fail-closed external backup
+
+Run the established Samsung generation builder and wait for a successful exit:
+
+```bash
+~/.hermes/scripts/backup/backup_hermes_to_samsung.sh daily
+```
+
+It stages on the mounted Samsung volume, snapshots SQLite databases, tests the
+zip, hashes the result, and publishes an immutable manifest. Prepare requires a
+complete generation less than four hours old. The official updater's internal
+full backup is intentionally disabled: this host's included set is about 32 GiB
+while the internal disk has about 31 GiB free, and that updater backup is
+best-effort rather than fail-closed.
+
+### 1. Quiesce services the wrapper does not own
 
 The maintenance wrapper stops only the default signed `HermesGateway.app`
 wrapper. Before prepare, stop the separately supervised named profiles from an
 independent Terminal and gracefully exit any manually served dashboard:
 
 ```bash
-cd ~/.hermes/hermes-agent
-./venv/bin/hermes --profile crmwebhook gateway stop
-./venv/bin/hermes --profile recovery gateway stop
+launchctl bootout "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/ai.hermes.gateway-crmwebhook.plist"
+launchctl bootout "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/ai.hermes.gateway-recovery.plist"
 # In the terminal serving a manual dashboard, press Ctrl-C and wait for exit.
 ```
 
@@ -38,12 +54,13 @@ wrapper, so a loaded/running named service, manual gateway, dashboard, or
 listener survivor blocks the updater and triggers recovery rather than being
 killed by this script.
 
-### 1. Prepare
+### 2. Prepare
 
-Run the command with no arguments (equivalent to `--pre --stable`):
+Run the pinned command below:
 
 ```bash
-./venv/bin/python scripts/hermes-maintenance-update.py
+./venv/bin/python scripts/hermes-maintenance-update.py \
+  --pre --commit 345cd2b057a452236de401d3534b8502a7465e8d
 ```
 
 Use the repository venv interpreter exactly. On this host, bare `python3` and
@@ -53,16 +70,17 @@ that ran prepare so post uses the same Python 3.11 environment.
 
 The pre step:
 
-1. validates the clean `diatche` checkout and custom gateway wrapper;
-2. privately fetches `origin/main` and upstream release tags, deepening a
+1. requires a fresh immutable Samsung backup generation;
+2. validates the clean `diatche` checkout and custom gateway wrapper;
+3. privately fetches `origin/main` and upstream release tags, deepening a
    shallow checkout by 4096 commits first so tag ancestry can be proven;
 3. selects the newest numeric stable tag reachable from the fetched upstream tip;
 4. reports the selected target, upstream tip, and commit skew as diagnostics;
    skew never pauses or refuses a supervised update;
 5. checks mergeability and validates an isolated candidate;
 6. rechecks checkout/ref invariants;
-7. verifies that the exact updater executable supports both `--backup` and
-   `--no-gateway-restart`, failing before interruption if either is absent;
+7. verifies that the exact updater executable supports `--no-backup`; this is
+   safe only because step 0 has already passed the external backup gate;
 8. stops the custom gateway wrapper and requires global update quiescence;
 9. moves local `main` to the selected target when it is behind upstream tip;
 10. records an `awaiting-official-update` journal;
@@ -81,13 +99,13 @@ Alternative target modes are explicit:
 ./venv/bin/python scripts/hermes-maintenance-update.py --commit <SHA>
 ```
 
-### 2. Run the printed official update command
+### 3. Run the printed official update command
 
 The printed command is equivalent to:
 
 ```bash
 cd ~/.hermes/hermes-agent && \
-  ./venv/bin/hermes update --branch main --backup --yes --no-gateway-restart
+  ./venv/bin/hermes update --branch main --no-backup --yes
 ```
 
 Run it directly. Its stdout/stderr and any terminal interaction are therefore
@@ -95,17 +113,12 @@ visible and connected to your terminal rather than captured by the maintenance
 wrapper. The official updater remains unchanged: it advances `main` to the
 upstream tip it observes and performs its ordinary dependency, asset, migration,
 cache, and managed-component synchronization. The custom wrapper is already
-stopped, and the current official updater does not relaunch it; lifecycle
-ownership returns to the maintenance script in the post step.
+stopped and global update quiescence has been proved, so the updater has no
+gateway/dashboard process to restart. Lifecycle ownership returns to the
+maintenance script in the post step. The exact v0.21.3 parser does not expose
+`--no-gateway-restart`; this workflow does not invent that unsupported flag.
 
-The wrapper probes the invoked executable's `update --help` before stopping
-anything. It does not print an unsupported restart-suppression option and does
-not silently omit it. The exact installed/v0.21.3 parser assessed for this run
-does **not** expose `--no-gateway-restart`, while the currently fetched upstream
-parser does; prepare therefore fails closed until the executable that will run
-the update has the supported option.
-
-### 3. Run the printed post command
+### 4. Run the printed post command
 
 The printed command is equivalent to:
 
@@ -114,9 +127,11 @@ The printed command is equivalent to:
 ```
 
 Run `--post` even if the official updater failed or was interrupted. The post
-step validates the resulting Git state. If valid, one compare-and-swap
-transaction restores `main` to the selected target and publishes the
-prevalidated candidate to `diatche`. It then restores that checkout, applies the
+step validates the resulting Git state, then rebuilds and validates the pinned
+candidate again against the dependency environment produced by the official
+updater. If valid, one compare-and-swap transaction restores `main` to the
+selected target and publishes that post-update candidate to `diatche`. It then
+restores that checkout, applies the
 narrow Hindsight compatibility guard, starts the custom wrapper, and runs live
 health checks. `origin/main` remains at the tip observed by the updater, which
 may be a descendant of the preflight tip if upstream advanced meanwhile. If the updater
@@ -128,9 +143,10 @@ profile services that were stopped in step 0 and verify their profile-specific
 health:
 
 ```bash
-cd ~/.hermes/hermes-agent
-./venv/bin/hermes --profile crmwebhook gateway start
-./venv/bin/hermes --profile recovery gateway start
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/ai.hermes.gateway-crmwebhook.plist"
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/ai.hermes.gateway-recovery.plist"
 ```
 
 The post step cannot observe the separate updater process's exit code. It judges
