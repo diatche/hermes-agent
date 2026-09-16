@@ -258,6 +258,15 @@ def test_external_backup_gate_requires_complete_recent_generation(tmp_path: Path
         module._assert_fresh_verified_backup(tmp_path)
 
 
+def test_post_update_candidate_runtime_probe_fails_closed(tmp_path: Path) -> None:
+    module = _load_script_module()
+    repo, _ = _make_repo(tmp_path)
+    _write(repo, "venv/bin/python", "#!/bin/sh\nexit 7\n").chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="runtime import validation failed"):
+        module._probe_candidate_runtime(repo, repo)
+
+
 def test_public_help_exposes_pre_post_check_and_help() -> None:
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--help"],

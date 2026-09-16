@@ -78,6 +78,14 @@ OFFICIAL_UPDATE_ARGUMENTS = ("update", "--branch", "main")
 OFFICIAL_UPDATE_SUFFIX = ("--no-backup", "--yes")
 SHALLOW_DEEPEN_COMMITS = 4096
 MAX_BACKUP_AGE_SECONDS = 4 * 60 * 60
+CANDIDATE_RUNTIME_IMPORT_PROBE = """\
+import gateway.run
+import gateway.platforms.api_server
+import hermes_state
+import hermes_state_messages
+import tools.computer_use.cua_backend
+import tools.computer_use.cua_backend_daemon
+"""
 
 
 class UpdateTarget(NamedTuple):
@@ -518,8 +526,28 @@ def _target_skew(repo: Path, target_oid: str, branch_oid: str) -> int:
         raise RuntimeError("could not measure target/upstream skew") from exc
 
 
+def _probe_candidate_runtime(repo: Path, worktree: Path) -> None:
+    python = repo / "venv" / "bin" / "python"
+    if not python.is_file() or not os.access(python, os.X_OK):
+        raise RuntimeError("cannot validate candidate: Hermes venv Python is missing")
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    probed = _run(
+        (str(python), "-c", CANDIDATE_RUNTIME_IMPORT_PROBE),
+        cwd=worktree,
+        timeout=120,
+        env=env,
+    )
+    if probed.returncode:
+        detail = probed.stderr.strip() or probed.stdout.strip()
+        raise RuntimeError(
+            "post-update candidate runtime import validation failed"
+            + (f": {detail}" if detail else "")
+        )
+
+
 def _build_candidate(
-    repo: Path, state_dir: Path, run_id: str, integration_oid: str, upstream_oid: str
+    repo: Path, state_dir: Path, run_id: str, integration_oid: str, upstream_oid: str,
+    *, runtime_probe: bool = False,
 ) -> tuple[str, str]:
     candidate_ref = f"refs/hermes-maintenance/candidates/{run_id}"
     root = Path(tempfile.mkdtemp(prefix=f"candidate-{run_id}-", dir=state_dir))
@@ -550,6 +578,8 @@ def _build_candidate(
                 "candidate local integration delta failed git diff --check"
                 + (f":\n{detail}" if detail else "")
             )
+        if runtime_probe:
+            _probe_candidate_runtime(repo, worktree)
         created = _git(repo, "update-ref", candidate_ref, candidate_oid, ZERO_OID, check=False)
         if created.returncode:
             raise RuntimeError("candidate ref creation compare-and-swap failed")
@@ -1051,7 +1081,8 @@ def _run_post_locked(
         )
         _progress("Rebuilding and validating the pinned candidate after dependency update")
         post_candidate_ref, post_candidate_oid = _build_candidate(
-            repo, state_dir, f"post-{journal['run_id']}", integration_old, upstream_oid
+            repo, state_dir, f"post-{journal['run_id']}", integration_old, upstream_oid,
+            runtime_probe=True,
         )
         candidate_oid = post_candidate_oid
         journal.update(
