@@ -77,6 +77,10 @@ def _make_repo(tmp_path: Path, *, conflict: bool = False) -> tuple[Path, str]:
         repo,
         "venv/bin/hermes",
         "#!/bin/sh\nset -eu\n"
+        "if [ \"${1:-}\" = update ] && [ \"${2:-}\" = --help ]; then\n"
+        "  echo 'usage: hermes update [--backup] [--no-gateway-restart]'\n"
+        "  exit 0\n"
+        "fi\n"
         f"printf '%s\\n' \"$*\" >> {updater_calls!s}\n"
         "git fetch origin main\n"
         "git update-ref refs/heads/main refs/remotes/origin/main\n"
@@ -100,16 +104,23 @@ def _fake_runtime(
     *,
     fail_health_call: int | None = None,
     fail_stop: bool = False,
+    fail_quiescence: bool = False,
 ):
     calls = tmp_path / "wrapper-calls.log"
     health_count = tmp_path / "health-count"
-    stop_clause = '[ "$1" != --force-stop ]\n' if fail_stop else "exit 0\n"
+    failure_clauses = []
+    if fail_stop:
+        failure_clauses.append('[ "$1" != --force-stop ] || exit 1')
+    if fail_quiescence:
+        failure_clauses.append('[ "$1" != --assert-update-quiescence ] || exit 1')
+    failure_body = "\n".join(failure_clauses) + ("\n" if failure_clauses else "")
     wrapper = _write(
         tmp_path,
         "wrapperctl",
         "#!/bin/sh\n"
         f"printf '%s\\n' \"$*\" >> {calls!s}\n"
-        f"{stop_clause}",
+        f"{failure_body}"
+        "exit 0\n",
     )
     fail_test = (
         f"if n == {fail_health_call}:\n    raise SystemExit(1)\n"
@@ -140,6 +151,10 @@ def _fake_official_updater(tmp_path: Path) -> tuple[Path, Path]:
         tmp_path,
         "fake-hermes",
         "#!/bin/sh\nset -eu\n"
+        "if [ \"${1:-}\" = update ] && [ \"${2:-}\" = --help ]; then\n"
+        "  echo 'usage: hermes update [--backup] [--no-gateway-restart]'\n"
+        "  exit 0\n"
+        "fi\n"
         f"printf '%s\\n' \"$*\" >> {calls!s}\n"
         "git fetch origin main\n"
         "git update-ref refs/heads/main refs/remotes/origin/main\n"
@@ -216,6 +231,14 @@ def _args(repo: Path, state_dir: Path, wrapper: Path, health: Path) -> Namespace
     )
 
 
+def test_default_health_timeout_is_bounded_for_multi_gigabyte_state_checks() -> None:
+    module = _load_script_module()
+
+    timeout = module._parser().parse_args([]).health_timeout
+
+    assert 600 <= timeout <= 1800
+
+
 def test_public_help_exposes_pre_post_check_and_help() -> None:
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--help"],
@@ -248,6 +271,48 @@ def test_target_mode_defaults_to_latest_stable_release(tmp_path: Path) -> None:
 
     assert target.label == "stable release v2026.8.14.2"
     assert target.oid == newest_release
+
+
+def test_stable_target_deepens_shallow_history_before_proving_ancestry(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    repo = tmp_path / "checkout"
+    _git(tmp_path, "init", "--bare", str(remote))
+    _git(tmp_path, "init", "-b", "main", str(seed))
+    _write(seed, "history.txt", "base\n")
+    _commit(seed, "base")
+    _write(seed, "history.txt", "release\n")
+    release_oid = _commit(seed, "release")
+    _annotated_tag(seed, "v2026.8.13", release_oid)
+    _write(seed, "history.txt", "after release\n")
+    _commit(seed, "after release")
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "origin", "main", "refs/tags/v2026.8.13")
+    _git(
+        tmp_path,
+        "clone",
+        "--depth=1",
+        f"file://{remote}",
+        str(repo),
+    )
+    _git(repo, "switch", "-c", "diatche")
+    assert _git(repo, "rev-parse", "--is-shallow-repository") == "true"
+    module = _load_script_module()
+
+    target = module._resolve_update_target(
+        repo, "origin", "main", "stable", None, "shallow"
+    )
+
+    assert target.oid == release_oid
+    assert _git(
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        release_oid,
+        target.branch_oid,
+    ) == ""
 
 
 def test_specific_commit_must_belong_to_upstream_main(tmp_path: Path) -> None:
@@ -393,17 +458,82 @@ def test_pre_stops_runtime_prints_handoff_and_never_runs_updater(tmp_path: Path)
     assert calls.read_text(encoding="utf-8").splitlines() == [
         "--status",
         "--force-stop",
+        "--assert-update-quiescence",
     ]
     assert not (tmp_path / "official-updater-calls.log").exists()
     state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
     assert f"cd {repo}" in result.stdout
     assert (
-        f"{repo}/venv/bin/hermes update --branch main --no-backup --yes"
+        f"{repo}/venv/bin/hermes update --branch main --backup --yes --no-gateway-restart"
     ) in result.stdout
-    assert "--no-gateway-restart" not in result.stdout
     assert "--revision" not in result.stdout
-    assert f"{SCRIPT} --post" in result.stdout
+    assert f"{Path(sys.executable).resolve()} {SCRIPT} --post" in result.stdout
     assert state["phase"] == "awaiting-official-update"
+
+
+def test_pre_refuses_unsupported_gateway_restart_opt_out_before_stop(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _make_repo(tmp_path)
+    wrapper, health, calls = _fake_runtime(tmp_path)
+    updater = _write(
+        tmp_path,
+        "unsupported-hermes",
+        "#!/bin/sh\n"
+        "echo 'usage: hermes update [--backup]'\n",
+    )
+    updater.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--pre",
+            "--repo", str(repo),
+            "--state-dir", str(tmp_path / "state"),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+            "--updater-executable", str(updater),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert "does not support --no-gateway-restart" in result.stderr
+    assert calls.read_text(encoding="utf-8").splitlines() == ["--status"]
+
+
+def test_update_quiescence_failure_recovers_without_printing_updater(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _make_repo(tmp_path)
+    wrapper, health, calls = _fake_runtime(tmp_path, fail_quiescence=True)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--pre",
+            "--repo", str(repo),
+            "--state-dir", str(tmp_path / "state"),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert "--assert-update-quiescence" in result.stderr
+    assert "update --branch main" not in result.stdout
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        "--status",
+        "--force-stop",
+        "--assert-update-quiescence",
+        "--foreground",
+        "--status",
+    ]
 
 
 
@@ -482,6 +612,7 @@ def test_post_finishes_prepared_handoff_after_direct_official_update(
     assert calls.read_text(encoding="utf-8").splitlines() == [
         "--status",
         "--force-stop",
+        "--assert-update-quiescence",
         "--foreground",
         "--status",
     ]
@@ -850,7 +981,7 @@ def test_pre_allows_selected_target_already_on_local_main(
     assert _git(repo, "rev-parse", "diatche") == old_diatche
     assert _git(repo, "branch", "--show-current") == "diatche"
     assert calls.read_text(encoding="utf-8").splitlines() == [
-        "--status", "--force-stop"
+        "--status", "--force-stop", "--assert-update-quiescence"
     ]
     assert json.loads((state_dir / "state.json").read_text())["phase"] == (
         "awaiting-official-update"
@@ -932,6 +1063,14 @@ def test_cas_failure_does_not_reset_concurrent_ref_or_checkout_changes(
         _git(repo, "update-ref", "refs/heads/diatche", moved_to)
         raise RuntimeError("ref compare-and-swap transaction failed")
 
+    monkeypatch.setattr(
+        module,
+        "_official_update_arguments",
+        lambda *_values: (
+            *module.OFFICIAL_UPDATE_ARGUMENTS,
+            *module.OFFICIAL_UPDATE_SUFFIX,
+        ),
+    )
     prepared = module._run_pre(_args(repo, state_dir, wrapper, health))
     assert prepared == 0
     _emulate_official_update(repo)
@@ -942,7 +1081,9 @@ def test_cas_failure_does_not_reset_concurrent_ref_or_checkout_changes(
     assert result == 1
     assert _git(repo, "rev-parse", "diatche") == moved_to
     assert (repo / "base.txt").read_text() == "concurrent tracked edit\n"
-    assert calls.read_text().splitlines() == ["--status", "--force-stop"]
+    assert calls.read_text().splitlines() == [
+        "--status", "--force-stop", "--assert-update-quiescence"
+    ]
     state = json.loads((state_dir / "state.json").read_text())
     assert "concurrent" in state["recovery_error"].lower()
 
@@ -983,6 +1124,7 @@ def test_health_failure_rolls_back_refs_and_restarts_old_runtime(tmp_path: Path)
     assert calls.read_text(encoding="utf-8").splitlines() == [
         "--status",
         "--force-stop",
+        "--assert-update-quiescence",
         "--foreground",
         "--status",
         "--force-stop",
@@ -1021,6 +1163,14 @@ def test_failure_recovery_retains_original_lock_and_signal_guard(
         observed["signal_handler"] = signal.getsignal(signal.SIGTERM)
         return original_recover(*args, **kwargs)
 
+    monkeypatch.setattr(
+        module,
+        "_official_update_arguments",
+        lambda *_values: (
+            *module.OFFICIAL_UPDATE_ARGUMENTS,
+            *module.OFFICIAL_UPDATE_SUFFIX,
+        ),
+    )
     prepared = module._run_pre(_args(repo, state_dir, wrapper, health))
     assert prepared == 0
     _emulate_official_update(repo)
@@ -1073,7 +1223,8 @@ def test_official_updater_failure_restores_owned_git_state_and_old_runtime(
     assert _git(repo, "rev-parse", "diatche") == old_diatche
     assert _git(repo, "rev-parse", "HEAD") == old_diatche
     assert calls.read_text().splitlines() == [
-        "--status", "--force-stop", "--foreground", "--status"
+        "--status", "--force-stop", "--assert-update-quiescence",
+        "--foreground", "--status"
     ]
     state = json.loads((state_dir / "state.json").read_text())
     assert state["recovered"] is True
@@ -1111,7 +1262,8 @@ def test_post_accepts_upstream_advance_observed_by_official_updater(
     assert _git(repo, "rev-parse", "main") == stable_oid
     assert _git(repo, "rev-parse", "refs/remotes/origin/main") == later_oid
     assert calls.read_text().splitlines() == [
-        "--status", "--force-stop", "--foreground", "--status"
+        "--status", "--force-stop", "--assert-update-quiescence",
+        "--foreground", "--status"
     ]
     assert json.loads((state_dir / "state.json").read_text())["phase"] == "complete"
 

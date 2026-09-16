@@ -74,7 +74,8 @@ import sentence_transformers
 import transformers
 """
 OFFICIAL_UPDATE_ARGUMENTS = ("update", "--branch", "main")
-OFFICIAL_UPDATE_SUFFIX = ("--no-backup", "--yes")
+OFFICIAL_UPDATE_SUFFIX = ("--backup", "--yes", "--no-gateway-restart")
+SHALLOW_DEEPEN_COMMITS = 4096
 
 
 class UpdateTarget(NamedTuple):
@@ -229,6 +230,23 @@ def _wrapper(
         raise RuntimeError(f"wrapper {argument} failed{': ' + detail if detail else ''}")
 
 
+def _official_update_arguments(updater: Path, repo: Path, timeout: float) -> tuple[str, ...]:
+    """Verify the invoked updater parser before printing its exact command."""
+    help_result = _run(
+        (str(updater), "update", "--help"), cwd=repo, timeout=timeout
+    )
+    help_text = f"{help_result.stdout}\n{help_result.stderr}"
+    if help_result.returncode:
+        raise RuntimeError("could not verify the official Hermes updater CLI")
+    for required in ("--backup", "--no-gateway-restart"):
+        if not re.search(rf"(?<![\w-]){re.escape(required)}(?![\w-])", help_text):
+            raise RuntimeError(
+                f"official Hermes updater does not support {required}; "
+                "refusing to invent or omit the required safety option"
+            )
+    return (*OFFICIAL_UPDATE_ARGUMENTS, *OFFICIAL_UPDATE_SUFFIX)
+
+
 def _health(health_script: Path, repo: Path, timeout: float) -> None:
     if not health_script.is_file():
         raise RuntimeError(f"health probe is missing: {health_script}")
@@ -298,8 +316,12 @@ def _ensure_hindsight_embeddings(repo: Path, timeout: float) -> None:
 
 def _fetch_private(repo: Path, remote: str, upstream_branch: str, run_id: str) -> tuple[str, str]:
     ref = f"refs/hermes-maintenance/fetches/{run_id}/upstream"
+    shallow = _git(
+        repo, "rev-parse", "--is-shallow-repository"
+    ).stdout.strip() == "true"
+    deepen = (f"--deepen={SHALLOW_DEEPEN_COMMITS}",) if shallow else ()
     result = _git(
-        repo, "fetch", "--no-write-fetch-head", "--refmap=", remote,
+        repo, "fetch", "--no-write-fetch-head", "--refmap=", *deepen, remote,
         f"refs/heads/{upstream_branch}:{ref}", check=False, timeout=300,
     )
     if result.returncode:
@@ -365,7 +387,20 @@ def _resolve_update_target(
                     source_ref=target_ref,
                     branch_ref=branch_ref,
                 )
-        raise RuntimeError(f"no stable release tag is reachable from {remote}/{upstream_branch}")
+        preparation = ""
+        if _git(
+            repo, "rev-parse", "--is-shallow-repository"
+        ).stdout.strip() == "true":
+            preparation = (
+                f"; shallow history remains insufficient after deepening by "
+                f"{SHALLOW_DEEPEN_COMMITS} commits. Run `git fetch "
+                f"--deepen={SHALLOW_DEEPEN_COMMITS} {remote} {upstream_branch}` "
+                "and rerun preflight"
+            )
+        raise RuntimeError(
+            f"no stable release tag is reachable from {remote}/{upstream_branch}"
+            f"{preparation}"
+        )
 
     if mode != "commit" or not requested_commit:
         raise RuntimeError("specific commit mode requires --commit SHA")
@@ -822,6 +857,9 @@ def _run_pre_locked(
         updater = updater.resolve() if updater else repo / "venv" / "bin" / "hermes"
         if not updater.is_file() or not os.access(updater, os.X_OK):
             raise RuntimeError(f"official Hermes updater is missing: {updater}")
+        update_arguments = _official_update_arguments(
+            updater, repo, args.wrapper_timeout
+        )
         _assert_pre_stop_snapshot(
             repo,
             main_oid=main_old,
@@ -835,6 +873,11 @@ def _run_pre_locked(
         wrapper_stopped = True
         _progress("Stopping the custom Hermes gateway wrapper")
         _wrapper(args.wrapperctl.resolve(), repo, "--force-stop", args.wrapper_timeout)
+        _progress("Proving global Hermes update quiescence")
+        _wrapper(
+            args.wrapperctl.resolve(), repo, "--assert-update-quiescence",
+            args.wrapper_timeout,
+        )
         if upstream_oid != target.branch_oid:
             _progress("Advancing local main to the selected update target")
             _update_ref_transaction(repo, [
@@ -844,11 +887,14 @@ def _run_pre_locked(
             ])
         journal.update(phase="awaiting-official-update", updated_at=_now())
         _write_journal(state_dir, journal)
-        update_arguments = (*OFFICIAL_UPDATE_ARGUMENTS, *OFFICIAL_UPDATE_SUFFIX)
         update_command = " ".join(
             shlex.quote(str(part)) for part in (updater, *update_arguments)
         )
         post_command = Path(sys.argv[0]).resolve()
+        post_invocation = " ".join(
+            shlex.quote(str(part))
+            for part in (Path(sys.executable).resolve(), post_command, "--post")
+        )
         print()
         print("Pre-update checks passed and the gateway is stopped.")
         print(f"Pinned target: {target.label} ({upstream_oid})")
@@ -857,7 +903,7 @@ def _run_pre_locked(
         print("Run these commands in order:")
         print()
         print(f"  cd {shlex.quote(str(repo))} && {update_command}")
-        print(f"  {shlex.quote(str(post_command))} --post")
+        print(f"  {post_invocation}")
         print()
         print("Run the post command even if the official update fails or is interrupted.")
         return 0
@@ -1149,7 +1195,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--remote", default="origin", help=hidden)
     parser.add_argument("--upstream-branch", default="main", help=hidden)
     parser.add_argument("--wrapper-timeout", type=float, default=60, help=hidden)
-    parser.add_argument("--health-timeout", type=float, default=120, help=hidden)
+    parser.add_argument("--health-timeout", type=float, default=900, help=hidden)
     parser.add_argument("--json", action="store_true", help=hidden)
     return parser
 
