@@ -686,6 +686,57 @@ def test_post_finishes_prepared_handoff_after_direct_official_update(
     assert state["phase"] == "complete"
 
 
+def test_post_restores_after_pinned_main_ref_moves_under_checked_out_head(
+    tmp_path: Path,
+) -> None:
+    repo, release_sha = _make_repo(tmp_path)
+    main_before = _git(repo, "rev-parse", "main")
+    seed = tmp_path / "seed"
+    _write(seed, "post-release.txt", "development\n")
+    branch_tip = _commit(seed, "post release development")
+    _git(seed, "push", "origin", "main")
+    _git(repo, "fetch", "origin", "main")
+    _git(repo, "tag", "-f", "v2026.8.13", release_sha)
+    _git(repo, "push", "--force", "origin", "refs/tags/v2026.8.13")
+    wrapper, health, _ = _fake_runtime(tmp_path)
+    state_dir = tmp_path / "state"
+    common = [
+        "--repo", str(repo),
+        "--state-dir", str(state_dir),
+        "--wrapperctl", str(wrapper),
+        "--health-script", str(health),
+    ]
+
+    prepared = subprocess.run(
+        [sys.executable, str(SCRIPT), "--pre", *common],
+        text=True,
+        capture_output=True,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    assert _git(repo, "rev-parse", "main") == release_sha
+
+    # Match the real updater: leave main checked out at the branch tip.  The
+    # post phase then CAS-moves main back to the pinned release while HEAD is
+    # symbolic, making the untouched updater tree appear staged.
+    _git(repo, "update-ref", "refs/heads/main", branch_tip)
+    _git(repo, "switch", "main")
+    _git(repo, "reset", "--hard", branch_tip)
+
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), "--post", *common],
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert _git(repo, "branch", "--show-current") == "diatche"
+    assert _git(repo, "rev-parse", "main") == release_sha
+    assert _git(repo, "rev-parse", "origin/main") == branch_tip
+    assert _git(repo, "status", "--porcelain") == ""
+    assert _git(repo, "merge-base", "--is-ancestor", release_sha, "diatche") == ""
+    assert _git(repo, "rev-parse", "diatche") != main_before
+
+
 def test_check_fetches_live_upstream_privately_and_never_calls_wrapper(
     tmp_path: Path,
 ) -> None:

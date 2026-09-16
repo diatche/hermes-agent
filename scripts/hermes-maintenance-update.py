@@ -703,6 +703,40 @@ def _restore_checkout(repo: Path, integration_branch: str, expected_oid: str) ->
         raise RuntimeError("restored checkout identity does not match the expected OID")
 
 
+def _restore_checkout_after_publish(
+    repo: Path, *, integration_branch: str, expected_oid: str,
+    published_main_oid: str, updater_checkout_oid: str,
+) -> None:
+    """Restore integration after CAS-moving the checked-out main ref.
+
+    When the official updater leaves ``main`` checked out, publishing a pinned
+    main target moves HEAD through its symbolic ref without changing the index
+    or worktree.  That Git-owned state looks dirty against the new HEAD even
+    though both trees still exactly match the updater commit.  Accept only that
+    exact state before forcing the branch switch; any other change remains a
+    fail-closed concurrent modification.
+    """
+    branch = _git(repo, "branch", "--show-current").stdout.strip()
+    if branch != "main" or _oid(repo, "HEAD") != published_main_oid:
+        _restore_checkout(repo, integration_branch, expected_oid)
+        return
+    if _git(repo, "diff", "--quiet", check=False).returncode:
+        raise RuntimeError("cannot restore after concurrent worktree changes")
+    if _git(repo, "diff", "--cached", "--quiet", updater_checkout_oid, check=False).returncode:
+        raise RuntimeError("cannot restore after concurrent index changes")
+    if _git(repo, "ls-files", "--others", "--exclude-standard").stdout.strip():
+        raise RuntimeError("cannot restore after concurrent untracked files")
+    switched = _git(repo, "switch", "--force", integration_branch, check=False)
+    if switched.returncode:
+        raise RuntimeError("could not restore integration checkout")
+    reset = _git(repo, "reset", "--hard", expected_oid, check=False)
+    if reset.returncode:
+        raise RuntimeError("could not restore integration checkout files")
+    _assert_checkout(repo, integration_branch)
+    if _oid(repo, "HEAD") != expected_oid:
+        raise RuntimeError("restored checkout identity does not match the expected OID")
+
+
 def _assert_transaction_checkout(
     repo: Path, *, integration_old: str, integration_new: str,
 ) -> None:
@@ -1129,7 +1163,13 @@ def _run_post_locked(
         journal.update(phase="published", updated_at=_now())
         _write_journal(state_dir, journal)
         _progress("Restoring the validated diatche checkout")
-        _restore_checkout(repo, "diatche", candidate_oid)
+        _restore_checkout_after_publish(
+            repo,
+            integration_branch="diatche",
+            expected_oid=candidate_oid,
+            published_main_oid=upstream_oid,
+            updater_checkout_oid=updater_oid,
+        )
         _progress("Checking Hindsight embedding compatibility")
         _ensure_hindsight_embeddings(repo, args.health_timeout)
         _progress("Starting the custom Hermes gateway wrapper")
