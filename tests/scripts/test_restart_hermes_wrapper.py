@@ -140,6 +140,25 @@ def test_restart_bootstraps_only_after_port_is_free_and_runs_health(tmp_path: Pa
     assert any("--check-only --no-state --json" in line for line in lines)
 
 
+def test_restart_bootstraps_when_port_is_already_free(tmp_path: Path) -> None:
+    env, calls, listener = _environment(tmp_path)
+    listener.unlink()
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--foreground"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = calls.read_text(encoding="utf-8").splitlines()
+    assert f"launchctl bootstrap gui/501 {tmp_path / 'wrapper.plist'}" in lines
+    assert not any(line.startswith("kill ") for line in lines)
+
+
 def test_restart_kickstarts_loaded_job_after_port_cleanup(tmp_path: Path) -> None:
     env, calls, _ = _environment(tmp_path)
     env["HERMES_TEST_KEEP_LOADED"] = "1"

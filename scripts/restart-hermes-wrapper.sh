@@ -74,14 +74,14 @@ wait_for_free_port() {
 
 clear_reserved_port() {
   local pids
-  pids="$(listener_pids)"
+  pids="$(listener_pids || true)"
   [[ -n "$pids" ]] || return 0
 
   echo "Port $PORT is still occupied; terminating listener(s): $pids" >&2
   for pid in $pids; do "$KILL_BIN" -TERM "$pid" 2>/dev/null || true; done
   wait_for_free_port "$PORT_TERM_WAIT" && return 0
 
-  pids="$(listener_pids)"
+  pids="$(listener_pids || true)"
   echo "Port $PORT is still occupied; killing listener(s): $pids" >&2
   for pid in $pids; do "$KILL_BIN" -KILL "$pid" 2>/dev/null || true; done
   if wait_for_free_port "$PORT_KILL_WAIT"; then
