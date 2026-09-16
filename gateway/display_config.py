@@ -14,6 +14,9 @@ from typing import Any
 # Settings configurable per-platform; other display settings are CLI-only.
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
+    "todo_progress": False,
+    "todo_progress_pin": False,
+    "delegated_tasks": "off",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
     "show_reasoning": False,
     "reasoning_style": "code",  # "code" (💭 **Reasoning:** + fence), "blockquote" ("> "), "subtext" ("-# " Discord)
@@ -154,6 +157,17 @@ def _norm_cleanup_progress(value: Any) -> bool:
     return value.lower() in _TRUTHY if isinstance(value, str) else bool(value)
 
 
+def _norm_delegated_tasks(value: Any) -> str:
+    if isinstance(value, bool):
+        return "count" if value else "off"
+    val = str(value).strip().lower()
+    if val in _TRUTHY:
+        return "count"
+    if val in _FALSY or val == "off":
+        return "off"
+    return val if val in {"count", "goal"} else "off"
+
+
 def _norm_choice(choices: tuple[str, ...]) -> Any:
     def norm(value: Any) -> str:
         val = str(value).lower()
@@ -179,6 +193,9 @@ _NORMALISERS: dict[str, Any] = {
     "busy_steer_ack_enabled": _norm_bool,
     "thinking_progress": _norm_bool,
     "cleanup_progress": _norm_cleanup_progress,
+    "todo_progress": _norm_bool,
+    "todo_progress_pin": _norm_bool,
+    "delegated_tasks": _norm_delegated_tasks,
     "live_status": _norm_tristate("full", "off", {"full", "verb", "off"}, extra_truthy={"all"}),
     "tool_progress_grouping": _norm_choice(("accumulate", "separate")),
     "reasoning_style": _norm_choice(("code", "blockquote", "subtext")),

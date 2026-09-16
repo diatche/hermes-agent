@@ -2601,6 +2601,25 @@ class TestModelRoutesParsing:
         adapter = _make_routing_adapter({"bad": {"provider": "openrouter"}})
         assert adapter._model_routes == {}
 
+    def test_route_accepts_only_validated_reasoning_and_context_policy(self):
+        adapter = _make_routing_adapter({
+            "voice": {
+                "model": "openai/gpt-5.6",
+                "model_options": {
+                    "reasoning": {"enabled": True, "effort": "minimal"},
+                    "skip_context_files": "yes",
+                    "arbitrary": "ignored",
+                },
+                "skip_context_files": True,
+                "unknown": "ignored",
+            }
+        })
+        assert adapter._model_routes["voice"] == {
+            "model": "openai/gpt-5.6",
+            "model_options": {"reasoning": {"enabled": True, "effort": "minimal"}},
+            "skip_context_files": True,
+        }
+
 
 class TestModelRoutesModelsEndpoint:
 
@@ -2643,6 +2662,78 @@ class TestModelRoutesHandlers:
 
 
 class TestModelRoutesAgentCreation:
+
+    def test_route_defaults_apply_and_request_options_override(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        adapter = _make_routing_adapter({
+            "voice": {
+                "model": "gpt-5.6-sol",
+                "model_options": {"reasoning": {"enabled": True, "effort": "minimal"}},
+                "skip_context_files": True,
+            }
+        })
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+        monkeypatch.setattr(adapter, "_session_reasoning_override_for", lambda *_: None)
+
+        route = adapter._resolve_route("voice")
+        adapter._create_agent(session_id="s1", route=route)
+        assert captured["reasoning_config"] == {"enabled": True, "effort": "minimal"}
+        assert captured["skip_context_files"] is True
+
+        adapter._create_agent(
+            session_id="s1", route=route,
+            model_options={
+                "reasoning": {"enabled": True, "effort": "high"},
+                "skip_context_files": False,
+            },
+        )
+        assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
+        assert captured["skip_context_files"] is False
+
+    def test_confirmed_session_lock_options_beat_route_and_session_override(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        adapter = _make_routing_adapter({
+            "voice": {
+                "model": "gpt-5.6-sol",
+                "model_options": {"reasoning": {"enabled": True, "effort": "minimal"}},
+                "skip_context_files": True,
+            }
+        })
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: {"model": "ignored/model"})
+        monkeypatch.setattr(
+            adapter, "_session_reasoning_override_for",
+            lambda *_: {"enabled": True, "effort": "xhigh"},
+        )
+        adapter._create_agent(
+            session_id="s1", route=adapter._resolve_route("voice"), confirmed_runtime_lock=True,
+            model_options={
+                "reasoning": {"enabled": True, "effort": "low"},
+                "skip_context_files": False,
+            },
+        )
+        assert captured["reasoning_config"] == {"enabled": True, "effort": "low"}
+        assert captured["skip_context_files"] is False
+
+        adapter._create_agent(
+            session_id="s1", route=adapter._resolve_route("voice"), confirmed_runtime_lock=True,
+            model_options={},
+        )
+        assert captured["reasoning_config"] == {"enabled": True, "effort": "minimal"}
+        assert captured["skip_context_files"] is True
 
     def test_route_provider_resolves_provider_credentials(self, monkeypatch):
         captured = {}

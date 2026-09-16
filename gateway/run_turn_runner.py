@@ -97,6 +97,18 @@ class TurnRunner:
             while not q.empty():
                 q.get_nowait()
 
+    def todo_complete_callback(self, call_id, tool_name, args, result) -> None:
+        """Publish an authoritative todo-tool result onto the dedicated checklist rail."""
+        ctx = self._ctx
+        if (
+            not ctx.todo_progress_enabled or tool_name != "todo" or not ctx.progress_queue
+            or not ctx._run_still_current()
+        ):
+            return
+        checklist_text = ctx.todo_checklist.update_from_result(result)
+        if checklist_text is not None:
+            ctx.progress_queue.put(("__todo__", checklist_text))
+
     def _track_progress_result(self, result) -> None:
         """Remember a delivered progress/status message id for end-of-turn cleanup."""
         ctx = self._ctx
@@ -129,6 +141,10 @@ class TurnRunner:
             ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
         if not ctx.progress_queue or not ctx._run_still_current():
             return
+        if ctx.todo_progress_enabled and event_type == "tool.started" and tool_name == "delegate_task":
+            checklist_text = ctx.todo_checklist.add_delegations(args)
+            if checklist_text:
+                ctx.progress_queue.put(("__todo__", checklist_text))
         if event_type == "tool.completed" and not ctx.long_tool_hint_fired[0]:
             self._progress_onboarding_hint(kwargs)
             return
@@ -249,6 +265,7 @@ class TurnRunner:
     def _progress_build_message(self, tool_name, preview, args) -> Optional[str]:
         """Render the progress line. Verbose mode queues directly (no dedup) and returns None."""
         ctx = self._ctx
+        raw_preview = preview
         from agent.display import get_tool_emoji
         emoji = get_tool_emoji(tool_name, default="⚙️")
         try:
@@ -275,6 +292,10 @@ class TurnRunner:
             return None
         if code is not None:
             return code
+        # The checklist is independent of ordinary tool chrome. When both are enabled, retain
+        # delegate_task's established human preview instead of replacing it with checklist text.
+        if tool_name == "delegate_task" and raw_preview and ctx.todo_progress_enabled:
+            return f"{emoji} {raw_preview}"
         if not preview:
             return f"{emoji} {tool_name}..."
         from agent.display import get_tool_verb, prepare_tool_preview, tool_verb_connector, verb_drops_preview
@@ -517,6 +538,236 @@ class TurnRunner:
     # ── editable progress bubbles (progress-queue drain) ────────────────────────────────────
 
     @dataclasses.dataclass
+    class _TodoEditState:
+        adapter: Any
+        message_id: Any = None
+        pinned_id: Any = None
+        last_text: Optional[str] = None
+        _edit_accepts_metadata: bool = False
+
+    @staticmethod
+    def _is_todo_marker(raw: Any) -> bool:
+        return isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__todo__"
+
+    def _ensure_todo_pin_state(self) -> None:
+        """Initialize ownership maps for normal and partially constructed test runners."""
+        runner = self._runner
+        for name in (
+            "_pinned_todo_messages", "_pinned_todo_texts", "_pinned_todo_adapters",
+            "_pinned_todo_revisions", "_todo_pin_locks",
+        ):
+            if not hasattr(runner, name):
+                setattr(runner, name, {})
+
+    def _todo_edit_state(self, adapter) -> "TurnRunner._TodoEditState":
+        self._ensure_todo_pin_state()
+        return self._TodoEditState(
+            adapter=adapter,
+            _edit_accepts_metadata=bool(self._ctx._progress_metadata) and _accepts_keyword(
+                adapter.edit_message, "metadata"),
+        )
+
+    def _forget_owned_todo(self) -> None:
+        key = self._ctx._todo_pin_key
+        for name in (
+            "_pinned_todo_messages", "_pinned_todo_texts", "_pinned_todo_adapters",
+            "_pinned_todo_revisions",
+        ):
+            getattr(self._runner, name).pop(key, None)
+
+    def _remember_owned_todo(self, message_id: Any, text: str, adapter: Any) -> None:
+        key = self._ctx._todo_pin_key
+        if self._runner._pinned_todo_messages.get(key) != message_id:
+            return
+        self._runner._pinned_todo_texts[key] = text
+        self._runner._pinned_todo_adapters[key] = adapter
+        self._runner._pinned_todo_revisions[key] = self._runner._pinned_todo_revisions.get(key, 0) + 1
+
+    @staticmethod
+    def _is_owned_todo_text(text: str) -> bool:
+        return bool(
+            text.startswith("Working on ")
+            or text.startswith("All tasks complete:\n")
+            or text.startswith("🤖 Delegated tasks\n")
+            or re.match(
+                r"^(?:Waiting on [1-9]\d* delegated tasks?|Delegated [1-9]\d* tasks?) 🤖(?:\n|$)", text,
+            )
+        )
+
+    async def _pin_todo(self, st: "TurnRunner._TodoEditState", message_id: Any) -> None:
+        ctx = self._ctx
+        if not ctx.todo_progress_pin_enabled:
+            return
+        bot = getattr(st.adapter, "_bot", None)
+        pin_message = getattr(st.adapter, "pin_message", None)
+        if not callable(pin_message) and (bot is None or not hasattr(bot, "pin_chat_message")):
+            return
+        try:
+            chat_id = int(ctx.source.chat_id)
+            seen: set[Any] = set()
+            get_pinned_message = getattr(st.adapter, "get_pinned_message", None)
+            if callable(get_pinned_message) or hasattr(bot, "get_chat"):
+                while True:
+                    if callable(get_pinned_message):
+                        pinned = await get_pinned_message(str(ctx.source.chat_id))
+                    else:
+                        chat = await bot.get_chat(chat_id=chat_id)
+                        pinned = getattr(chat, "pinned_message", None)
+                    stale_id = getattr(pinned, "message_id", None)
+                    if stale_id is None or stale_id in seen:
+                        break
+                    seen.add(stale_id)
+                    text = getattr(pinned, "text", None) or getattr(pinned, "caption", None) or ""
+                    author = getattr(pinned, "from_user", None)
+                    thread_id = getattr(pinned, "message_thread_id", None)
+                    if (
+                        not self._is_owned_todo_text(text)
+                        or not getattr(author, "is_bot", False)
+                        or str(thread_id or "") != str(ctx.source.thread_id or "")
+                    ):
+                        break
+                    unpin_message = getattr(st.adapter, "unpin_message", None)
+                    unpinned = (
+                        await unpin_message(str(ctx.source.chat_id), stale_id)
+                        if callable(unpin_message)
+                        else await bot.unpin_chat_message(chat_id=chat_id, message_id=stale_id)
+                    )
+                    if unpinned is False:
+                        return
+                    if str(self._runner._pinned_todo_messages.get(ctx._todo_pin_key)) == str(stale_id):
+                        self._forget_owned_todo()
+            prior_id = self._runner._pinned_todo_messages.get(ctx._todo_pin_key)
+            if prior_id is not None and prior_id != message_id:
+                prior_wire_id = int(prior_id) if str(prior_id).isdigit() else prior_id
+                unpin_message = getattr(st.adapter, "unpin_message", None)
+                unpinned = (
+                    await unpin_message(str(ctx.source.chat_id), prior_wire_id)
+                    if callable(unpin_message)
+                    else await bot.unpin_chat_message(chat_id=chat_id, message_id=prior_wire_id)
+                )
+                if unpinned is False:
+                    return
+                self._forget_owned_todo()
+            wire_id = int(message_id) if str(message_id).isdigit() else message_id
+            pinned = (
+                await pin_message(str(ctx.source.chat_id), wire_id, silent=True)
+                if callable(pin_message)
+                else await bot.pin_chat_message(
+                    chat_id=chat_id, message_id=wire_id, disable_notification=True)
+            )
+            if pinned is not False:
+                st.pinned_id = message_id
+                self._runner._pinned_todo_messages[ctx._todo_pin_key] = message_id
+        except Exception:
+            logger.debug("Failed to pin Telegram todo checklist", exc_info=True)
+
+    async def _unpin_todo(self, st: "TurnRunner._TodoEditState", message_id: Any) -> None:
+        if st.pinned_id != message_id:
+            return
+        bot = getattr(st.adapter, "_bot", None)
+        unpin_message = getattr(st.adapter, "unpin_message", None)
+        if not callable(unpin_message) and (bot is None or not hasattr(bot, "unpin_chat_message")):
+            return
+        try:
+            wire_id = int(message_id) if str(message_id).isdigit() else message_id
+            unpinned = (
+                await unpin_message(str(self._ctx.source.chat_id), wire_id)
+                if callable(unpin_message)
+                else await bot.unpin_chat_message(
+                    chat_id=int(self._ctx.source.chat_id), message_id=wire_id)
+            )
+            if unpinned is not False:
+                st.pinned_id = None
+                if self._runner._pinned_todo_messages.get(self._ctx._todo_pin_key) == message_id:
+                    self._forget_owned_todo()
+        except Exception:
+            logger.debug("Failed to unpin Telegram todo checklist", exc_info=True)
+
+    def _fit_todo_text(self, st: "TurnRunner._TodoEditState", text: str) -> str:
+        len_fn = st.adapter.message_len_fn if isinstance(st.adapter, BasePlatformAdapter) else len
+        raw_limit = int(getattr(st.adapter, "MAX_MESSAGE_LENGTH", 4000) or 4000)
+        limit = max(1, raw_limit - (64 if raw_limit > 128 else 0))
+        formatter = getattr(st.adapter, "format_message", None)
+        def formatted_len(value: str) -> int:
+            if callable(formatter):
+                with suppress(Exception):
+                    value = formatter(value)
+            return len_fn(value)
+        if formatted_len(text) <= limit:
+            return text
+        marker = "\n… more tasks"
+        low, high = 0, len(text)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if formatted_len(text[:mid].rstrip() + marker) <= limit:
+                low = mid
+            else:
+                high = mid - 1
+        return text[:low].rstrip() + marker
+
+    async def _delete_todo(self, st: "TurnRunner._TodoEditState") -> None:
+        from gateway.run import _TODO_DELETE_SHUTDOWN_TIMEOUT_SECS
+        message_id = st.message_id
+        if message_id is None:
+            st.last_text = None
+            return
+        await self._unpin_todo(st, message_id)
+        task = asyncio.create_task(st.adapter.delete_message(self._ctx.source.chat_id, message_id))
+        cancelled = False
+        try:
+            deleted = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            done, _ = await asyncio.wait({task}, timeout=_TODO_DELETE_SHUTDOWN_TIMEOUT_SECS)
+            if task in done:
+                deleted = task.result()
+            else:
+                task.cancel()
+                task.add_done_callback(lambda finished: finished.exception() if not finished.cancelled() else None)
+                deleted = False
+        except Exception:
+            logger.debug("Todo checklist delete failed", exc_info=True)
+            return
+        if deleted:
+            st.message_id = None
+            st.last_text = None
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _deliver_todo_checklist(self, st: "TurnRunner._TodoEditState", text: str) -> None:
+        """Send/edit one checklist or clear its owned bubble; failures remain retryable."""
+        if not text:
+            await self._delete_todo(st)
+            return
+        text = self._fit_todo_text(st, text)
+        if text == st.last_text:
+            return
+        lock = self._runner._todo_pin_locks.setdefault(self._ctx._todo_pin_key, asyncio.Lock())
+        if st.message_id is not None:
+            try:
+                async with lock:
+                    result = await self._edit_progress_message(st, st.message_id, text)
+                if getattr(result, "success", False):
+                    st.last_text = text
+                    self._remember_owned_todo(st.message_id, text, st.adapter)
+                    return
+            except Exception:
+                logger.debug("Todo checklist edit failed", exc_info=True)
+            await self._unpin_todo(st, st.message_id)
+            st.message_id = None
+        try:
+            async with lock:
+                result = await self._send_progress_text(st, text)
+            if getattr(result, "success", False):
+                st.message_id = getattr(result, "message_id", None)
+                st.last_text = text
+                if st.message_id is not None:
+                    await self._pin_todo(st, st.message_id)
+                    self._remember_owned_todo(st.message_id, text, st.adapter)
+        except Exception:
+            logger.debug("Todo checklist send failed", exc_info=True)
+
+    @dataclasses.dataclass
     class _ProgressEditState:
         """Mutable editable-bubble state shared by ``send_progress_messages`` and its helpers."""
         adapter: Any
@@ -526,6 +777,7 @@ class TurnRunner:
         _progress_len_fn: Any
         _PROGRESS_TEXT_LIMIT: int
         _edit_accepts_metadata: bool
+        todo: Any = None
 
     def _progress_edit_state(self, adapter) -> "TurnRunner._ProgressEditState":
         ctx = self._ctx
@@ -645,7 +897,9 @@ class TurnRunner:
         with suppress(Exception):
             while not ctx.progress_queue.empty():
                 raw = ctx.progress_queue.get_nowait()
-                if self._is_reset_marker(raw):
+                if self._is_todo_marker(raw):
+                    await self._deliver_todo_checklist(st.todo, str(raw[1]))
+                elif self._is_reset_marker(raw):
                     # Content-bubble marker during drain: close the current progress bubble
                     # and start a fresh one for tool lines that arrived after.
                     await self._roll_progress_overflow_if_needed(st)
@@ -706,6 +960,7 @@ class TurnRunner:
             self._drain_progress_queue()
             return
         st = self._progress_edit_state(adapter)
+        st.todo = self._todo_edit_state(adapter)
         last_edit_ts = 0.0
         EDIT_INTERVAL = 1.5  # Minimum seconds between edits (Telegram flood control)
         while True:
@@ -717,6 +972,10 @@ class TurnRunner:
                 # Drain silently when interrupted: events queued in the window between tool parse
                 # and interrupt processing should not render as bubbles.
                 if self._agent_interrupted():
+                    await asyncio.sleep(0)
+                    continue
+                if self._is_todo_marker(raw):
+                    await self._deliver_todo_checklist(st.todo, str(raw[1]))
                     await asyncio.sleep(0)
                     continue
                 if self._is_reset_marker(raw):
@@ -804,6 +1063,13 @@ class TurnRunner:
             self.voice_ack_callback(call_id, tool_name, args)
         if self._ctx._native_slack_task_cards:
             self.native_tool_start_callback(call_id, tool_name, args)
+
+    def combined_tool_complete_callback(self, call_id, tool_name, args, result):
+        """Keep Slack's native card ownership; otherwise feed the local todo rail."""
+        if self._ctx._native_slack_task_cards:
+            self.native_tool_complete_callback(call_id, tool_name, args, result)
+        elif self._ctx.todo_progress_enabled:
+            self.todo_complete_callback(call_id, tool_name, args, result)
 
     # ── hook / status bridges (agent thread → gateway loop) ────────────────────────────────
 
@@ -1214,7 +1480,10 @@ class TurnRunner:
             (ctx.native_tool_start_callback or ctx.voice_ack_callback)
             if (ctx._voice_ack_guild[0] is not None or ctx._native_slack_task_cards) else None
         )
-        agent.tool_complete_callback = ctx.native_tool_complete_callback if ctx._native_slack_task_cards else None
+        agent.tool_complete_callback = (
+            ctx.native_tool_complete_callback
+            if (ctx._native_slack_task_cards or ctx.todo_progress_enabled) else None
+        )
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
@@ -1480,8 +1749,8 @@ class TurnRunner:
             ctx.message = note + "\n\n" + ctx.message
 
     def _resume_note_interactive(self) -> bool:
-        """Interactive platforms report the restore and ask what next; event platforms (webhook,
-        API server) continue the work — nobody is present to answer."""
+        """Interactive platforms report restoration before continuing; event platforms (webhook,
+        API server) continue without an acknowledgement."""
         return bool(getattr(self._runner._adapter_for_source(self._ctx.source), "interactive_resume", True))
 
     def _prepare_turn_message(self, agent_history):
@@ -1495,8 +1764,10 @@ class TurnRunner:
             _last_transcript_timestamp, _prepare_resume_pending_message, build_resume_recovery_note,
         )
         ctx = self._ctx
+        # Classify recovery from the untouched inbound payload. Pending model/skills notes are
+        # API-only context, not a NEW user message, and must not suppress the blank-turn safety net.
+        original_message = ctx.message
         persist_override: Optional[Any] = ctx.persist_user_message
-        self._prepend_pending_note("_pending_model_notes")
         # Auto-continue: history ending with a tool result means the previous turn was cut off
         # (restart, crash, SIGTERM). Session-level resume_pending (drain-timeout shutdown) uses
         # stronger reason-aware wording that subsumes this case. Both gate on the age of
@@ -1517,24 +1788,31 @@ class TurnRunner:
         )
         if resume_pending and (interruption_is_fresh or mark_is_fresh):
             # Empty message = the startup auto-resume turn; there is no NEW user message.
-            ctx.message, persist_override = _prepare_resume_pending_message(
-                resume_reason, ctx.message, interactive=self._resume_note_interactive(),
+            ctx.message, recovery_persist_override = _prepare_resume_pending_message(
+                resume_reason, original_message, interactive=self._resume_note_interactive(),
             )
+            if persist_override is None:
+                persist_override = recovery_persist_override
         elif agent_history and agent_history[-1].get("role") == "tool" and interruption_is_fresh:
-            persist_override = ctx.message
+            persist_override = original_message
             ctx.message = (
                 "[System note: A new message has arrived. The conversation "
                 "history contains pending tool outputs from an interrupted turn. "
                 "IGNORE those pending results. Address the user's NEW message "
                 "below FIRST. Do NOT re-execute old tool calls from the history.]\n\n"
-                + ctx.message
+                + original_message
             )
-        self._prepend_pending_note("_pending_skills_reload_notes")
         # Safety net: a startup auto-resume event carries empty text; if the resume_pending branch
         # did not fire (freshness signals disagreed, marker cleared) we must NOT hand the model a blank
         # user turn. Restricted to resume_pending sessions so caption-less image turns are untouched.
-        if isinstance(ctx.message, str) and not ctx.message.strip() and resume_pending:
+        if isinstance(original_message, str) and not original_message.strip() and resume_pending and not ctx.message.strip():
             ctx.message = build_resume_recovery_note(resume_reason, "", interactive=self._resume_note_interactive())
+            # Stable persists a non-empty synthetic recovery row so the pre-call sanitizer does not
+            # repeatedly heal a blank row; later API-only notes remain outside durable history.
+            if persist_override is None:
+                persist_override = ctx.message
+        self._prepend_pending_note("_pending_model_notes")
+        self._prepend_pending_note("_pending_skills_reload_notes")
         return persist_override, ctx.persist_user_timestamp
 
     def _native_image_run_message(self):

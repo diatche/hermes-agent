@@ -138,7 +138,7 @@ def _prepare_recovery_agent_runner(monkeypatch):
     import hermes_cli.tools_config as tools_config
 
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "test-model")
     monkeypatch.setattr(
         gateway_run,
@@ -569,7 +569,9 @@ class TestResumePendingSystemNote:
         assert "[Internal skills reload note]" in captured["user_message"]
         assert "continue the unfinished goal" in captured["user_message"]
         assert "NEW message" not in captured["user_message"]
-        assert captured["persist_user_message"] == ""
+        assert "[System note:" in captured["persist_user_message"]
+        assert "[Internal model switch note]" not in captured["persist_user_message"]
+        assert "[Internal skills reload note]" not in captured["persist_user_message"]
 
     def test_resume_note_is_persisted_instead_of_original_empty_message(self):
         """The auto-resume note must not leave an empty row in state.db."""

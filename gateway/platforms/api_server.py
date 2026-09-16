@@ -292,6 +292,13 @@ def _request_service_tier(model_options: Any) -> Any:
     return _REQUEST_OPTION_MISSING
 
 
+def _validated_skip_context_files(model_options: Any) -> Optional[bool]:
+    """Return an explicitly boolean context-file policy; strings/numbers are not accepted."""
+    if not isinstance(model_options, dict) or not isinstance(model_options.get("skip_context_files"), bool):
+        return None
+    return model_options["skip_context_files"]
+
+
 def _apply_runtime_agent_overrides(
     runtime_kwargs: Dict[str, Any], overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Merge resolved provider/runtime fields into ``runtime_kwargs`` in place."""
@@ -1740,6 +1747,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 key: str(cfg[key]).strip()
                 for key in allowed_keys
                 if cfg.get(key) is not None and str(cfg[key]).strip()}
+            route_options: Dict[str, Any] = {}
+            raw_options = cfg.get("model_options")
+            reasoning = _request_reasoning_config(raw_options)
+            if reasoning is None and cfg.get("reasoning_effort") is not None:
+                reasoning = _request_reasoning_config({"reasoning_effort": cfg.get("reasoning_effort")})
+            if reasoning is not None:
+                route_options["reasoning"] = reasoning
+            option_skip = _validated_skip_context_files(raw_options)
+            top_level_skip = cfg.get("skip_context_files")
+            if isinstance(top_level_skip, bool):
+                route["skip_context_files"] = top_level_skip
+            elif option_skip is not None:
+                route["skip_context_files"] = option_skip
+            if route_options:
+                route["model_options"] = route_options
             if not route.get("model"):
                 logger.warning(
                     "api_server model_routes: route %r has no 'model'; dropping", alias_str)
@@ -1891,9 +1913,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             route = {"model": model} if model else {}
             if provider:
                 route["provider"] = provider
-        model_options = body.get("model_options")
-        if not isinstance(model_options, dict):
-            model_options = lock.get("model_options")
+        # A confirmed lock is the highest-precedence runtime selection. Its stored options must
+        # remain locked too; allowing a later body to replace them would make the lock partial.
+        model_options = lock.get("model_options")
         return {
             "requested": {"provider": provider, "model": model, "raw_model": model},
             "route": route or None, "route_source": "session_model_lock",
@@ -1955,6 +1977,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 logger.debug(
                     "api_server failed to rehydrate session /model override for %s", session_key, exc_info=True)
             override = runner._session_model_overrides.get(session_key)
+            return dict(override) if isinstance(override, dict) else None
+        except Exception:
+            return None
+
+    def _session_reasoning_override_for(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Return the gateway session's explicit /reasoning selection, if present."""
+        if not session_key:
+            return None
+        try:
+            from gateway.run import _gateway_runner_ref
+            runner = _gateway_runner_ref()
+            if runner is None:
+                return None
+            override = (getattr(runner, "_session_reasoning_overrides", {}) or {}).get(session_key)
             return dict(override) if isinstance(override, dict) else None
         except Exception:
             return None
@@ -2155,14 +2191,48 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             policy = RoomExecutionPolicy.from_mapping(room_execution_policy or {})
             enabled_toolsets = list(policy.enabled_toolsets)
             max_iterations = policy.max_iterations
-        # Reasoning resolves against the model that actually runs (per-model overrides), so only
-        # after the precedence chain settles; an explicit request wins.
-        if request_reasoning_config is None:
-            request_reasoning_config = GatewayRunner._load_reasoning_config(model)
+        # Runtime-option precedence mirrors model selection: confirmed Browser lock > explicit
+        # session /reasoning > per-request model_options > static route defaults > global config.
+        route_options = route.get("model_options") if isinstance(route, dict) else None
+        route_reasoning_config = _request_reasoning_config(route_options)
+        session_reasoning_config = (
+            None if confirmed_runtime_lock
+            else self._session_reasoning_override_for(gateway_session_key or session_id)
+        )
+        if confirmed_runtime_lock:
+            reasoning_config = request_reasoning_config or route_reasoning_config
+        else:
+            reasoning_config = session_reasoning_config or request_reasoning_config or route_reasoning_config
+        if reasoning_config is None:
+            reasoning_config = GatewayRunner._load_reasoning_config(model)
+
+        request_skip_context_files = _validated_skip_context_files(model_options)
+        session_skip_context_files = (
+            session_override.get("skip_context_files")
+            if isinstance(session_override, dict) and isinstance(session_override.get("skip_context_files"), bool)
+            else None
+        )
+        route_skip_context_files = (
+            route.get("skip_context_files")
+            if isinstance(route, dict) and isinstance(route.get("skip_context_files"), bool)
+            else None
+        )
+        if confirmed_runtime_lock:
+            skip_context_files = (
+                request_skip_context_files
+                if request_skip_context_files is not None else route_skip_context_files
+            )
+        else:
+            skip_context_files = (
+                session_skip_context_files if session_skip_context_files is not None
+                else request_skip_context_files if request_skip_context_files is not None
+                else route_skip_context_files
+            )
         agent_kwargs = {
             "model": model, **runtime_kwargs, **_checkpoint_agent_kwargs(user_config),
             "max_iterations": max_iterations, "quiet_mode": True, "verbose_logging": False,
             "ephemeral_system_prompt": ephemeral_system_prompt or None,
+            "skip_context_files": bool(skip_context_files),
             "enabled_toolsets": enabled_toolsets, "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
@@ -2172,7 +2242,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "session_db": self._ensure_session_db(),
             # Same fallback provider chain as Telegram/Discord/Slack.
             "fallback_model": None if confirmed_runtime_lock else GatewayRunner._load_fallback_model(),
-            "reasoning_config": request_reasoning_config,
+            "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key}
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier

@@ -56,6 +56,7 @@ _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 # offline update queue, #46621).
 _TELEGRAM_INITIAL_CONNECT_TIMEOUT_SECS_DEFAULT = 45.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+_TODO_DELETE_SHUTDOWN_TIMEOUT_SECS = 2.0
 # End reasons meaning the USER deliberately closed this thread. Shared by _classify_completion_target and
 # _resolve_async_delegation_session so they never disagree (else a "delivered" reason is acked, then lost).
 _USER_BOUNDARY_END_REASONS = ("session_reset", "user_exit", "session_switch", "new_session")
@@ -999,7 +1000,7 @@ def build_resume_recovery_note(
     reason: Optional[str], message: str = "", *, interactive: bool = True) -> str:
     """Build the resume-pending recovery system note for an interrupted turn (empty ``message`` = auto-resume).
 
-    Interactive platforms report the restore and ask what next; non-interactive ones finish the work.
+    Interactive platforms report the restore and continue clear safe work; non-interactive ones finish it.
 
     On non-interactive event platforms (webhook, API server — adapters with ``interactive_resume = False``)
     nobody can answer; the resumed turn must instead complete the interrupted work, or the task is silently
@@ -1010,16 +1011,22 @@ def build_resume_recovery_note(
         else "a gateway shutdown" if reason == "shutdown_timeout" else "a gateway interruption")
     if message:
         resume_guidance = (
-            "Address the user's NEW message below FIRST and focus on what the user is asking now.")
+            "Address the user's NEW message below FIRST. Then resume the unfinished goal from its "
+            "next safe incomplete step unless the new message supersedes it. A new message may also "
+            "pause or cancel the old goal.")
         tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
+            "Do NOT re-execute old tool calls blindly; treat recorded outputs as authoritative prior "
+            "results, including failures."
         )
     elif interactive:
         resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next.")
+            "Briefly report that the session was restored successfully, then review the conversation "
+            "history and continue the unfinished goal from its next safe incomplete step. Ask the user "
+            "only if no unfinished goal is clear, continuation is ambiguous, or user input or approval "
+            "is required.")
         tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
+            "Do NOT re-execute old tool calls blindly; treat recorded outputs as authoritative prior "
+            "results, including failures."
         )
     else:
         resume_guidance = (
@@ -3360,6 +3367,13 @@ class GatewayRunner(
         except Exception:
             logger.debug("could not set multiplex-active flag", exc_info=True)
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        # Telegram checklist ownership is scoped by (chat, topic). Text/revision/adaptor snapshots
+        # let async-delegation cleanup prove it still owns the exact pin before mutating it.
+        self._pinned_todo_messages: Dict[tuple[str, str], Any] = {}
+        self._pinned_todo_texts: Dict[tuple[str, str], str] = {}
+        self._pinned_todo_adapters: Dict[tuple[str, str], BasePlatformAdapter] = {}
+        self._pinned_todo_revisions: Dict[tuple[str, str], int] = {}
+        self._todo_pin_locks: Dict[tuple[str, str], asyncio.Lock] = {}
         # Non-None means SessionDB init failed — the gateway broadcasts a one-time warning to the home
         # channel(s) after connecting so the user learns persistence is broken before /resume fails.
         # See #88235.
@@ -4335,6 +4349,9 @@ class GatewayRunner(
         progress_grouping: Any = None
         _display_surface_mode: Any = None
         tool_progress_enabled: Any = None
+        todo_progress_enabled: Any = None
+        todo_progress_pin_enabled: Any = None
+        delegated_tasks_mode: Any = None
         _live_status_mode: Any = None
         _live_status_adapter: Any = None
         log_mode_enabled: Any = None

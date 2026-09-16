@@ -22,6 +22,10 @@ class TurnContext:
     progress_mode: str = "off"
     progress_grouping: str = "grouped"
     tool_progress_enabled: bool = False
+    todo_progress_enabled: bool = False
+    todo_progress_pin_enabled: bool = False
+    todo_checklist: Any = None
+    _todo_pin_key: tuple[str, str] = ("", "")
     progress_queue: Any = None
     log_queue: Any = None
     # mutable single-element containers (shared with the outer body)

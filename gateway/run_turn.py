@@ -2776,6 +2776,17 @@ class GatewayTurnMixin:
         _thinking_enabled = _display_surface_mode(
             "thinking_progress", default=False, require_platform_override_for={Platform.MATTERMOST},
         ) != "off"
+        todo_progress_enabled = (
+            not is_webhook
+            and bool(resolve_display_setting(user_config, platform_key, "todo_progress", False))
+        )
+        todo_progress_pin_enabled = (
+            todo_progress_enabled
+            and source.platform == Platform.TELEGRAM
+            and bool(resolve_display_setting(user_config, platform_key, "todo_progress_pin", False))
+        )
+        delegated_tasks_mode = resolve_display_setting(
+            user_config, platform_key, "delegated_tasks", "off")
         # Slack-native task cards need the progress queue even with text tool_progress off.
         # Slack-native task cards (#29483): when the Slack adapter's opt-in is set, tool progress renders as
         # native plan/task cards via chat.startStream — the progress queue is needed even though Slack keeps
@@ -2795,6 +2806,10 @@ class GatewayTurnMixin:
                 _native_slack_task_cards = bool(adapter.native_task_cards_enabled())
             except Exception:
                 logger.debug("Slack native task-card config check failed", exc_info=True)
+        if _native_slack_task_cards:
+            # Stable Slack cards remain authoritative; the local checklist is a separate text/pin rail.
+            todo_progress_enabled = False
+            todo_progress_pin_enabled = False
         return self._RunAgentDisplay(
             user_config=user_config, platform_key=platform_key, enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets, resolve_display_setting=resolve_display_setting,
@@ -2805,7 +2820,12 @@ class GatewayTurnMixin:
             log_queue=queue.Queue() if log_mode_enabled else None,
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
             _thinking_enabled=_thinking_enabled, _native_slack_task_cards=_native_slack_task_cards,
-            needs_progress_queue=tool_progress_enabled or _thinking_enabled or _native_slack_task_cards,
+            todo_progress_enabled=todo_progress_enabled,
+            todo_progress_pin_enabled=todo_progress_pin_enabled,
+            delegated_tasks_mode=delegated_tasks_mode,
+            needs_progress_queue=(
+                tool_progress_enabled or _thinking_enabled or todo_progress_enabled
+                or _native_slack_task_cards),
             _generic_status_phrase=_generic_status_phrase,
         )
 
@@ -2815,6 +2835,7 @@ class GatewayTurnMixin:
         "progress_grouping", "tool_progress_enabled", "log_queue", "resolve_display_setting",
         "user_config", "enabled_toolsets", "disabled_toolsets", "log_mode_enabled",
         "interim_assistant_messages_enabled", "needs_progress_queue", "_native_slack_task_cards",
+        "todo_progress_enabled", "todo_progress_pin_enabled",
     )
 
     def _run_agent_build_turn_context(
@@ -2850,11 +2871,14 @@ class GatewayTurnMixin:
             _cleanup_adapter = None
 
         # The one-slot progress/holder containers shared with the callbacks are TurnContext defaults.
+        from gateway.todo_progress import TodoChecklist
         turn_ctx = TurnContext(
             source=source, message=message, AIAgent=AIAgent, session_key=session_key,
             run_generation=run_generation, _cleanup_progress=_cleanup_progress,
             _run_still_current=self._run_still_current_fn(session_key, run_generation),
             progress_queue=queue.Queue() if disp.needs_progress_queue else None,
+            todo_checklist=TodoChecklist(delegated_tasks=disp.delegated_tasks_mode),
+            _todo_pin_key=(str(source.chat_id), str(source.thread_id or "")),
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
         )
@@ -2863,7 +2887,7 @@ class GatewayTurnMixin:
         turn_ctx.progress_callback = turn_runner.progress_callback
         turn_ctx.voice_ack_callback = turn_runner.voice_ack_callback
         turn_ctx.native_tool_start_callback = turn_runner.combined_tool_start_callback
-        turn_ctx.native_tool_complete_callback = turn_runner.native_tool_complete_callback
+        turn_ctx.native_tool_complete_callback = turn_runner.combined_tool_complete_callback
         return turn_ctx, turn_runner, _cleanup_adapter
 
     def _thread_metadata_for_progress(
@@ -3664,6 +3688,11 @@ class GatewayTurnMixin:
     ) -> None:
         """``finally`` half of a turn: cancel background tasks, flush stream, release the session slot."""
         stream_consumer_holder, session_key = turn_ctx.stream_consumer_holder, turn_ctx.session_key
+        # Give a freshly-created progress consumer one loop turn to begin before cancellation. Fast
+        # synchronous agents can otherwise enqueue a complete checklist and finish before the task ever
+        # starts, so its cancellation handler never gets a chance to perform the final drain.
+        if progress_task and not progress_task.done():
+            await asyncio.sleep(0)
         for task in (progress_task, log_task, interrupt_monitor, _notify_task):
             if task:
                 task.cancel()

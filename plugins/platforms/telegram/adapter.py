@@ -3706,6 +3706,43 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to delete Telegram message %s: %s", self.name, message_id, _redact_telegram_error_text(e))
             return False
 
+    async def get_pinned_message(self, chat_id: str):
+        """Return Telegram's current chat/topic pin, or None when unavailable."""
+        if not self._bot or not hasattr(self._bot, "get_chat"):
+            return None
+        try:
+            chat = await self._bot.get_chat(chat_id=normalize_telegram_chat_id(chat_id))
+            return getattr(chat, "pinned_message", None)
+        except Exception as e:
+            logger.debug("[%s] Failed to read Telegram pin: %s", self.name, _redact_telegram_error_text(e))
+            return None
+
+    async def pin_message(self, chat_id: str, message_id: Any, *, silent: bool = True) -> bool:
+        """Pin a bot message without producing a service notification by default."""
+        if not self._bot or not hasattr(self._bot, "pin_chat_message"):
+            return False
+        try:
+            result = await self._bot.pin_chat_message(
+                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id),
+                disable_notification=bool(silent),
+            )
+            return result is not False
+        except Exception as e:
+            logger.debug("[%s] Failed to pin Telegram message %s: %s", self.name, message_id, _redact_telegram_error_text(e))
+            return False
+
+    async def unpin_message(self, chat_id: str, message_id: Any) -> bool:
+        """Unpin one specific bot-owned message."""
+        if not self._bot or not hasattr(self._bot, "unpin_chat_message"):
+            return False
+        try:
+            result = await self._bot.unpin_chat_message(
+                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id))
+            return result is not False
+        except Exception as e:
+            logger.debug("[%s] Failed to unpin Telegram message %s: %s", self.name, message_id, _redact_telegram_error_text(e))
+            return False
+
     def supports_draft_streaming(self, chat_type: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> bool:
         """sendMessageDraft works for private chats only (Bot API 9.5) and needs PTB >= 22.6; groups and
         older installs use the edit-based path. ``rich_drafts`` controls draft *format*, not availability."""

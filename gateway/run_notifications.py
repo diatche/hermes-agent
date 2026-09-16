@@ -58,6 +58,93 @@ class GatewayNotificationsMixin:
     _COMPLETION_BATCH_KEY_FIELDS = ("session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id")
     _ASYNC_GROUP_KEY_FIELDS = ("session_key", "parent_session_id", *_COMPLETION_BATCH_KEY_FIELDS[1:])
 
+    def _ensure_todo_pin_state(self) -> None:
+        for name in (
+            "_pinned_todo_messages", "_pinned_todo_texts", "_pinned_todo_adapters",
+            "_pinned_todo_revisions", "_todo_pin_locks",
+        ):
+            if not hasattr(self, name):
+                setattr(self, name, {})
+
+    async def _cleanup_completed_delegation_todo_pin(self, evt: dict) -> bool:
+        """Remove only the delegated suffix from the exact Telegram pin this session owns."""
+        if evt.get("type") != "async_delegation":
+            return False
+        self._ensure_todo_pin_state()
+        session_key = str(evt.get("session_key") or "").strip()
+        delegation_id = str(evt.get("delegation_id") or "").strip()
+        try:
+            from tools.async_delegation import list_async_delegations
+            for record in list_async_delegations():
+                if str(record.get("delegation_id") or "") == delegation_id:
+                    continue
+                if str(record.get("session_key") or "") != session_key:
+                    continue
+                if str(record.get("status") or "") in {"running", "stalling", "finalizing"}:
+                    return False
+        except Exception:
+            logger.debug("Could not inspect sibling delegations before todo cleanup", exc_info=True)
+            return False
+
+        source = self._build_process_event_source(evt)
+        if source is None or source.platform != Platform.TELEGRAM:
+            return False
+        pin_key = (str(source.chat_id), str(source.thread_id or ""))
+        message_id = self._pinned_todo_messages.get(pin_key)
+        pinned_text = self._pinned_todo_texts.get(pin_key)
+        adapter = self._pinned_todo_adapters.get(pin_key)
+        revision = self._pinned_todo_revisions.get(pin_key)
+        if message_id is None or pinned_text is None or adapter is None or revision is None:
+            return False
+
+        from gateway.todo_progress import without_delegated_section
+        remaining = without_delegated_section(pinned_text)
+        if remaining is None:
+            return False
+
+        def still_owned() -> bool:
+            return bool(
+                self._pinned_todo_messages.get(pin_key) == message_id
+                and self._pinned_todo_texts.get(pin_key) == pinned_text
+                and self._pinned_todo_adapters.get(pin_key) is adapter
+                and self._pinned_todo_revisions.get(pin_key) == revision
+            )
+
+        lock = self._todo_pin_locks.setdefault(pin_key, asyncio.Lock())
+        async with lock:
+            if not still_owned():
+                return False
+            message_id_text = str(message_id)
+            if remaining:
+                result = await adapter.edit_message(
+                    chat_id=str(source.chat_id), message_id=message_id_text, content=remaining)
+                if result is None or not getattr(result, "success", False):
+                    return False
+                if still_owned():
+                    self._pinned_todo_texts[pin_key] = remaining
+                    self._pinned_todo_revisions[pin_key] = revision + 1
+                return True
+            bot = getattr(adapter, "_bot", None)
+            unpin_message = getattr(adapter, "unpin_message", None)
+            if not callable(unpin_message) and (bot is None or not hasattr(bot, "unpin_chat_message")):
+                return False
+            unpinned = (
+                await unpin_message(str(source.chat_id), message_id)
+                if callable(unpin_message)
+                else await bot.unpin_chat_message(chat_id=int(source.chat_id), message_id=message_id)
+            )
+            if unpinned is False:
+                return False
+            deleted = await adapter.delete_message(
+                chat_id=str(source.chat_id), message_id=message_id_text)
+            if deleted and still_owned():
+                self._pinned_todo_messages.pop(pin_key, None)
+                self._pinned_todo_texts.pop(pin_key, None)
+                self._pinned_todo_adapters.pop(pin_key, None)
+                self._pinned_todo_revisions.pop(pin_key, None)
+                return True
+            return False
+
     @dataclasses.dataclass
     class _UpdatePaths:
         """Marker files ``hermes update --gateway`` and its watcher exchange under HERMES_HOME."""
@@ -1340,6 +1427,13 @@ class GatewayNotificationsMixin:
             if injection_result is not True:
                 return injection_result
             accepted = True
+            if evt.get("type") == "async_delegation":
+                try:
+                    await self._cleanup_completed_delegation_todo_pin(evt)
+                except Exception:
+                    # Completion delivery remains durable on its own contract; stale UI can be
+                    # reconciled by the next checklist update.
+                    logger.debug("Could not clean up completed delegation todo pin", exc_info=True)
             if identity is not None:
                 with self._completion_delivery_lock:
                     self._mark_completions_delivered_locked((identity,))
