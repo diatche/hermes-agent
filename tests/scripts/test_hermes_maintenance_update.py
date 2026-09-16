@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import signal
@@ -247,14 +248,16 @@ def test_external_backup_gate_requires_complete_recent_generation(tmp_path: Path
     manifest = {
         "archive": "archive.zip",
         "size_bytes": archive.stat().st_size,
+        "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
         "source": str(Path.home() / ".hermes"),
     }
     manifest_path = _write(generation, "manifest.json", json.dumps(manifest))
 
     assert module._assert_fresh_verified_backup(tmp_path) == manifest_path
 
-    archive.write_text("wrong size", encoding="utf-8")
-    with pytest.raises(RuntimeError, match="size does not match"):
+    archive.write_text("corruptd bytes", encoding="utf-8")
+    assert archive.stat().st_size == manifest["size_bytes"]
+    with pytest.raises(RuntimeError, match="checksum does not match"):
         module._assert_fresh_verified_backup(tmp_path)
 
 

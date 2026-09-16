@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -290,6 +291,7 @@ def _assert_fresh_verified_backup(
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         archive_name = str(payload["archive"])
         expected_size = int(payload["size_bytes"])
+        expected_sha256 = str(payload["sha256"])
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"latest Hermes backup manifest is malformed: {manifest_path}") from exc
     if payload.get("source") != str(Path.home() / ".hermes"):
@@ -304,6 +306,17 @@ def _assert_fresh_verified_backup(
         raise RuntimeError("latest Hermes backup archive is missing or unreadable") from exc
     if expected_size <= 0 or actual_size != expected_size:
         raise RuntimeError("latest Hermes backup archive size does not match its verified manifest")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise RuntimeError("latest Hermes backup manifest has an invalid SHA-256")
+    digest = hashlib.sha256()
+    try:
+        with archive.open("rb") as handle:
+            while chunk := handle.read(8 * 1024 * 1024):
+                digest.update(chunk)
+    except OSError as exc:
+        raise RuntimeError("latest Hermes backup archive could not be checksum-verified") from exc
+    if digest.hexdigest() != expected_sha256:
+        raise RuntimeError("latest Hermes backup archive checksum does not match its verified manifest")
     if age < -300 or age > max_age_seconds:
         raise RuntimeError(
             "latest verified Hermes backup is stale; run "
