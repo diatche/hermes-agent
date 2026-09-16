@@ -911,6 +911,8 @@ def _run_pre_locked(
         origin_ref = f"refs/remotes/{args.remote}/{args.upstream_branch}"
         origin_old = _oid(repo, origin_ref)
         integration_old = _oid(repo, "refs/heads/diatche")
+        prepared_ref = getattr(args, "prepared_ref", None)
+        candidate_base_oid = _oid(repo, prepared_ref) if prepared_ref else integration_old
         _progress(f"Resolving the requested {args.target_mode} update target")
         target = _resolve_update_target(
             repo,
@@ -923,10 +925,10 @@ def _run_pre_locked(
         fetch_ref, upstream_oid = target.source_ref, target.oid
         target_skew = _target_skew(repo, upstream_oid, target.branch_oid)
         _progress("Checking mergeability without changing refs or checkout")
-        _check_merge(repo, integration_old, upstream_oid)
+        _check_merge(repo, candidate_base_oid, upstream_oid)
         _progress("Building and validating the isolated merge candidate")
         candidate_ref, candidate_oid = _build_candidate(
-            repo, state_dir, run_id, integration_old, upstream_oid
+            repo, state_dir, run_id, candidate_base_oid, upstream_oid
         )
         journal = _journal_payload(
             repo, run_id, main_old, integration_old, upstream_oid,
@@ -939,6 +941,8 @@ def _run_pre_locked(
             target_skew=target_skew,
             target_label=target.label,
             backup_manifest=str(backup_manifest) if backup_manifest else "fixture-mode-not-required",
+            prepared_ref=prepared_ref,
+            prepared_base_oid=candidate_base_oid,
             candidate_ref=candidate_ref,
             origin_ref=origin_ref,
             origin_old=origin_old,
@@ -962,6 +966,8 @@ def _run_pre_locked(
             upstream_ref=fetch_ref,
             upstream_oid=upstream_oid,
         )
+        if prepared_ref and _oid(repo, prepared_ref) != candidate_base_oid:
+            raise RuntimeError("prepared integration ref moved before stop")
         journal.update(phase="stopping", updated_at=_now())
         _write_journal(state_dir, journal)
         # A failed stop may still have partially unloaded the supervisor.
@@ -1067,6 +1073,7 @@ def _run_post_locked(
         upstream_oid = str(journal["main_new"])
         branch_oid = str(journal.get("branch_oid", upstream_oid))
         integration_old = str(journal["integration_old"])
+        candidate_base_oid = str(journal.get("prepared_base_oid", integration_old))
         candidate_oid = str(journal["integration_new"])
         fetch_ref = str(journal["fetch_ref"])
         branch_ref = str(journal.get("branch_ref", fetch_ref))
@@ -1081,7 +1088,7 @@ def _run_post_locked(
         )
         _progress("Rebuilding and validating the pinned candidate after dependency update")
         post_candidate_ref, post_candidate_oid = _build_candidate(
-            repo, state_dir, f"post-{journal['run_id']}", integration_old, upstream_oid,
+            repo, state_dir, f"post-{journal['run_id']}", candidate_base_oid, upstream_oid,
             runtime_probe=True,
         )
         candidate_oid = post_candidate_oid
@@ -1216,7 +1223,8 @@ def _check(args: argparse.Namespace) -> int:
     repo = args.repo.resolve()
     try:
         _assert_checkout(repo, "diatche")
-        integration = _oid(repo, "refs/heads/diatche")
+        prepared_ref = getattr(args, "prepared_ref", None)
+        integration = _oid(repo, prepared_ref) if prepared_ref else _oid(repo, "refs/heads/diatche")
         target = _resolve_update_target(
             repo,
             args.remote,
@@ -1291,6 +1299,14 @@ def _parser() -> argparse.ArgumentParser:
         "--commit",
         metavar="SHA",
         help="target a specific commit reachable from upstream main",
+    )
+    parser.add_argument(
+        "--prepared-ref",
+        metavar="REF",
+        help=(
+            "build the validated integration from this prepared local ref while "
+            "leaving the live diatche checkout unchanged until post"
+        ),
     )
     parser.set_defaults(target_mode="stable")
     parser.add_argument("--repo", type=Path, default=DEFAULT_REPO, help=hidden)

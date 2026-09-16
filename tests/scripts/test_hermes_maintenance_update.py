@@ -499,6 +499,41 @@ def test_pre_stops_runtime_prints_handoff_and_never_runs_updater(tmp_path: Path)
     assert state["phase"] == "awaiting-official-update"
 
 
+def test_prepared_ref_keeps_live_diatche_unchanged_until_post(tmp_path: Path) -> None:
+    repo, _ = _make_repo(tmp_path)
+    live_diatche = _git(repo, "rev-parse", "diatche")
+    prepared_tree = tmp_path / "prepared-worktree"
+    _git(repo, "worktree", "add", "--detach", str(prepared_tree), live_diatche)
+    _write(prepared_tree, "prepared.txt", "validated integration\n")
+    prepared_oid = _commit(prepared_tree, "prepared integration")
+    _git(repo, "update-ref", "refs/heads/prepared-integration", prepared_oid)
+    _git(repo, "worktree", "remove", "--force", str(prepared_tree))
+    wrapper, health, _ = _fake_runtime(tmp_path)
+    state_dir = tmp_path / "state"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--pre",
+            "--prepared-ref", "refs/heads/prepared-integration",
+            "--repo", str(repo),
+            "--state-dir", str(state_dir),
+            "--wrapperctl", str(wrapper),
+            "--health-script", str(health),
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _git(repo, "branch", "--show-current") == "diatche"
+    assert _git(repo, "rev-parse", "diatche") == live_diatche
+    state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["integration_old"] == live_diatche
+    assert state["prepared_base_oid"] == prepared_oid
+
+
 def test_pre_refuses_unsupported_backup_opt_out_before_stop(
     tmp_path: Path,
 ) -> None:

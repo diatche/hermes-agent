@@ -59,14 +59,19 @@ killed by this script.
 Run the pinned command below:
 
 ```bash
-./venv/bin/python scripts/hermes-maintenance-update.py \
-  --pre --commit 345cd2b057a452236de401d3534b8502a7465e8d
+~/.hermes/hermes-agent/venv/bin/python \
+  ~/.hermes/worktrees/hermes-v0213-integration/scripts/hermes-maintenance-update.py \
+  --pre \
+  --prepared-ref refs/heads/feature/hermes-v0213-integration \
+  --commit 345cd2b057a452236de401d3534b8502a7465e8d
 ```
 
-Use the repository venv interpreter exactly. On this host, bare `python3` and
-the script shebang resolve Miniconda Python 3.10, which cannot import the current
-health stack. Prepare prints the post command with the exact `sys.executable`
-that ran prepare so post uses the same Python 3.11 environment.
+The script runs from the prepared worktree while operating on the production
+repository. The live `diatche` checkout therefore remains on the old runtime
+until the wrapper has been stopped and the post phase publishes the validated
+candidate. Use the repository venv interpreter exactly: bare `python3` and the
+script shebang resolve Miniconda Python 3.10 on this host. Prepare preserves the
+exact interpreter in the printed post command.
 
 The pre step:
 
