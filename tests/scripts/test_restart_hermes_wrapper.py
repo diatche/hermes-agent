@@ -86,6 +86,9 @@ def _environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
             "HERMES_WRAPPER_START_WAIT": "2",
             "HERMES_WRAPPER_PORT_TERM_WAIT": "1",
             "HERMES_WRAPPER_PORT_KILL_WAIT": "1",
+            "HERMES_UPDATE_QUIESCENCE_ATTEMPTS": "4",
+            "HERMES_UPDATE_QUIESCENCE_STABLE_SAMPLES": "2",
+            "HERMES_UPDATE_QUIESCENCE_INTERVAL": "0.01",
             "HERMES_MAINTENANCE_ACTIVE": str(tmp_path / "active.json"),
         }
     )

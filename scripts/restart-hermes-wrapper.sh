@@ -228,22 +228,24 @@ listener_pids() {
 }
 
 assert_update_quiescence() {
-  local stable=0
-  for _ in {1..40}; do
+  local stable=0 attempts="${HERMES_UPDATE_QUIESCENCE_ATTEMPTS:-120}"
+  local required="${HERMES_UPDATE_QUIESCENCE_STABLE_SAMPLES:-12}"
+  local interval="${HERMES_UPDATE_QUIESCENCE_INTERVAL:-0.25}"
+  for ((i = 0; i < attempts; i++)); do
     if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 \
       && [[ -z "$(wrapper_app_pids)" ]] \
       && [[ -z "$(hermes_runtime_pids)" ]] \
       && [[ -z "$(listener_pids)" ]] \
       && [[ -z "$(loaded_official_gateway_labels)" ]]; then
       stable=$((stable + 1))
-      if (( stable >= 12 )); then
+      if (( stable >= required )); then
         echo "Update quiescence verified"
         return 0
       fi
     else
       stable=0
     fi
-    sleep 0.25
+    sleep "$interval"
   done
   echo "ERROR: Hermes update quiescence could not be established" >&2
   loaded_official_gateway_labels >&2 || true
