@@ -7,6 +7,8 @@ import hashlib
 import json
 import logging
 import time
+import uuid
+from collections.abc import Iterator, Sequence
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.context_compressor import _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, split_user_originated_turn
@@ -15,7 +17,7 @@ from agent.message_sanitization import _sanitize_surrogates
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import (
     _COMPRESSION_LOCK_ROW_SQL, _ENDED_ROW_SQL, _RESET_END_REASONS, _RESET_END_REASONS_SQL, _ended_by_compression,
-    _legacy_reset_child_sql, _placeholders, _sql_json_extract)
+    _id_chunks, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
 
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
 
@@ -43,6 +45,232 @@ _RESET_COUNTERS_SQL = "UPDATE sessions SET message_count = 0, tool_call_count = 
 _SET_DISPLAY_META_SQL = "UPDATE messages SET display_metadata = ? WHERE id = ?"
 _ARCHIVE_ACTIVE_SQL = "UPDATE messages SET active = 0, compacted = 1 WHERE session_id = ? AND active = 1"
 _INVALID = object()  # _json_or sentinel where the fallback must be distinguishable from JSON null
+
+# Lease-owned compactions prepare replacement rows in bounded write transactions.  The
+# final transaction changes only visibility/ownership and keeps the previous live view
+# authoritative until the complete replacement is ready.
+_COMPACTION_STAGE_MAX_ROWS = 32
+_COMPACTION_STAGE_MAX_BYTES = 512 * 1024
+_COMPACTION_CLEANUP_MAX_ROWS = 32
+_COMPACTION_STAGE_MARKER = "_hermes_compaction_stage"
+
+
+def _verify_compaction_lock(conn, session_id: str, lock_holder: Optional[str]) -> None:
+    """Fence a staging/cutover write against the caller-owned compression lease."""
+    if lock_holder is None:
+        return
+    from hermes_state import SessionCompressionInProgressError
+
+    row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
+    if row is None or row["holder"] != lock_holder or float(row["expires_at"]) <= time.time():
+        raise SessionCompressionInProgressError(
+            f"Compression lease for {session_id!r} lost before commit; "
+            "refusing to publish a stale compaction")
+
+
+def _compaction_message_size(message: Any) -> int:
+    """Conservative serialized size used only to bound staging transactions."""
+    try:
+        raw = json.dumps(message, ensure_ascii=False, default=str, separators=(",", ":")).encode("utf-8")
+    except Exception:
+        raw = str(message).encode("utf-8", "replace")
+    return max(1, len(raw))
+
+
+def _compaction_stage_chunks(messages: Sequence[Dict[str, Any]]) -> Iterator[List[Dict[str, Any]]]:
+    """Yield chunks bounded by row count and encoded bytes (except one indivisible oversized row)."""
+    max_rows = max(1, int(_COMPACTION_STAGE_MAX_ROWS))
+    max_bytes = max(1, int(_COMPACTION_STAGE_MAX_BYTES))
+    chunk: List[Dict[str, Any]] = []
+    chunk_bytes = 0
+    for message in messages:
+        size = _compaction_message_size(message)
+        if chunk and (len(chunk) >= max_rows or chunk_bytes + size > max_bytes):
+            yield chunk
+            chunk, chunk_bytes = [], 0
+        chunk.append(message)
+        chunk_bytes += size
+        if len(chunk) >= max_rows or chunk_bytes >= max_bytes:
+            yield chunk
+            chunk, chunk_bytes = [], 0
+    if chunk:
+        yield chunk
+
+
+def _compaction_stage_metadata(model_config: Any, target_session_id: str, lock_holder: str) -> str:
+    config = _json_or(model_config, {}, "Ignoring invalid target model config for compaction staging") \
+        if model_config else {}
+    if not isinstance(config, dict):
+        config = {}
+    config[_COMPACTION_STAGE_MARKER] = {
+        "target_session_id": target_session_id, "lock_holder": lock_holder,
+    }
+    return json.dumps(config, separators=(",", ":"))
+
+
+def _create_compaction_stage(db, target_session_id: str, stage_session_id: str, lock_holder: str) -> None:
+    """Create one hidden internal stage after proving target and lease ownership."""
+    def _create(conn):
+        _verify_compaction_lock(conn, target_session_id, lock_holder)
+        target = conn.execute(
+            "SELECT source, model_config FROM sessions WHERE id = ?", (target_session_id,)).fetchone()
+        if target is None:
+            raise RuntimeError(f"Compaction target session {target_session_id!r} is missing")
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, model_config, hidden) VALUES (?, ?, ?, ?, 1)",
+            (stage_session_id, target["source"], time.time(),
+             _compaction_stage_metadata(target["model_config"], target_session_id, lock_holder)))
+    db._execute_write(_create)
+
+
+def _stage_compaction_chunk(db, target_session_id: str, stage_session_id: str,
+                            lock_holder: str, chunk: List[Dict[str, Any]]) -> Tuple[int, int]:
+    """Insert and hide one replacement chunk in one bounded transaction."""
+    def _insert(conn):
+        _verify_compaction_lock(conn, target_session_id, lock_holder)
+        before = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?", (stage_session_id,)).fetchone()[0]
+        inserted, tool_calls = db._insert_message_rows(conn, stage_session_id, chunk)
+        cursor = conn.execute(
+            "UPDATE messages SET active = 0, compacted = 0 "
+            "WHERE session_id = ? AND id > ? AND active = 1",
+            (stage_session_id, int(before)))
+        changed = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else \
+            conn.execute("SELECT changes()").fetchone()[0]
+        if int(changed) != inserted:
+            raise RuntimeError(
+                "staged compaction visibility flip was incomplete: "
+                f"expected={inserted}, changed={changed}")
+        return int(inserted), int(tool_calls)
+    return db._execute_write(_insert)
+
+
+def _cleanup_compaction_stage(db, stage_session_id: str, *, target_session_id: Optional[str] = None,
+                              lock_holder: Optional[str] = None) -> int:
+    """Delete one hidden stage in row-bounded transactions.
+
+    Failure cleanup needs no lease because the random stage id belongs only to that
+    call.  Stale-stage cleanup supplies a target/holder and re-fences every step.
+    """
+    deleted_total = 0
+    while True:
+        def _delete_step(conn):
+            if target_session_id is not None:
+                _verify_compaction_lock(conn, target_session_id, lock_holder)
+            rows = conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? ORDER BY id LIMIT ?",
+                (stage_session_id, max(1, int(_COMPACTION_CLEANUP_MAX_ROWS)))).fetchall()
+            ids = [int(row["id"]) for row in rows]
+            if ids:
+                conn.execute(f"DELETE FROM messages WHERE id IN ({_placeholders(ids)})", ids)
+                return len(ids), True
+            marker_expr = _sql_json_extract(
+                "model_config", f"$.{_COMPACTION_STAGE_MARKER}.target_session_id")
+            conn.execute(
+                f"DELETE FROM sessions WHERE id = ? AND hidden = 1 AND {marker_expr} IS NOT NULL",
+                (stage_session_id,))
+            return 0, False
+        deleted, more = db._execute_write(_delete_step)
+        deleted_total += int(deleted)
+        if not more:
+            return deleted_total
+
+
+def _reclaim_stale_compaction_stages(db, target_session_id: str, lock_holder: str) -> int:
+    """Reclaim prior stages one at a time after proving current ownership."""
+    deleted = 0
+    target_expr = _sql_json_extract("model_config", f"$.{_COMPACTION_STAGE_MARKER}.target_session_id")
+    while True:
+        with db._read_ctx() as conn:
+            row = conn.execute(
+                f"SELECT id FROM sessions WHERE hidden = 1 AND {target_expr} = ? "
+                "ORDER BY started_at, id LIMIT 1",
+                (target_session_id,)).fetchone()
+        if row is None:
+            return deleted
+        deleted += _cleanup_compaction_stage(
+            db, str(row["id"]), target_session_id=target_session_id, lock_holder=lock_holder)
+
+
+def _commit_compaction_stage(db, target_session_id: str, stage_session_id: str, lock_holder: str, *,
+                             stage_message_count: int, stage_tool_call_count: int,
+                             model_config_patch: Optional[Dict[str, Any]], watermark: Optional[int],
+                             tail_count: int) -> int:
+    """Atomically replace the active view with a complete, verified stage."""
+    def _commit(conn):
+        _verify_compaction_lock(conn, target_session_id, lock_holder)
+        if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (target_session_id,)).fetchone() is None:
+            raise RuntimeError(f"Compaction target session {target_session_id!r} is missing")
+        target_expr = _sql_json_extract("model_config", f"$.{_COMPACTION_STAGE_MARKER}.target_session_id")
+        holder_expr = _sql_json_extract("model_config", f"$.{_COMPACTION_STAGE_MARKER}.lock_holder")
+        stage = conn.execute(
+            f"SELECT 1 FROM sessions WHERE id = ? AND hidden = 1 "
+            f"AND {target_expr} = ? AND {holder_expr} = ?",
+            (stage_session_id, target_session_id, lock_holder)).fetchone()
+        if stage is None:
+            raise RuntimeError("compaction stage session disappeared or changed owner")
+        stage_rows = conn.execute(
+            "SELECT active, compacted FROM messages WHERE session_id = ? ORDER BY id",
+            (stage_session_id,)).fetchall()
+        if len(stage_rows) != stage_message_count:
+            raise RuntimeError(
+                "staged compaction set changed before cutover: "
+                f"expected={stage_message_count}, found={len(stage_rows)}")
+        if any(bool(row["active"]) or bool(row["compacted"]) for row in stage_rows):
+            raise RuntimeError("staged compaction rows became visible before cutover")
+
+        patched_model_config = None
+        if model_config_patch is not None:
+            patched_model_config = db._merge_model_config_json(
+                conn, target_session_id, model_config_patch, on_missing="raise")
+
+        tail_ids: List[int] = []
+        tail_tool_calls = 0
+        if watermark is not None:
+            tail_ids, tail_tool_calls = db._tail_rows_after_watermark(
+                conn,
+                "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 "
+                "AND id > ? ORDER BY id",
+                (target_session_id, int(watermark)))
+        rewind_ids: List[int] = []
+        if tail_count > 0:
+            bound = watermark is not None
+            rewind_ids = [int(row["id"]) for row in conn.execute(
+                f"SELECT id FROM messages WHERE session_id = ? AND active = 1"
+                f"{' AND id <= ?' if bound else ''} ORDER BY id DESC LIMIT ?",
+                (target_session_id, *((int(watermark),) if bound else ()), int(tail_count))).fetchall()]
+
+        conn.execute(_ARCHIVE_ACTIVE_SQL, (target_session_id,))
+        for ids in _id_chunks([*rewind_ids, *tail_ids]):
+            conn.execute(
+                f"UPDATE messages SET compacted = 0 WHERE session_id = ? AND id IN ({_placeholders(ids)})",
+                (target_session_id, *ids))
+        cursor = conn.execute(
+            "UPDATE messages SET session_id = ?, active = 1, compacted = 0 "
+            "WHERE session_id = ? AND active = 0 AND compacted = 0",
+            (target_session_id, stage_session_id))
+        activated = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else \
+            conn.execute("SELECT changes()").fetchone()[0]
+        if int(activated) != stage_message_count:
+            raise RuntimeError(
+                "staged compaction activation was incomplete: "
+                f"expected={stage_message_count}, activated={activated}")
+        conn.execute(
+            f"DELETE FROM sessions WHERE id = ? AND hidden = 1 AND {target_expr} = ?",
+            (stage_session_id, target_session_id))
+
+        inserted = stage_message_count
+        tool_calls_total = stage_tool_call_count
+        for ids in _id_chunks(tail_ids):
+            db._clone_message_rows(conn, ids)
+        inserted += len(tail_ids)
+        tool_calls_total += tail_tool_calls
+        conn.execute(
+            f"{_SET_COUNTERS_SQL}{', model_config = ?' if model_config_patch is not None else ''} WHERE id = ?",
+            (inserted, tool_calls_total,
+             *((patched_model_config,) if model_config_patch is not None else ()), target_session_id))
+        return inserted
+    return int(db._execute_write(_commit))
 
 
 def _json_or(raw: Any, fallback: Any, warning: str) -> Any:
@@ -564,10 +792,12 @@ class SessionMessagesMixin:
             f"WHERE id IN ({_placeholders(tail_ids)}) ORDER BY id",
             [session_id, *tail_ids] if retarget else tail_ids)
 
-    def archive_and_compact(self, session_id: str, compacted_messages: List[Dict[str, Any]],
+    def _archive_and_compact_atomic(self, session_id: str, compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None, watermark: Optional[int] = None,
         lock_holder: Optional[str] = None, tail_count: int = 0) -> int:
-        """Non-destructive in-place compaction under ONE session id: soft-archive the active rows (``active=0,
+        """Single-transaction publication used only by compactions without a durable lease.
+
+        Non-destructive in-place compaction under ONE session id: soft-archive the active rows (``active=0,
         compacted=1``: summarized away, still searchable) and insert *compacted_messages* as fresh active
         rows, atomically; returns the new ACTIVE count (= ``message_count``). *watermark* (compression
         START): rows ``id > watermark`` arrived during the slow summary and are re-sequenced after the
@@ -625,6 +855,79 @@ class SessionMessagesMixin:
                 (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
             return inserted
         return self._execute_write(_do)
+
+    def archive_and_compact(self, session_id: str, compacted_messages: List[Dict[str, Any]],
+        model_config_patch: Optional[Dict[str, Any]] = None, watermark: Optional[int] = None,
+        lock_holder: Optional[str] = None, tail_count: int = 0) -> int:
+        """Publish a complete replacement through bounded staging when a lease is held.
+
+        The stage is a hidden internal session whose rows remain ``active=0, compacted=0``.
+        Each row/byte-bounded insert commits independently, leaving the old active transcript
+        unchanged and releasing SQLite's writer slot between chunks.  A final short transaction
+        rechecks the lease, preserves post-watermark appends, applies tail rewind semantics and
+        model configuration, then atomically moves the staged rows into the public session.
+
+        Unowned maintenance callers retain the historical single-transaction path: without a
+        pre-existing compression lease, a multi-transaction stage would create an unfenced stale
+        snapshot window.
+        """
+        if lock_holder is None:
+            return self._archive_and_compact_atomic(
+                session_id, compacted_messages, model_config_patch=model_config_patch,
+                watermark=watermark, lock_holder=None, tail_count=tail_count)
+
+        stage_session_id = f"_hcmp_{uuid.uuid4().hex}"
+        previous_row_ids: Dict[int, Tuple[Dict[str, Any], bool, Any]] = {}
+        for message in compacted_messages:
+            if isinstance(message, dict) and id(message) not in previous_row_ids:
+                previous_row_ids[id(message)] = (
+                    message, "_row_id" in message, message.get("_row_id"))
+
+        stage_created = False
+        stage_message_count = 0
+        stage_tool_call_count = 0
+        started = time.monotonic()
+        transaction_count = 0
+        try:
+            reclaimed = _reclaim_stale_compaction_stages(self, session_id, lock_holder)
+            _create_compaction_stage(self, session_id, stage_session_id, lock_holder)
+            stage_created = True
+            for chunk in _compaction_stage_chunks(compacted_messages):
+                inserted, tool_calls = _stage_compaction_chunk(
+                    self, session_id, stage_session_id, lock_holder, chunk)
+                stage_message_count += inserted
+                stage_tool_call_count += tool_calls
+                transaction_count += 1
+            cutover_started = time.monotonic()
+            inserted = _commit_compaction_stage(
+                self, session_id, stage_session_id, lock_holder,
+                stage_message_count=stage_message_count,
+                stage_tool_call_count=stage_tool_call_count,
+                model_config_patch=model_config_patch,
+                watermark=watermark,
+                tail_count=tail_count)
+            logger.info(
+                "state.db compaction published: session=%s rows=%d stage_transactions=%d "
+                "cutover_seconds=%.3f total_seconds=%.3f stale_stage_rows_reclaimed=%d",
+                session_id, inserted, transaction_count, time.monotonic() - cutover_started,
+                time.monotonic() - started, reclaimed)
+            return inserted
+        except BaseException:
+            if stage_created:
+                try:
+                    _cleanup_compaction_stage(self, stage_session_id)
+                except Exception:
+                    # Residue remains hidden and non-searchable; a later proven holder
+                    # reclaims it before creating a new stage.
+                    logger.error(
+                        "Could not remove abandoned compaction stage %s for %s",
+                        stage_session_id, session_id, exc_info=True)
+            for message, had_row_id, row_id in previous_row_ids.values():
+                if had_row_id:
+                    message["_row_id"] = row_id
+                else:
+                    message.pop("_row_id", None)
+            raise
 
     def _message_column_names(self, conn) -> List[str]:
         """Column names of the messages table, cached per-connection era."""
