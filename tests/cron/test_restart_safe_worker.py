@@ -443,6 +443,31 @@ def test_launch_external_worker_stays_in_process_outside_managed_gateway(
     popen.assert_not_called()
 
 
+def test_finite_owner_forces_external_worker_outside_managed_gateway(
+    tmp_path, monkeypatch,
+):
+    """A finite CLI/request process must hand ownership to a detached worker.
+
+    Otherwise the caller can exit after its request deadline and leave an
+    honestly-unknown execution even though the long-lived gateway stayed up.
+    """
+    import cron.scheduler as scheduler
+    from tools.process_registry import GatewayChildDispatch
+
+    job = {"id": "job-finite", "execution_id": "exec-finite", "prompt": "work"}
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "tools.process_registry.restart_safe_gateway_child_argv",
+        lambda command, **_kw: GatewayChildDispatch("in_process", command),
+    )
+    spawned, payloads, handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
+
+    assert scheduler._launch_external_cron_worker(job, force=True) is True
+    assert spawned[0][1]["start_new_session"] is True
+    assert payloads[0]["job"]["id"] == "job-finite"
+    handoff.assert_called_once_with("exec-finite")
+
+
 @pytest.mark.linux_only
 def test_launch_external_worker_degrades_by_default_with_real_helper(
     tmp_path, monkeypatch,
@@ -602,6 +627,100 @@ def test_lost_execution_start_cas_prevents_side_effects(monkeypatch):
         {"id": "job-1", "execution_id": "exec-1"}, adapters=None
     ) is True
     run.assert_not_called()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-session test")
+@pytest.mark.live_system_guard_bypass
+def test_finite_manual_owner_exit_does_not_orphan_detached_execution(tmp_path, monkeypatch):
+    """The real finite-owner handoff survives its request process exiting."""
+    import cron.executions as executions
+    from cron.jobs import create_job, use_cron_store
+    from gateway.status import _pid_exists
+
+    home = tmp_path / "profile"
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", home / "cron" / "executions.db")
+    scripts_dir = home / "scripts"
+    scripts_dir.mkdir(parents=True)
+    started = tmp_path / "started"
+    release = tmp_path / "release"
+    side_effect = tmp_path / "side-effect"
+    probe = scripts_dir / "finite_owner_probe.py"
+    probe.write_text(
+        "import pathlib, time\n"
+        f"started = pathlib.Path({str(started)!r})\n"
+        f"release = pathlib.Path({str(release)!r})\n"
+        f"side_effect = pathlib.Path({str(side_effect)!r})\n"
+        "started.write_text('started')\n"
+        "deadline = time.monotonic() + 15\n"
+        "while not release.exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.05)\n"
+        "if not release.exists():\n"
+        "    raise SystemExit('release timeout')\n"
+        "side_effect.write_text('once')\n"
+        "print('completed')\n",
+        encoding="utf-8",
+    )
+    with use_cron_store(home):
+        job = create_job(
+            prompt=None,
+            schedule="every 1h",
+            name="finite owner probe",
+            script=probe.name,
+            no_agent=True,
+            deliver="local",
+        )
+
+    repo = Path(__file__).resolve().parents[2]
+    harness = (
+        "import os\n"
+        f"os.environ['HERMES_HOME'] = {str(home)!r}\n"
+        "from cron.jobs import claim_job_for_fire, use_cron_store\n"
+        "from cron.scheduler import run_one_job\n"
+        f"with use_cron_store({str(home)!r}):\n"
+        f"    job = claim_job_for_fire({job['id']!r}, manual=True, return_job=True)\n"
+        "    assert isinstance(job, dict)\n"
+        "    assert run_one_job(job, force_external_worker=True)\n"
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["PYTHONPATH"] = str(repo)
+    parent = subprocess.Popen([sys.executable, "-c", harness], cwd=repo, env=env)
+    worker_pid = None
+    try:
+        deadline = time.monotonic() + 10
+        current = None
+        while time.monotonic() < deadline:
+            current = executions.latest_execution(job["id"])
+            if started.exists() and current and int(current["pid"]) != parent.pid:
+                break
+            if parent.poll() is not None:
+                pytest.fail(f"finite owner exited before handoff: {parent.returncode}")
+            time.sleep(0.05)
+        assert started.exists()
+        assert current is not None
+        worker_pid = int(current["pid"])
+
+        parent.terminate()
+        parent.wait(timeout=5)
+        assert _pid_exists(worker_pid)
+
+        release.write_text("go", encoding="utf-8")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            current = executions.latest_execution(job["id"])
+            if current and current["status"] == "completed":
+                break
+            time.sleep(0.05)
+        terminal = executions.latest_execution(job["id"])
+        assert terminal is not None
+        assert terminal["status"] == "completed"
+        assert side_effect.read_text(encoding="utf-8") == "once"
+    finally:
+        if parent.poll() is None:
+            parent.terminate()
+            parent.wait(timeout=5)
+        if worker_pid is not None and _pid_exists(worker_pid):
+            os.kill(worker_pid, signal.SIGKILL)
 
 
 @pytest.mark.linux_only

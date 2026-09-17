@@ -362,6 +362,31 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     assert events[-1][2]["success"] is True
 
 
+def test_manual_run_without_gateway_requests_durable_external_owner(monkeypatch):
+    """Manual/event runs in finite processes cannot keep execution ownership."""
+    import tools.cronjob_tools as cronjob_tools
+
+    observed = {}
+    monkeypatch.setattr("cron.scheduler.try_register_running_job", lambda _job_id: True)
+    monkeypatch.setattr("cron.scheduler.release_running_job", lambda _job_id: None)
+
+    def fake_run_one_job(job, **kwargs):
+        observed.update(kwargs)
+        return True
+
+    monkeypatch.setattr("cron.scheduler.run_one_job", fake_run_one_job)
+    monkeypatch.setattr(cronjob_tools, "get_job", lambda _job_id: {"last_status": "ok"})
+
+    result = cronjob_tools._run_claimed_job({
+        "id": "manual-finite",
+        "name": "manual finite",
+        "fire_claim": {"by": "finite:owner"},
+    })
+
+    assert result["success"] is True
+    assert observed["force_external_worker"] is True
+
+
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
     import cron.scheduler_provider as provider
 

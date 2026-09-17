@@ -303,7 +303,17 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
             # run_one_job records last_run_at/last_status via mark_job_run; `job` is the
             # owner-bearing claimed snapshot, so terminal writes stay fenced by that owner.
             with _run_heartbeat(str(job.get("name") or job_id)):
-                processed = run_one_job(job, adapters=adapters, loop=gateway_loop, extra_prompt=extra_prompt)
+                processed = run_one_job(
+                    job,
+                    adapters=adapters,
+                    loop=gateway_loop,
+                    extra_prompt=extra_prompt,
+                    # A CLI, webhook helper, or other finite process can be
+                    # killed by its caller's request timeout. Transfer the
+                    # execution row to a detached worker first; a live gateway
+                    # remains the in-process owner and keeps adapter parity.
+                    force_external_worker=runner is None,
+                )
         finally:
             _registered = False
             release_running_job(job_id)

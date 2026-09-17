@@ -2460,6 +2460,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 def run_one_job(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, cancel_event: Optional[_CancelEventLike] = None,
+    force_external_worker: bool = False,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark. Shared by the built-in
     ticker and external providers' ``fire_due``; does NOT decide due-ness or acquire the initial
@@ -2478,7 +2479,12 @@ def run_one_job(
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
     if not external_owner:
         try:
-            if _launch_external_cron_worker(job):
+            handed_off = (
+                _launch_external_cron_worker(job, force=True)
+                if force_external_worker
+                else _launch_external_cron_worker(job)
+            )
+            if handed_off:
                 return True
         except Exception as handoff_error:
             error = f"Restart-safe cron worker dispatch failed: {handoff_error}"
@@ -3098,14 +3104,14 @@ def _wait_for_external_cron_worker(
                 pass
 
 
-def _launch_external_cron_worker(job: dict) -> bool:
-    """Launch *job* outside the managed gateway process when required.
+def _launch_external_cron_worker(job: dict, *, force: bool = False) -> bool:
+    """Launch *job* in a detached owner process when required.
 
-    Returns ``False`` outside a managed systemd gateway (in-process path).  In
-    managed topology the job always goes to an external worker with the #101940
-    ownership handoff: in a transient user scope, or — when no user D-Bus
-    session exists and ``cron.require_restart_safe_scope`` is false — as a
-    direct subprocess (process separation kept, cgroup isolation lost).
+    Ordinarily returns ``False`` outside a managed systemd gateway. ``force``
+    is used by finite manual/event callers: they cannot durably own a long cron
+    run, so even on macOS or an unsupervised host they transfer the ledger row
+    to a new-session subprocess before side effects begin. In managed topology
+    the existing #101940 scope/degraded policy is unchanged.
     """
     execution_id = str(job["execution_id"])
     job_id = str(job["id"])
@@ -3147,7 +3153,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
         unit_suffix=f"cron-{job_id}-exec-{execution_id}",
         require_restart_safe_scope=require_restart_safe_scope,
     )
-    if dispatch.mode == "in_process":
+    if dispatch.mode == "in_process" and not force:
         return False
 
     if mark_execution_handoff_pending(execution_id) is None:
