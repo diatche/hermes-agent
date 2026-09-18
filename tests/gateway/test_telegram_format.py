@@ -207,6 +207,27 @@ class TestFormatMessageLinks:
         # The ) in URL should be escaped
         assert "\\)" in result
 
+    def test_bare_url_is_clickable_without_swallowing_sentence_punctuation(self, adapter):
+        result = adapter.format_message(
+            '"/Users/diatche/Documents/Семья/Дети/Luca/School/Mt Eden Normal Primary/README.md" , '
+            "see https://www.mteden.school.nz/enrolment."
+        )
+
+        assert (
+            "[https://www\\.mteden\\.school\\.nz/enrolment]"
+            "(https://www.mteden.school.nz/enrolment)\\."
+        ) in result
+
+    def test_bare_url_with_parentheses_keeps_a_valid_markdownv2_target(self, adapter):
+        result = adapter.format_message(
+            "See https://en.wikipedia.org/wiki/Python_(programming_language)."
+        )
+
+        assert (
+            "[https://en\\.wikipedia\\.org/wiki/Python\\_\\(programming\\_language\\)]"
+            "(https://en.wikipedia.org/wiki/Python_(programming_language\\))\\."
+        ) in result
+
 
 # =========================================================================
 # format_message - BUG: italic regex spans newlines
