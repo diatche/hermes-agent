@@ -5168,12 +5168,9 @@ class TelegramAdapter(BasePlatformAdapter):
         text = re.sub(r'(```(?:[^\n]*\n)?[\s\S]*?```)', _protect_fenced, text)
         # 2) Protect inline code; escape \ inside it per MarkdownV2 spec.
         text = re.sub(r'(`[^`]+`)', lambda m: _ph(m.group(0).replace('\\', '\\\\')), text)
-        # 3) Links: escape display text; inside the URL only ')' and '\\' need escaping.
-        def _escape_link_url(url: str) -> str:
-            return url.replace('\\', '\\\\').replace(')', '\\)')
-
+        # 3) Links: escape display text; inside the URL only ')' and '\' need escaping.
         def _convert_link(m):
-            url = _escape_link_url(m.group(2))
+            url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
             return _ph(f'[{_escape_mdv2(m.group(1))}]({url})')
 
         text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _convert_link, text)
@@ -5197,30 +5194,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return _ph(f'{prefix} {_escape_mdv2(content)}')
 
         text = re.sub(r'^((?:\*\*)?>{1,3}) (.+)$', _convert_blockquote, text, flags=re.MULTILINE)
-        # 9b) Turn plain HTTP(S) URLs into explicit MarkdownV2 links before the
-        # general escape pass. Telegram does not reliably auto-link escaped URL
-        # text. Keep sentence punctuation outside the target and preserve
-        # balanced parentheses that belong to the URL itself.
-        def _convert_bare_url(m):
-            url = m.group(0)
-            suffix = ''
-            while url:
-                last = url[-1]
-                if last in '.,!?;:]}' or last in {'"', "'"}:
-                    suffix = last + suffix
-                    url = url[:-1]
-                    continue
-                if last == ')' and url.count(')') > url.count('('):
-                    suffix = last + suffix
-                    url = url[:-1]
-                    continue
-                break
-            if not url:
-                return m.group(0)
-            link = f'[{_escape_mdv2(url)}]({_escape_link_url(url)})'
-            return _ph(link) + suffix
-
-        text = re.sub(r'https?://[^\s<>\x00]+', _convert_bare_url, text)
         # 10) Escape remaining special characters in plain text
         text = _escape_mdv2(text)
         # 11) Restore placeholders in reverse insertion order so nested placeholders resolve.
@@ -5244,16 +5217,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return ch
         if ch == '(' and s > 0 and seg[s - 1] == ']':  # opens a link [text](url)
             return ch
-        if ch == '(' and '](' in seg[:s]:  # nested opening parenthesis inside a link URL
-            depth = 0
-            for j in range(s - 1, max(s - 2000, -1), -1):
-                if seg[j] == ')':
-                    depth += 1
-                elif seg[j] == '(':
-                    if depth:
-                        depth -= 1
-                    elif j > 0 and seg[j - 1] == ']':
-                        return ch
         if ch == ')':  # closes a link URL? walk back matching depth
             before = seg[:s]
             if '](http' in before or '](' in before:
