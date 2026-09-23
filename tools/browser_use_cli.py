@@ -32,15 +32,31 @@ _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 # (per-name provider / named BU cloud / Lightpanda). Popped before the subprocess launches — never exported.
 _PRIVATE_BROWSER_SENTINEL = "_HERMES_BU_PRIVATE_BROWSER"
 
-# Prepended to the model's code for named sessions on SHARED browsers (a /browser connect CDP override): the
-# harness daemon attaches to the first existing page at startup, so two fresh named daemons can land on the
-# SAME tab. Steering each onto a tab it created prevents clobbering. Runs once per daemon (marker keyed by
-# BU_NAME + daemon pid).
+# Prepended to the model's code for named sessions on SHARED browsers (a /browser connect CDP override).
+# Old harness releases attached fresh named daemons to the first existing page, so Hermes had to create and
+# pin a private target. browser-harness 0.1.9+ isolates named daemons natively; the embedded version gate
+# stands down there, otherwise every session creates a redundant blank target (#91522).
 _OWN_TAB_PREAMBLE = """\
 # hermes: pin this named session to its own tab (once per daemon process)
 def _hermes_ensure_own_tab():
     import os as _os, tempfile as _tf
     _name = _os.environ.get("BU_NAME", "default")
+    try:
+        from importlib.metadata import version as _bh_version
+        _version = []
+        for _part in _bh_version("browser-harness").split(".")[:3]:
+            _digits = ""
+            for _char in _part:
+                if not _char.isdigit():
+                    break
+                _digits += _char
+            _version.append(int(_digits or 0))
+        while len(_version) < 3:
+            _version.append(0)
+        if tuple(_version) >= (0, 1, 9):
+            return
+    except Exception:
+        pass  # unknown/old harness: retain the compatibility pin
     try:
         # Key the marker by the daemon's pid so a daemon restart (which
         # re-attaches to the first shared page) re-pins automatically,
@@ -685,6 +701,10 @@ _HEADER_BASE = (
     "('all N products / every entry'), append each batch to a JSON/CSV file in the workspace, then read it "
     "back and aggregate in code — dedupe/count/sort with Python, not in your head — and verify the "
     "collected count against what was asked before answering.\n\n"
+    "TAB LIFECYCLE: Browser sessions share a long-lived browser. Reuse the task-owned current tab where "
+    "possible, record target IDs for any additional tabs you create, and close task-created tabs with "
+    "close_tab(target_id) before the final response. For a named session, close its dedicated current tab "
+    "last when the browser task is complete. Never close pre-existing user or service tabs.\n\n"
     "Batch each sub-procedure (navigate, wait, extract, act) into one call — do not spend a call per "
     "action — but for long extractions prefer several medium calls that append to workspace files over "
     "one giant call, so progress survives timeouts."
@@ -720,6 +740,8 @@ _HELPERS_DIGEST = (
     "state, js(expr) evaluates a JS expression and returns its value (js('document.title'); wrap function "
     "bodies as js('(() => {...})()') — a bare '() => {...}' returns the function itself, uncalled), "
     "fill_input(selector, text) types into inputs, click_at_xy(x, y) clicks viewport coordinates, "
+    "current_tab() returns the active target, list_tabs() lists targets, switch_tab(target_id) selects one, "
+    "and close_tab(target_id) closes only that target (close_tab() closes the current target). "
     "capture_screenshot() saves and prints a screenshot path, cdp('Domain.method', **kwargs) is raw CDP — "
     "cdp('Accessibility.getFullAXTree')['nodes'] lists every element's role/name/backendDOMNodeId (filter "
     "in Python before printing; it is thousands of nodes), then cdp('DOM.getBoxModel', backendNodeId=n) "

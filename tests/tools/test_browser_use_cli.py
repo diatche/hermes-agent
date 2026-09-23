@@ -676,6 +676,48 @@ class TestOwnTabPreamble:
         # and composes with model code
         ast.parse(bu_cli._OWN_TAB_PREAMBLE + "print('x')")
 
+    def test_current_harness_does_not_create_redundant_tab(self, tmp_path, monkeypatch):
+        """browser-harness 0.1.9+ already isolates named daemons on their own tab.
+
+        Running Hermes' legacy compatibility preamble as well creates a second blank
+        target for every named session (#91522), which accumulates in shared Chrome.
+        """
+        import importlib.metadata
+        import tempfile
+
+        monkeypatch.setenv("BU_NAME", f"native-{tmp_path.name}")
+        monkeypatch.setattr(importlib.metadata, "version", lambda name: "0.1.13")
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        cdp_calls = []
+        namespace = {
+            "cdp": lambda method, **kwargs: cdp_calls.append((method, kwargs)) or {"targetId": "extra"},
+            "switch_tab": lambda target_id: None,
+        }
+
+        exec(bu_cli._OWN_TAB_PREAMBLE, namespace)
+
+        assert cdp_calls == []
+
+    def test_old_harness_retains_compatibility_tab_pin(self, tmp_path, monkeypatch):
+        """Pre-0.1.9 harnesses still need Hermes to isolate a named session."""
+        import importlib.metadata
+        import tempfile
+
+        monkeypatch.setenv("BU_NAME", f"legacy-{tmp_path.name}")
+        monkeypatch.setattr(importlib.metadata, "version", lambda name: "0.1.8")
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        cdp_calls = []
+        switched = []
+        namespace = {
+            "cdp": lambda method, **kwargs: cdp_calls.append((method, kwargs)) or {"targetId": "owned"},
+            "switch_tab": switched.append,
+        }
+
+        exec(bu_cli._OWN_TAB_PREAMBLE, namespace)
+
+        assert cdp_calls == [("Target.createTarget", {"url": "about:blank"})]
+        assert switched == ["owned"]
+
 
 class TestProviderPickerIntegration:
     """The `hermes tools` Browser Automation picker row (browser_backend
@@ -895,6 +937,8 @@ class TestStepLabels:
     def test_header_instructs_leading_comment(self):
         assert "one-line comment" in bu_cli._HEADER_BASE
         assert "step label" in bu_cli._HEADER_BASE
+        assert "close task-created tabs" in bu_cli._HEADER_BASE
+        assert "Never close pre-existing user or service tabs" in bu_cli._HEADER_BASE
 
 
 class TestHeaderVariants:
@@ -935,7 +979,8 @@ class TestSkillTextDescription:
 
     def test_digest_names_core_helpers(self):
         for helper in ("new_tab(", "page_info()", "js(", "fill_input(",
-                       "click_at_xy(", "capture_screenshot()", "cdp("):
+                       "click_at_xy(", "current_tab(", "list_tabs(", "switch_tab(",
+                       "close_tab(", "capture_screenshot()", "cdp("):
             assert helper in bu_cli._HELPERS_DIGEST
 
     def test_static_fallback_carries_digest_and_install_hint(self):
