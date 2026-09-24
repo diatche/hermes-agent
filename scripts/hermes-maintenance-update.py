@@ -333,6 +333,30 @@ def _health(health_script: Path, repo: Path, timeout: float) -> None:
         raise RuntimeError("wrapper health validation failed")
 
 
+def _lcm_post_upgrade_check(health_script: Path, repo: Path, timeout: float) -> None:
+    """Run the authoritative fail-closed LCM gate while the wrapper is stopped."""
+    if not health_script.is_file():
+        raise RuntimeError(f"health probe is missing: {health_script}")
+    result = _run(
+        (sys.executable, str(health_script), "--post-upgrade-lcm", "--json"),
+        cwd=repo,
+        timeout=timeout,
+        env={**os.environ, "HERMES_HOME": str(repo.parent)},
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            "LCM post-upgrade integrity/activation validation failed"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("LCM post-upgrade check returned malformed JSON") from exc
+    if payload.get("healthy") is not True or payload.get("issues"):
+        raise RuntimeError(f"LCM post-upgrade check reported unhealthy state: {payload}")
+
+
 def _ensure_hindsight_embeddings(repo: Path, timeout: float) -> None:
     """Repair the known shared-venv HF downgrade, then prove imports work."""
     python = repo / "venv" / "bin" / "python"
@@ -1062,6 +1086,9 @@ def _run_pre_locked(
                 _progress("Pre-update failed after gateway interruption; recovering the previous runtime")
                 _recover_owned_git_state(repo, journal)
                 _ensure_hindsight_embeddings(repo, args.health_timeout)
+                _lcm_post_upgrade_check(
+                    args.health_script.resolve(), repo, args.health_timeout
+                )
                 _wrapper(
                     args.wrapperctl.resolve(), repo, "--foreground",
                     args.wrapper_timeout, maintenance_start=True,
@@ -1172,6 +1199,10 @@ def _run_post_locked(
         )
         _progress("Checking Hindsight embedding compatibility")
         _ensure_hindsight_embeddings(repo, args.health_timeout)
+        _progress("Running offline LCM post-upgrade integrity and activation checks")
+        _lcm_post_upgrade_check(
+            args.health_script.resolve(), repo, args.health_timeout
+        )
         _progress("Starting the custom Hermes gateway wrapper")
         _wrapper(
             args.wrapperctl.resolve(), repo, "--foreground",
@@ -1203,6 +1234,9 @@ def _run_post_locked(
                     )
                 _recover_owned_git_state(repo, journal)
                 _ensure_hindsight_embeddings(repo, args.health_timeout)
+                _lcm_post_upgrade_check(
+                    args.health_script.resolve(), repo, args.health_timeout
+                )
                 _wrapper(
                     args.wrapperctl.resolve(), repo, "--foreground",
                     args.wrapper_timeout, maintenance_start=True,

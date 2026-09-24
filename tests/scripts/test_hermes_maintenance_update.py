@@ -133,7 +133,11 @@ def _fake_runtime(
         "health.py",
         "#!/usr/bin/env python3\n"
         "import json\n"
+        "import sys\n"
         "from pathlib import Path\n"
+        "if '--post-upgrade-lcm' in sys.argv:\n"
+        "    print(json.dumps({'healthy': True, 'issues': [], 'repairs': []}))\n"
+        "    raise SystemExit(0)\n"
         f"p = Path({str(health_count)!r})\n"
         "n = int(p.read_text()) + 1 if p.exists() else 1\n"
         "p.write_text(str(n))\n"
@@ -268,6 +272,41 @@ def test_post_update_candidate_runtime_probe_fails_closed(tmp_path: Path) -> Non
 
     with pytest.raises(RuntimeError, match="runtime import validation failed"):
         module._probe_candidate_runtime(repo, repo)
+
+
+def test_lcm_post_upgrade_check_requires_healthy_json(tmp_path: Path, monkeypatch) -> None:
+    module = _load_script_module()
+    health = _write(tmp_path, "lcm-health.py", "# fixture\n")
+    monkeypatch.setattr(
+        module,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, json.dumps({"healthy": False, "issues": ["broken"]}), ""
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="reported unhealthy state"):
+        module._lcm_post_upgrade_check(health, tmp_path, 30)
+
+
+def test_lcm_post_upgrade_check_passes_fail_closed_mode(tmp_path: Path, monkeypatch) -> None:
+    module = _load_script_module()
+    health = _write(tmp_path, "lcm-health.py", "# fixture\n")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(
+            command, 0, json.dumps({"healthy": True, "issues": [], "repairs": []}), ""
+        )
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    module._lcm_post_upgrade_check(health, tmp_path, 30)
+
+    assert calls[0][0] == (
+        sys.executable, str(health), "--post-upgrade-lcm", "--json"
+    )
+    assert calls[0][1]["env"]["HERMES_HOME"] == str(tmp_path.parent)
 
 
 def test_public_help_exposes_pre_post_check_and_help() -> None:
