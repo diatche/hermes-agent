@@ -288,6 +288,64 @@ def test_cutover_preserves_model_config_tail_sidecars_display_and_search(
         peer.close()
 
 
+def test_staged_cutover_preserves_exact_noncontiguous_carried_rows(tmp_path: Path) -> None:
+    """Lease-owned staging must compose with exact carried-row rewind semantics."""
+    writer, peer = _open_pair(tmp_path)
+    holder = "carried-row-stage-test"
+    try:
+        _lock(writer, holder)
+        writer.append_message("session", role="user", content="question 0")
+        writer.append_message(
+            "session", role="assistant", content="",
+            tool_calls=[{
+                "id": "call-1", "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }],
+        )
+        writer.append_message(
+            "session", role="tool", content="tool result that was summarized",
+            tool_call_id="call-1", tool_name="read_file",
+        )
+        writer.append_message("session", role="user", content="question 1")
+        writer.append_message("session", role="assistant", content="answer 1")
+
+        carried = [
+            message for message in writer.get_messages_as_conversation("session")
+            if message.get("content") in {"question 0", "question 1", "answer 1"}
+        ]
+        assert carried and all("_row_id" not in message for message in carried)
+
+        assert writer.archive_and_compact(
+            "session",
+            [
+                {"role": "user", "content": "question 0"},
+                {"role": "assistant", "content": "[CONTEXT COMPACTION] summarized tool exchange"},
+                {"role": "user", "content": "question 1"},
+                {"role": "assistant", "content": "answer 1"},
+            ],
+            lock_holder=holder,
+            carried_messages=carried,
+        ) == 4
+
+        rows = writer.get_messages("session", include_inactive=True)
+        tool_rows = [row for row in rows if row["content"] == "tool result that was summarized"]
+        assert len(tool_rows) == 1
+        assert not tool_rows[0]["active"] and tool_rows[0]["compacted"]
+        assert writer.search_messages("summarized")
+
+        carried_originals = [
+            row for row in rows
+            if row["content"] in {"question 0", "question 1", "answer 1"} and not row["active"]
+        ]
+        assert len(carried_originals) == 3
+        assert all(not row["compacted"] for row in carried_originals)
+        assert _stage_sessions(writer) == []
+    finally:
+        writer.release_compression_lock("session", holder)
+        writer.close()
+        peer.close()
+
+
 @pytest.mark.parametrize(
     ("source", "model_config"),
     [

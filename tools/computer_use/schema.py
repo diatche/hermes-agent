@@ -147,7 +147,7 @@ _PROPERTIES: Dict[str, Any] = {
             "Key combo, e.g. 'cmd+s', 'ctrl+alt+t', 'return', 'escape', 'tab'. Use '+' to combine."
         ),
     },
-    "seconds": {"type": "number", "description": "Seconds to wait. Max 30."},
+    "seconds": {"type": "number", "description": "wait: seconds to pause (max 30)."},
     "raise_window": {
         "type": "boolean",
         "description": (
@@ -194,9 +194,11 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
         "hidden/minimized windows), and when a result's `verdict` says to escalate you climb — "
         "pixel coordinates, or delivery_mode='foreground' (briefly fronts the window; separate "
         "approval). Each result carries a `verdict` with the next step; follow it — never repeat "
-        "confirmed input, and re-capture to verify an unverifiable one before retrying. Workflow: "
-        "action='capture' (mode='som' gives numbered element overlays), then click by `element` "
-        "index; re-capture after state-changing actions (or pass capture_after=true). Image "
+        "confirmed input, and re-capture to verify an unverifiable one before retrying. Never enter "
+        "passwords, API keys, payment-card details, or other secrets unless the user explicitly "
+        "approved that specific use case; stop and ask before acting on any unexpected credential "
+        "or payment prompt. Workflow: action='capture' (mode='som' gives numbered element overlays), "
+        "then click by `element` index; re-capture after state-changing actions (or pass capture_after=true). Image "
         "captures include a shareable `screenshot_path`; deliver it via the platform's MEDIA "
         "syntax when the user asks to see it — not for captures used only for control."
     ),
@@ -206,3 +208,4 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
 def get_computer_use_schema() -> Dict[str, Any]:
     """Return the generic OpenAI function-calling schema."""
     return COMPUTER_USE_SCHEMA
+
