@@ -14,7 +14,9 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "hermes-maintenance-update.py"
+SCRIPT = (
+    Path(__file__).resolve().parents[2] / "scripts" / "hermes-maintenance-update.py"
+)
 
 
 def _load_script_module():
@@ -43,9 +45,13 @@ def _commit(repo: Path, message: str) -> str:
     _git(repo, "add", "-A")
     _git(
         repo,
-        "-c", "user.name=Maintenance Test",
-        "-c", "user.email=maintenance@example.test",
-        "commit", "-m", message,
+        "-c",
+        "user.name=Maintenance Test",
+        "-c",
+        "user.email=maintenance@example.test",
+        "commit",
+        "-m",
+        message,
     )
     return _git(repo, "rev-parse", "HEAD")
 
@@ -53,9 +59,16 @@ def _commit(repo: Path, message: str) -> str:
 def _annotated_tag(repo: Path, name: str, target: str) -> None:
     _git(
         repo,
-        "-c", "user.name=Maintenance Test",
-        "-c", "user.email=maintenance@example.test",
-        "tag", "-a", name, target, "-m", name,
+        "-c",
+        "user.name=Maintenance Test",
+        "-c",
+        "user.email=maintenance@example.test",
+        "tag",
+        "-a",
+        name,
+        target,
+        "-m",
+        name,
     )
 
 
@@ -78,11 +91,11 @@ def _make_repo(tmp_path: Path, *, conflict: bool = False) -> tuple[Path, str]:
         repo,
         "venv/bin/hermes",
         "#!/bin/sh\nset -eu\n"
-        "if [ \"${1:-}\" = update ] && [ \"${2:-}\" = --help ]; then\n"
+        'if [ "${1:-}" = update ] && [ "${2:-}" = --help ]; then\n'
         "  echo 'usage: hermes update [--no-backup]'\n"
         "  exit 0\n"
         "fi\n"
-        "if [ \"${1:-}\" = gateway ] && [ \"${2:-}\" = stop ]; then\n"
+        'if [ "${1:-}" = gateway ] && [ "${2:-}" = stop ]; then\n'
         f"  printf '%s\\n' \"$*\" >> {updater_calls!s}\n"
         "  exit 0\n"
         "fi\n"
@@ -122,10 +135,7 @@ def _fake_runtime(
     wrapper = _write(
         tmp_path,
         "wrapperctl",
-        "#!/bin/sh\n"
-        f"printf '%s\\n' \"$*\" >> {calls!s}\n"
-        f"{failure_body}"
-        "exit 0\n",
+        f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {calls!s}\n{failure_body}exit 0\n",
     )
     fail_test = (
         f"if n == {fail_health_call}:\n    raise SystemExit(1)\n"
@@ -160,7 +170,7 @@ def _fake_official_updater(tmp_path: Path) -> tuple[Path, Path]:
         tmp_path,
         "fake-hermes",
         "#!/bin/sh\nset -eu\n"
-        "if [ \"${1:-}\" = update ] && [ \"${2:-}\" = --help ]; then\n"
+        'if [ "${1:-}" = update ] && [ "${2:-}" = --help ]; then\n'
         "  echo 'usage: hermes update [--no-backup]'\n"
         "  exit 0\n"
         "fi\n"
@@ -209,11 +219,16 @@ def _run(
         [
             sys.executable,
             str(SCRIPT),
-            "--repo", str(repo),
-            "--state-dir", str(state_dir),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
-            "--updater-executable", str(updater),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(state_dir),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
+            "--updater-executable",
+            str(updater),
         ],
         text=True,
         capture_output=True,
@@ -249,7 +264,9 @@ def test_default_health_timeout_is_bounded_for_multi_gigabyte_state_checks() -> 
     assert 600 <= timeout <= 1800
 
 
-def test_external_backup_gate_requires_complete_recent_generation(tmp_path: Path) -> None:
+def test_external_backup_gate_requires_complete_recent_generation(
+    tmp_path: Path,
+) -> None:
     module = _load_script_module()
     generation = tmp_path / "generations" / "20260916T000000Z-test-daily"
     archive = _write(generation, "archive.zip", "verified bytes")
@@ -269,7 +286,9 @@ def test_external_backup_gate_requires_complete_recent_generation(tmp_path: Path
         module._assert_fresh_verified_backup(tmp_path)
 
 
-def test_profile_gateway_inventory_filters_loaded_named_services(tmp_path: Path, monkeypatch) -> None:
+def test_profile_gateway_inventory_filters_loaded_named_services(
+    tmp_path: Path, monkeypatch
+) -> None:
     module = _load_script_module()
     monkeypatch.setattr(module, "DEFAULT_REPO", tmp_path)
     monkeypatch.setattr(
@@ -292,8 +311,33 @@ def test_profile_gateway_inventory_filters_loaded_named_services(tmp_path: Path,
     ]
 
 
+def test_stop_profile_gateways_boots_out_and_verifies_recorded_services(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_script_module()
+    label = "ai.hermes.gateway-recovery"
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(tuple(command))
+        return subprocess.CompletedProcess(
+            command, 0 if command[1] == "bootout" else 113, "", ""
+        )
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    module._stop_profile_gateway_services(tmp_path, [label], 30)
+
+    domain = f"gui/{os.getuid()}"
+    assert calls == [
+        ("/bin/launchctl", "bootout", f"{domain}/{label}"),
+        ("/bin/launchctl", "print", f"{domain}/{label}"),
+    ]
+
+
 def test_restore_profile_gateways_bootstraps_and_starts_recorded_services(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     module = _load_script_module()
     label = "ai.hermes.gateway-recovery"
@@ -334,7 +378,9 @@ def test_post_update_candidate_runtime_probe_fails_closed(tmp_path: Path) -> Non
         module._probe_candidate_runtime(repo, repo)
 
 
-def test_lcm_post_upgrade_check_requires_healthy_json(tmp_path: Path, monkeypatch) -> None:
+def test_lcm_post_upgrade_check_requires_healthy_json(
+    tmp_path: Path, monkeypatch
+) -> None:
     module = _load_script_module()
     health = _write(tmp_path, "lcm-health.py", "# fixture\n")
     monkeypatch.setattr(
@@ -349,7 +395,9 @@ def test_lcm_post_upgrade_check_requires_healthy_json(tmp_path: Path, monkeypatc
         module._lcm_post_upgrade_check(health, tmp_path, 30)
 
 
-def test_lcm_post_upgrade_check_passes_fail_closed_mode(tmp_path: Path, monkeypatch) -> None:
+def test_lcm_post_upgrade_check_passes_fail_closed_mode(
+    tmp_path: Path, monkeypatch
+) -> None:
     module = _load_script_module()
     health = _write(tmp_path, "lcm-health.py", "# fixture\n")
     calls = []
@@ -363,9 +411,7 @@ def test_lcm_post_upgrade_check_passes_fail_closed_mode(tmp_path: Path, monkeypa
     monkeypatch.setattr(module, "_run", fake_run)
     module._lcm_post_upgrade_check(health, tmp_path, 30)
 
-    assert calls[0][0] == (
-        sys.executable, str(health), "--post-upgrade-lcm", "--json"
-    )
+    assert calls[0][0] == (sys.executable, str(health), "--post-upgrade-lcm", "--json")
     assert calls[0][1]["env"]["HERMES_HOME"] == str(tmp_path.parent)
 
 
@@ -397,7 +443,9 @@ def test_target_mode_defaults_to_latest_stable_release(tmp_path: Path) -> None:
     _git(repo, "push", "origin", "refs/tags/v2026.8.15-rc1")
     module = _load_script_module()
 
-    target = module._resolve_update_target(repo, "origin", "main", "stable", None, "test")
+    target = module._resolve_update_target(
+        repo, "origin", "main", "stable", None, "test"
+    )
 
     assert target.label == "stable release v2026.8.14.2"
     assert target.oid == newest_release
@@ -436,13 +484,16 @@ def test_stable_target_deepens_shallow_history_before_proving_ancestry(
     )
 
     assert target.oid == release_oid
-    assert _git(
-        repo,
-        "merge-base",
-        "--is-ancestor",
-        release_oid,
-        target.branch_oid,
-    ) == ""
+    assert (
+        _git(
+            repo,
+            "merge-base",
+            "--is-ancestor",
+            release_oid,
+            target.branch_oid,
+        )
+        == ""
+    )
 
 
 def test_specific_commit_must_belong_to_upstream_main(tmp_path: Path) -> None:
@@ -457,7 +508,9 @@ def test_specific_commit_must_belong_to_upstream_main(tmp_path: Path) -> None:
     assert target.oid == upstream_sha
 
 
-def test_stable_target_can_lag_upstream_tip_and_complete_handoff(tmp_path: Path) -> None:
+def test_stable_target_can_lag_upstream_tip_and_complete_handoff(
+    tmp_path: Path,
+) -> None:
     repo, release_sha = _make_repo(tmp_path)
     seed = tmp_path / "seed"
     _write(seed, "post-release.txt", "development\n")
@@ -469,10 +522,14 @@ def test_stable_target_can_lag_upstream_tip_and_complete_handoff(tmp_path: Path)
     wrapper, health, _ = _fake_runtime(tmp_path)
     state_dir = tmp_path / "state"
     common = [
-        "--repo", str(repo),
-        "--state-dir", str(state_dir),
-        "--wrapperctl", str(wrapper),
-        "--health-script", str(health),
+        "--repo",
+        str(repo),
+        "--state-dir",
+        str(state_dir),
+        "--wrapperctl",
+        str(wrapper),
+        "--health-script",
+        str(health),
     ]
 
     prepared = subprocess.run(
@@ -486,7 +543,10 @@ def test_stable_target_can_lag_upstream_tip_and_complete_handoff(tmp_path: Path)
     assert state["branch_oid"] == upstream_sha
     assert state["target_skew"] == 1
     assert _git(repo, "rev-parse", "main") == release_sha
-    assert "Target skew: 1 commit(s) behind upstream tip (diagnostic only)" in prepared.stdout
+    assert (
+        "Target skew: 1 commit(s) behind upstream tip (diagnostic only)"
+        in prepared.stdout
+    )
 
     _emulate_official_update(repo)
 
@@ -500,7 +560,9 @@ def test_stable_target_can_lag_upstream_tip_and_complete_handoff(tmp_path: Path)
     assert _git(repo, "rev-parse", "origin/main") == upstream_sha
 
 
-def test_stable_pre_state_recovers_if_official_update_never_completes(tmp_path: Path) -> None:
+def test_stable_pre_state_recovers_if_official_update_never_completes(
+    tmp_path: Path,
+) -> None:
     repo, release_sha = _make_repo(tmp_path)
     main_before = _git(repo, "rev-parse", "main")
     seed = tmp_path / "seed"
@@ -510,10 +572,14 @@ def test_stable_pre_state_recovers_if_official_update_never_completes(tmp_path: 
     wrapper, health, _ = _fake_runtime(tmp_path)
     state_dir = tmp_path / "state"
     common = [
-        "--repo", str(repo),
-        "--state-dir", str(state_dir),
-        "--wrapperctl", str(wrapper),
-        "--health-script", str(health),
+        "--repo",
+        str(repo),
+        "--state-dir",
+        str(state_dir),
+        "--wrapperctl",
+        str(wrapper),
+        "--health-script",
+        str(health),
     ]
 
     prepared = subprocess.run(
@@ -535,7 +601,9 @@ def test_stable_pre_state_recovers_if_official_update_never_completes(tmp_path: 
     assert _git(repo, "branch", "--show-current") == "diatche"
 
 
-def test_stable_mode_proceeds_when_main_already_equals_selected_release(tmp_path: Path) -> None:
+def test_stable_mode_proceeds_when_main_already_equals_selected_release(
+    tmp_path: Path,
+) -> None:
     repo, release_sha = _make_repo(tmp_path)
     seed = tmp_path / "seed"
     _write(seed, "later.txt", "later\n")
@@ -551,10 +619,14 @@ def test_stable_mode_proceeds_when_main_already_equals_selected_release(tmp_path
             sys.executable,
             str(SCRIPT),
             "--pre",
-            "--repo", str(repo),
-            "--state-dir", str(state_dir),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(state_dir),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
         ],
         text=True,
         capture_output=True,
@@ -565,7 +637,9 @@ def test_stable_mode_proceeds_when_main_already_equals_selected_release(tmp_path
     assert f"Upstream tip: origin/main ({upstream_sha})" in prepared.stdout
 
 
-def test_pre_stops_runtime_prints_handoff_and_never_runs_updater(tmp_path: Path) -> None:
+def test_pre_stops_runtime_prints_handoff_and_never_runs_updater(
+    tmp_path: Path,
+) -> None:
     repo, _ = _make_repo(tmp_path)
     wrapper, health, calls = _fake_runtime(tmp_path)
     state_dir = tmp_path / "state"
@@ -575,10 +649,14 @@ def test_pre_stops_runtime_prints_handoff_and_never_runs_updater(tmp_path: Path)
             sys.executable,
             str(SCRIPT),
             "--pre",
-            "--repo", str(repo),
-            "--state-dir", str(state_dir),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(state_dir),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
         ],
         text=True,
         capture_output=True,
@@ -620,11 +698,16 @@ def test_prepared_ref_keeps_live_diatche_unchanged_until_post(tmp_path: Path) ->
             sys.executable,
             str(SCRIPT),
             "--pre",
-            "--prepared-ref", "refs/heads/prepared-integration",
-            "--repo", str(repo),
-            "--state-dir", str(state_dir),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--prepared-ref",
+            "refs/heads/prepared-integration",
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(state_dir),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
         ],
         text=True,
         capture_output=True,
@@ -646,8 +729,7 @@ def test_pre_refuses_unsupported_backup_opt_out_before_stop(
     updater = _write(
         tmp_path,
         "unsupported-hermes",
-        "#!/bin/sh\n"
-        "echo 'usage: hermes update [--backup]'\n",
+        "#!/bin/sh\necho 'usage: hermes update [--backup]'\n",
     )
     updater.chmod(0o755)
 
@@ -656,11 +738,16 @@ def test_pre_refuses_unsupported_backup_opt_out_before_stop(
             sys.executable,
             str(SCRIPT),
             "--pre",
-            "--repo", str(repo),
-            "--state-dir", str(tmp_path / "state"),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
-            "--updater-executable", str(updater),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
+            "--updater-executable",
+            str(updater),
         ],
         text=True,
         capture_output=True,
@@ -682,10 +769,14 @@ def test_update_quiescence_failure_recovers_without_printing_updater(
             sys.executable,
             str(SCRIPT),
             "--pre",
-            "--repo", str(repo),
-            "--state-dir", str(tmp_path / "state"),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
         ],
         text=True,
         capture_output=True,
@@ -703,8 +794,9 @@ def test_update_quiescence_failure_recovers_without_printing_updater(
     ]
 
 
-
-def test_latest_mode_leaves_main_for_official_updater_to_advance(tmp_path: Path) -> None:
+def test_latest_mode_leaves_main_for_official_updater_to_advance(
+    tmp_path: Path,
+) -> None:
     repo, upstream_sha = _make_repo(tmp_path)
     main_before = _git(repo, "rev-parse", "main")
     wrapper, health, _ = _fake_runtime(tmp_path)
@@ -716,10 +808,14 @@ def test_latest_mode_leaves_main_for_official_updater_to_advance(tmp_path: Path)
             str(SCRIPT),
             "--pre",
             "--latest",
-            "--repo", str(repo),
-            "--state-dir", str(state_dir),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(state_dir),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
         ],
         text=True,
         capture_output=True,
@@ -733,10 +829,14 @@ def test_latest_mode_leaves_main_for_official_updater_to_advance(tmp_path: Path)
             sys.executable,
             str(SCRIPT),
             "--post",
-            "--repo", str(repo),
-            "--state-dir", str(state_dir),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(state_dir),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
         ],
         text=True,
         capture_output=True,
@@ -752,10 +852,14 @@ def test_post_finishes_prepared_handoff_after_direct_official_update(
     wrapper, health, calls = _fake_runtime(tmp_path)
     state_dir = tmp_path / "state"
     common = [
-        "--repo", str(repo),
-        "--state-dir", str(state_dir),
-        "--wrapperctl", str(wrapper),
-        "--health-script", str(health),
+        "--repo",
+        str(repo),
+        "--state-dir",
+        str(state_dir),
+        "--wrapperctl",
+        str(wrapper),
+        "--health-script",
+        str(health),
     ]
     prepared = subprocess.run(
         [sys.executable, str(SCRIPT), "--pre", *common],
@@ -802,10 +906,14 @@ def test_post_restores_after_pinned_main_ref_moves_under_checked_out_head(
     wrapper, health, _ = _fake_runtime(tmp_path)
     state_dir = tmp_path / "state"
     common = [
-        "--repo", str(repo),
-        "--state-dir", str(state_dir),
-        "--wrapperctl", str(wrapper),
-        "--health-script", str(health),
+        "--repo",
+        str(repo),
+        "--state-dir",
+        str(state_dir),
+        "--wrapperctl",
+        str(wrapper),
+        "--health-script",
+        str(health),
     ]
 
     prepared = subprocess.run(
@@ -853,10 +961,14 @@ def test_check_fetches_live_upstream_privately_and_never_calls_wrapper(
             sys.executable,
             str(SCRIPT),
             "--check",
-            "--repo", str(repo),
-            "--state-dir", str(tmp_path / "state"),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
             "--json",
         ],
         text=True,
@@ -893,10 +1005,14 @@ def test_check_success_reports_pinned_commits_and_next_step(tmp_path: Path) -> N
             sys.executable,
             str(SCRIPT),
             "--check",
-            "--repo", str(repo),
-            "--state-dir", str(tmp_path / "state"),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
         ],
         text=True,
         capture_output=True,
@@ -923,10 +1039,14 @@ def test_check_conflict_reports_pinned_commits_files_and_next_step(
             sys.executable,
             str(SCRIPT),
             "--check",
-            "--repo", str(repo),
-            "--state-dir", str(tmp_path / "state"),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
         ],
         text=True,
         capture_output=True,
@@ -936,7 +1056,10 @@ def test_check_conflict_reports_pinned_commits_files_and_next_step(
     assert f"upstream commit {upstream_sha}" in result.stderr
     assert f"diatche commit {integration_sha}" in result.stderr
     assert "Conflicting files:\n  - base.txt" in result.stderr
-    assert "resolve these conflicts in an isolated integration branch/worktree" in result.stderr
+    assert (
+        "resolve these conflicts in an isolated integration branch/worktree"
+        in result.stderr
+    )
     assert "rerun hermes-maintenance-update --check" in result.stderr
     assert "No refs or checkout files were changed." in result.stderr
     assert not calls.exists()
@@ -962,10 +1085,14 @@ def test_check_fetch_failure_does_not_move_checkout_or_production_refs(
             sys.executable,
             str(SCRIPT),
             "--check",
-            "--repo", str(repo),
-            "--state-dir", str(tmp_path / "state"),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
             "--json",
         ],
         text=True,
@@ -977,12 +1104,15 @@ def test_check_fetch_failure_does_not_move_checkout_or_production_refs(
     assert _git(repo, "branch", "--show-current") == branch_before
     assert _git(repo, "rev-parse", "refs/heads/main") == main_before
     assert _git(repo, "rev-parse", "refs/remotes/origin/main") == tracking_before
-    assert _git(
-        repo,
-        "for-each-ref",
-        "--format=%(refname)",
-        "refs/hermes-maintenance/fetches/",
-    ) == ""
+    assert (
+        _git(
+            repo,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/hermes-maintenance/fetches/",
+        )
+        == ""
+    )
     assert not calls.exists()
 
 
@@ -1018,10 +1148,14 @@ def test_single_interrupted_journal_is_recovered_before_update(tmp_path: Path) -
         [
             sys.executable,
             str(SCRIPT),
-            "--repo", str(repo),
-            "--state-dir", str(state_dir),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(state_dir),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
         ],
         text=True,
         capture_output=True,
@@ -1069,10 +1203,14 @@ def test_crash_recovery_stops_candidate_runtime_before_restoring_refs(
         [
             sys.executable,
             str(SCRIPT),
-            "--repo", str(repo),
-            "--state-dir", str(state_dir),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(state_dir),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
         ],
         text=True,
         capture_output=True,
@@ -1091,7 +1229,9 @@ def test_crash_recovery_preserves_nontransactional_dirty_checkout(
     run_id = "stopped-dirty"
     main_old = _git(repo, "rev-parse", "main")
     integration_old = _git(repo, "rev-parse", "diatche")
-    common_git_dir = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    common_git_dir = Path(
+        _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    )
     payload = {
         "version": 2,
         "run_id": run_id,
@@ -1115,10 +1255,14 @@ def test_crash_recovery_preserves_nontransactional_dirty_checkout(
         [
             sys.executable,
             str(SCRIPT),
-            "--repo", str(repo),
-            "--state-dir", str(state_dir),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(state_dir),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
         ],
         text=True,
         capture_output=True,
@@ -1144,10 +1288,14 @@ def test_completed_current_state_ignores_historical_failed_runs(tmp_path: Path) 
         [
             sys.executable,
             str(SCRIPT),
-            "--repo", str(repo),
-            "--state-dir", str(state_dir),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(state_dir),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
         ],
         text=True,
         capture_output=True,
@@ -1185,10 +1333,14 @@ def test_pre_allows_selected_target_already_on_local_main(
             sys.executable,
             str(SCRIPT),
             "--pre",
-            "--repo", str(repo),
-            "--state-dir", str(state_dir),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(state_dir),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
         ],
         text=True,
         capture_output=True,
@@ -1199,7 +1351,9 @@ def test_pre_allows_selected_target_already_on_local_main(
     assert _git(repo, "rev-parse", "diatche") == old_diatche
     assert _git(repo, "branch", "--show-current") == "diatche"
     assert calls.read_text(encoding="utf-8").splitlines() == [
-        "--status", "--force-stop", "--assert-update-quiescence"
+        "--status",
+        "--force-stop",
+        "--assert-update-quiescence",
     ]
     assert json.loads((state_dir / "state.json").read_text())["phase"] == (
         "awaiting-official-update"
@@ -1215,11 +1369,16 @@ def test_missing_updater_fails_before_forced_stop(tmp_path: Path) -> None:
             sys.executable,
             str(SCRIPT),
             "--pre",
-            "--repo", str(repo),
-            "--state-dir", str(tmp_path / "state"),
-            "--wrapperctl", str(wrapper),
-            "--health-script", str(health),
-            "--updater-executable", str(missing),
+            "--repo",
+            str(repo),
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--wrapperctl",
+            str(wrapper),
+            "--health-script",
+            str(health),
+            "--updater-executable",
+            str(missing),
         ],
         text=True,
         capture_output=True,
@@ -1239,7 +1398,6 @@ def test_dirty_checkout_fails_before_wrapper_call(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert "dirty" in result.stderr.lower()
     assert not calls.exists()
-
 
 
 def test_checkout_is_rechecked_immediately_before_stop(
@@ -1300,14 +1458,17 @@ def test_cas_failure_does_not_reset_concurrent_ref_or_checkout_changes(
     assert _git(repo, "rev-parse", "diatche") == moved_to
     assert (repo / "base.txt").read_text() == "concurrent tracked edit\n"
     assert calls.read_text().splitlines() == [
-        "--status", "--force-stop", "--assert-update-quiescence"
+        "--status",
+        "--force-stop",
+        "--assert-update-quiescence",
     ]
     state = json.loads((state_dir / "state.json").read_text())
     assert "concurrent" in state["recovery_error"].lower()
 
 
-
-def test_health_failure_rolls_back_refs_and_restarts_old_runtime(tmp_path: Path) -> None:
+def test_health_failure_rolls_back_refs_and_restarts_old_runtime(
+    tmp_path: Path,
+) -> None:
     repo, _ = _make_repo(tmp_path)
     old_main = _git(repo, "rev-parse", "main")
     old_diatche = _git(repo, "rev-parse", "diatche")
@@ -1315,10 +1476,14 @@ def test_health_failure_rolls_back_refs_and_restarts_old_runtime(tmp_path: Path)
     wrapper, health, calls = _fake_runtime(tmp_path, fail_health_call=1)
     state_dir = tmp_path / "state"
     common = [
-        "--repo", str(repo),
-        "--state-dir", str(state_dir),
-        "--wrapperctl", str(wrapper),
-        "--health-script", str(health),
+        "--repo",
+        str(repo),
+        "--state-dir",
+        str(state_dir),
+        "--wrapperctl",
+        str(wrapper),
+        "--health-script",
+        str(health),
     ]
     prepared = subprocess.run(
         [sys.executable, str(SCRIPT), "--pre", *common],
@@ -1398,7 +1563,10 @@ def test_failure_recovery_retains_original_lock_and_signal_guard(
 
     assert result == 1
     assert observed["lock_returncode"] == 23
-    assert callable(observed["signal_handler"]) or observed["signal_handler"] is signal.SIG_IGN
+    assert (
+        callable(observed["signal_handler"])
+        or observed["signal_handler"] is signal.SIG_IGN
+    )
 
 
 def test_official_updater_failure_restores_owned_git_state_and_old_runtime(
@@ -1412,10 +1580,14 @@ def test_official_updater_failure_restores_owned_git_state_and_old_runtime(
     state_dir = tmp_path / "state"
 
     common = [
-        "--repo", str(repo),
-        "--state-dir", str(state_dir),
-        "--wrapperctl", str(wrapper),
-        "--health-script", str(health),
+        "--repo",
+        str(repo),
+        "--state-dir",
+        str(state_dir),
+        "--wrapperctl",
+        str(wrapper),
+        "--health-script",
+        str(health),
     ]
     prepared = subprocess.run(
         [sys.executable, str(SCRIPT), "--pre", *common],
@@ -1441,8 +1613,11 @@ def test_official_updater_failure_restores_owned_git_state_and_old_runtime(
     assert _git(repo, "rev-parse", "diatche") == old_diatche
     assert _git(repo, "rev-parse", "HEAD") == old_diatche
     assert calls.read_text().splitlines() == [
-        "--status", "--force-stop", "--assert-update-quiescence",
-        "--foreground", "--status"
+        "--status",
+        "--force-stop",
+        "--assert-update-quiescence",
+        "--foreground",
+        "--status",
     ]
     state = json.loads((state_dir / "state.json").read_text())
     assert state["recovered"] is True
@@ -1456,10 +1631,14 @@ def test_post_accepts_upstream_advance_observed_by_official_updater(
     wrapper, health, calls = _fake_runtime(tmp_path)
     state_dir = tmp_path / "state"
     common = [
-        "--repo", str(repo),
-        "--state-dir", str(state_dir),
-        "--wrapperctl", str(wrapper),
-        "--health-script", str(health),
+        "--repo",
+        str(repo),
+        "--state-dir",
+        str(state_dir),
+        "--wrapperctl",
+        str(wrapper),
+        "--health-script",
+        str(health),
     ]
     prepared = subprocess.run(
         [sys.executable, str(SCRIPT), "--pre", *common],
@@ -1480,8 +1659,11 @@ def test_post_accepts_upstream_advance_observed_by_official_updater(
     assert _git(repo, "rev-parse", "main") == stable_oid
     assert _git(repo, "rev-parse", "refs/remotes/origin/main") == later_oid
     assert calls.read_text().splitlines() == [
-        "--status", "--force-stop", "--assert-update-quiescence",
-        "--foreground", "--status"
+        "--status",
+        "--force-stop",
+        "--assert-update-quiescence",
+        "--foreground",
+        "--status",
     ]
     assert json.loads((state_dir / "state.json").read_text())["phase"] == "complete"
 
@@ -1528,7 +1710,11 @@ def test_hindsight_embedding_guard_repairs_only_incompatible_hub(
     assert commands[0][0] == str(python)
     assert commands[0][1] == "-c"
     assert commands[1] == (
-        str(python), "-m", "pip", "install", "--no-deps",
+        str(python),
+        "-m",
+        "pip",
+        "install",
+        "--no-deps",
         "huggingface-hub==1.24.0",
     )
     assert commands[2] == commands[0]
@@ -1541,7 +1727,8 @@ def test_hindsight_embedding_guard_matches_lazy_dependency_pin() -> None:
     from tools.lazy_deps import LAZY_DEPS
 
     hub_requirement = next(
-        spec for spec in LAZY_DEPS["tool.trace_upload"]
+        spec
+        for spec in LAZY_DEPS["tool.trace_upload"]
         if spec.startswith("huggingface-hub")
     )
     assert module.HINDSIGHT_HUB_REQUIREMENT == hub_requirement

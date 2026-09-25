@@ -24,6 +24,7 @@ Intentional operating assumptions (keep this design small):
   interrupted recovery, and unhealthy runtime startup. Do not add leases,
   provenance proofs, or hypothetical concurrent-writer checks here.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -47,8 +48,12 @@ from typing import Any, Iterator, NamedTuple, Sequence
 
 DEFAULT_REPO = Path.home() / ".hermes" / "hermes-agent"
 DEFAULT_STATE_DIR = Path.home() / ".hermes" / "local" / "update"
-DEFAULT_WRAPPERCTL = Path.home() / ".hermes" / "local" / "bin" / "hermes-gateway-wrapperctl"
-DEFAULT_HEALTH_SCRIPT = Path.home() / ".hermes" / "local" / "health" / "hermes_core_health.py"
+DEFAULT_WRAPPERCTL = (
+    Path.home() / ".hermes" / "local" / "bin" / "hermes-gateway-wrapperctl"
+)
+DEFAULT_HEALTH_SCRIPT = (
+    Path.home() / ".hermes" / "local" / "health" / "hermes_core_health.py"
+)
 DEFAULT_BACKUP_ROOT = Path("/Volumes/SamsungS3/Backups/Hermes")
 
 ZERO_OID = "0" * 40
@@ -117,13 +122,22 @@ def _progress(message: str) -> None:
 
 
 def _run(
-    command: Sequence[str], *, cwd: Path, timeout: float = 60, check: bool = False,
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    timeout: float = 60,
+    check: bool = False,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a bounded child in its own process group and reap its descendants."""
     process = subprocess.Popen(
-        list(command), cwd=cwd, text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, start_new_session=True, env=env,
+        list(command),
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        env=env,
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
@@ -141,7 +155,9 @@ def _run(
                 pass
             process.communicate(timeout=3)
         raise
-    result = subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
+    result = subprocess.CompletedProcess(
+        list(command), process.returncode, stdout, stderr
+    )
     if check and result.returncode:
         raise subprocess.CalledProcessError(
             result.returncode, result.args, output=result.stdout, stderr=result.stderr
@@ -149,7 +165,9 @@ def _run(
     return result
 
 
-def _git(repo: Path, *args: str, check: bool = True, timeout: float = 60) -> subprocess.CompletedProcess[str]:
+def _git(
+    repo: Path, *args: str, check: bool = True, timeout: float = 60
+) -> subprocess.CompletedProcess[str]:
     return _run(("git", *args), cwd=repo, timeout=timeout, check=check)
 
 
@@ -161,7 +179,9 @@ def _oid(repo: Path, ref: str) -> str:
 
 
 def _common_git_dir(repo: Path) -> Path:
-    value = _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    value = _git(
+        repo, "rev-parse", "--path-format=absolute", "--git-common-dir"
+    ).stdout.strip()
     return Path(value).resolve()
 
 
@@ -213,7 +233,9 @@ def _lock(state_dir: Path) -> Iterator[None]:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise BusyError("another maintenance or recovery operation is active") from exc
+            raise BusyError(
+                "another maintenance or recovery operation is active"
+            ) from exc
         yield
 
 
@@ -222,7 +244,14 @@ def _assert_checkout(repo: Path, integration_branch: str) -> None:
         raise RuntimeError(f"checkout must be clean and on {integration_branch}")
     if _git(repo, "status", "--porcelain").stdout.strip():
         raise RuntimeError("checkout is dirty")
-    for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "sequencer"):
+    for name in (
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+    ):
         path = Path(_git(repo, "rev-parse", "--git-path", name).stdout.strip())
         if not path.is_absolute():
             path = repo / path
@@ -231,7 +260,11 @@ def _assert_checkout(repo: Path, integration_branch: str) -> None:
 
 
 def _wrapper(
-    wrapper: Path, repo: Path, argument: str, timeout: float, *,
+    wrapper: Path,
+    repo: Path,
+    argument: str,
+    timeout: float,
+    *,
     maintenance_start: bool = False,
 ) -> None:
     env = None
@@ -240,7 +273,9 @@ def _wrapper(
     result = _run((str(wrapper), argument), cwd=repo, timeout=timeout, env=env)
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(f"wrapper {argument} failed{': ' + detail if detail else ''}")
+        raise RuntimeError(
+            f"wrapper {argument} failed{': ' + detail if detail else ''}"
+        )
 
 
 def _loaded_profile_gateway_labels(repo: Path, timeout: float) -> list[str]:
@@ -258,8 +293,19 @@ def _loaded_profile_gateway_labels(repo: Path, timeout: float) -> list[str]:
     return sorted(labels)
 
 
+def _validated_profile_gateway_labels(labels: Sequence[str]) -> list[str]:
+    validated: list[str] = []
+    for label in labels:
+        if not PROFILE_GATEWAY_LABEL_RE.fullmatch(str(label)):
+            raise RuntimeError(f"invalid recorded profile gateway label: {label!r}")
+        validated.append(str(label))
+    return validated
+
+
 def _stop_related_hermes_processes(
-    repo: Path, wrapper: Path, timeout: float,
+    repo: Path,
+    wrapper: Path,
+    timeout: float,
 ) -> None:
     """Stop the custom wrapper plus every Hermes profile/manual gateway."""
     _wrapper(wrapper, repo, "--force-stop", timeout)
@@ -269,38 +315,86 @@ def _stop_related_hermes_processes(
     result = _run((str(hermes), "gateway", "stop", "--all"), cwd=repo, timeout=timeout)
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(f"could not stop all Hermes gateways{': ' + detail if detail else ''}")
+        raise RuntimeError(
+            f"could not stop all Hermes gateways{': ' + detail if detail else ''}"
+        )
     _wrapper(wrapper, repo, "--assert-update-quiescence", timeout)
 
 
+def _stop_profile_gateway_services(
+    repo: Path, labels: list[str], timeout: float
+) -> None:
+    domain = f"gui/{os.getuid()}"
+    for label in _validated_profile_gateway_labels(labels):
+        target = f"{domain}/{label}"
+        result = _run(
+            ("/bin/launchctl", "bootout", target),
+            cwd=repo,
+            timeout=timeout,
+            check=False,
+        )
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(
+                f"failed to stop recorded profile gateway {label}"
+                f"{': ' + detail if detail else ''}"
+            )
+        probe = _run(
+            ("/bin/launchctl", "print", target),
+            cwd=repo,
+            timeout=timeout,
+            check=False,
+        )
+        if probe.returncode == 0:
+            raise RuntimeError(f"profile gateway remained loaded after stop: {label}")
+
+
 def _restore_profile_gateway_services(
-    repo: Path, profile_labels: Sequence[str], timeout: float,
+    repo: Path,
+    profile_labels: Sequence[str],
+    timeout: float,
 ) -> None:
     """Restore only named-profile LaunchAgents recorded as loaded by ``--pre``."""
     domain = f"gui/{os.getuid()}"
     launch_agents = Path.home() / "Library" / "LaunchAgents"
-    for label in profile_labels:
-        if not PROFILE_GATEWAY_LABEL_RE.fullmatch(str(label)):
-            raise RuntimeError(f"invalid recorded profile gateway label: {label!r}")
+    for label in _validated_profile_gateway_labels(profile_labels):
         plist = launch_agents / f"{label}.plist"
         if not plist.is_file():
             raise RuntimeError(f"recorded profile gateway plist is missing: {plist}")
-        probe = _run(("/bin/launchctl", "print", f"{domain}/{label}"), cwd=repo, timeout=timeout)
+        probe = _run(
+            ("/bin/launchctl", "print", f"{domain}/{label}"), cwd=repo, timeout=timeout
+        )
         if probe.returncode:
-            loaded = _run(("/bin/launchctl", "bootstrap", domain, str(plist)), cwd=repo, timeout=timeout)
+            loaded = _run(
+                ("/bin/launchctl", "bootstrap", domain, str(plist)),
+                cwd=repo,
+                timeout=timeout,
+            )
             if loaded.returncode:
                 detail = loaded.stderr.strip() or loaded.stdout.strip()
-                raise RuntimeError(f"could not restore {label}{': ' + detail if detail else ''}")
-        started = _run(("/bin/launchctl", "kickstart", f"{domain}/{label}"), cwd=repo, timeout=timeout)
+                raise RuntimeError(
+                    f"could not restore {label}{': ' + detail if detail else ''}"
+                )
+        started = _run(
+            ("/bin/launchctl", "kickstart", f"{domain}/{label}"),
+            cwd=repo,
+            timeout=timeout,
+        )
         if started.returncode:
             detail = started.stderr.strip() or started.stdout.strip()
-            raise RuntimeError(f"could not start {label}{': ' + detail if detail else ''}")
-        verified = _run(("/bin/launchctl", "print", f"{domain}/{label}"), cwd=repo, timeout=timeout)
+            raise RuntimeError(
+                f"could not start {label}{': ' + detail if detail else ''}"
+            )
+        verified = _run(
+            ("/bin/launchctl", "print", f"{domain}/{label}"), cwd=repo, timeout=timeout
+        )
         if verified.returncode:
             raise RuntimeError(f"restored profile gateway is not loaded: {label}")
 
 
-def _official_update_arguments(updater: Path, repo: Path, timeout: float) -> tuple[str, ...]:
+def _official_update_arguments(
+    updater: Path, repo: Path, timeout: float
+) -> tuple[str, ...]:
     """Verify the invoked updater parser before printing its exact command.
 
     The separate Samsung generation is the fail-closed backup.  The built-in
@@ -308,9 +402,7 @@ def _official_update_arguments(updater: Path, repo: Path, timeout: float) -> tup
     may continue after backup failure, and this host's included backup set is
     larger than the remaining internal free space.
     """
-    help_result = _run(
-        (str(updater), "update", "--help"), cwd=repo, timeout=timeout
-    )
+    help_result = _run((str(updater), "update", "--help"), cwd=repo, timeout=timeout)
     help_text = f"{help_result.stdout}\n{help_result.stderr}"
     if help_result.returncode:
         raise RuntimeError("could not verify the official Hermes updater CLI")
@@ -324,7 +416,9 @@ def _official_update_arguments(updater: Path, repo: Path, timeout: float) -> tup
 
 
 def _assert_fresh_verified_backup(
-    backup_root: Path, *, max_age_seconds: float = MAX_BACKUP_AGE_SECONDS,
+    backup_root: Path,
+    *,
+    max_age_seconds: float = MAX_BACKUP_AGE_SECONDS,
 ) -> Path:
     """Require a recent completed immutable Samsung backup generation.
 
@@ -344,7 +438,9 @@ def _assert_fresh_verified_backup(
         reverse=True,
     )
     if not manifests:
-        raise RuntimeError(f"no verified Hermes backup generation found under {generation_root}")
+        raise RuntimeError(
+            f"no verified Hermes backup generation found under {generation_root}"
+        )
     manifest_path = manifests[0]
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -352,7 +448,9 @@ def _assert_fresh_verified_backup(
         expected_size = int(payload["size_bytes"])
         expected_sha256 = str(payload["sha256"])
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"latest Hermes backup manifest is malformed: {manifest_path}") from exc
+        raise RuntimeError(
+            f"latest Hermes backup manifest is malformed: {manifest_path}"
+        ) from exc
     if payload.get("source") != str(Path.home() / ".hermes"):
         raise RuntimeError("latest Hermes backup generation has the wrong source root")
     if Path(archive_name).name != archive_name or archive_name != "archive.zip":
@@ -362,9 +460,13 @@ def _assert_fresh_verified_backup(
         actual_size = archive.stat().st_size
         age = datetime.now(timezone.utc).timestamp() - manifest_path.stat().st_mtime
     except OSError as exc:
-        raise RuntimeError("latest Hermes backup archive is missing or unreadable") from exc
+        raise RuntimeError(
+            "latest Hermes backup archive is missing or unreadable"
+        ) from exc
     if expected_size <= 0 or actual_size != expected_size:
-        raise RuntimeError("latest Hermes backup archive size does not match its verified manifest")
+        raise RuntimeError(
+            "latest Hermes backup archive size does not match its verified manifest"
+        )
     if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
         raise RuntimeError("latest Hermes backup manifest has an invalid SHA-256")
     digest = hashlib.sha256()
@@ -373,9 +475,13 @@ def _assert_fresh_verified_backup(
             while chunk := handle.read(8 * 1024 * 1024):
                 digest.update(chunk)
     except OSError as exc:
-        raise RuntimeError("latest Hermes backup archive could not be checksum-verified") from exc
+        raise RuntimeError(
+            "latest Hermes backup archive could not be checksum-verified"
+        ) from exc
     if digest.hexdigest() != expected_sha256:
-        raise RuntimeError("latest Hermes backup archive checksum does not match its verified manifest")
+        raise RuntimeError(
+            "latest Hermes backup archive checksum does not match its verified manifest"
+        )
     if age < -300 or age > max_age_seconds:
         raise RuntimeError(
             "latest verified Hermes backup is stale; run "
@@ -413,7 +519,9 @@ def _lcm_post_upgrade_check(health_script: Path, repo: Path, timeout: float) -> 
     except json.JSONDecodeError as exc:
         raise RuntimeError("LCM post-upgrade check returned malformed JSON") from exc
     if payload.get("healthy") is not True or payload.get("issues"):
-        raise RuntimeError(f"LCM post-upgrade check reported unhealthy state: {payload}")
+        raise RuntimeError(
+            f"LCM post-upgrade check reported unhealthy state: {payload}"
+        )
 
 
 def _ensure_hindsight_embeddings(repo: Path, timeout: float) -> None:
@@ -439,7 +547,11 @@ def _ensure_hindsight_embeddings(repo: Path, timeout: float) -> None:
     if version_checked.returncode in repairable_version_results:
         repaired = _run(
             (
-                str(python), "-m", "pip", "install", "--no-deps",
+                str(python),
+                "-m",
+                "pip",
+                "install",
+                "--no-deps",
                 HINDSIGHT_HUB_REQUIREMENT,
             ),
             cwd=repo,
@@ -469,21 +581,28 @@ def _ensure_hindsight_embeddings(repo: Path, timeout: float) -> None:
     if imports_verified.returncode:
         detail = imports_verified.stderr.strip() or imports_verified.stdout.strip()
         raise RuntimeError(
-            "Hindsight embedding imports fail"
-            + (f": {detail}" if detail else "")
+            "Hindsight embedding imports fail" + (f": {detail}" if detail else "")
         )
 
 
-
-def _fetch_private(repo: Path, remote: str, upstream_branch: str, run_id: str) -> tuple[str, str]:
+def _fetch_private(
+    repo: Path, remote: str, upstream_branch: str, run_id: str
+) -> tuple[str, str]:
     ref = f"refs/hermes-maintenance/fetches/{run_id}/upstream"
-    shallow = _git(
-        repo, "rev-parse", "--is-shallow-repository"
-    ).stdout.strip() == "true"
+    shallow = (
+        _git(repo, "rev-parse", "--is-shallow-repository").stdout.strip() == "true"
+    )
     deepen = (f"--deepen={SHALLOW_DEEPEN_COMMITS}",) if shallow else ()
     result = _git(
-        repo, "fetch", "--no-write-fetch-head", "--refmap=", *deepen, remote,
-        f"refs/heads/{upstream_branch}:{ref}", check=False, timeout=300,
+        repo,
+        "fetch",
+        "--no-write-fetch-head",
+        "--refmap=",
+        *deepen,
+        remote,
+        f"refs/heads/{upstream_branch}:{ref}",
+        check=False,
+        timeout=300,
     )
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "upstream fetch failed")
@@ -498,9 +617,7 @@ def _resolve_update_target(
     requested_commit: str | None,
     run_id: str,
 ) -> UpdateTarget:
-    branch_ref, branch_oid = _fetch_private(
-        repo, remote, upstream_branch, run_id
-    )
+    branch_ref, branch_oid = _fetch_private(repo, remote, upstream_branch, run_id)
     if mode == "latest":
         return UpdateTarget(
             oid=branch_oid,
@@ -549,9 +666,7 @@ def _resolve_update_target(
                     branch_ref=branch_ref,
                 )
         preparation = ""
-        if _git(
-            repo, "rev-parse", "--is-shallow-repository"
-        ).stdout.strip() == "true":
+        if _git(repo, "rev-parse", "--is-shallow-repository").stdout.strip() == "true":
             preparation = (
                 f"; shallow history remains insufficient after deepening by "
                 f"{SHALLOW_DEEPEN_COMMITS} commits. Run `git fetch "
@@ -570,9 +685,13 @@ def _resolve_update_target(
     )
     candidate = resolved.stdout.strip()
     if resolved.returncode or not OID_RE.fullmatch(candidate):
-        raise RuntimeError("requested commit could not be resolved after fetching upstream")
+        raise RuntimeError(
+            "requested commit could not be resolved after fetching upstream"
+        )
     oid = candidate
-    if _git(repo, "merge-base", "--is-ancestor", oid, branch_oid, check=False).returncode:
+    if _git(
+        repo, "merge-base", "--is-ancestor", oid, branch_oid, check=False
+    ).returncode:
         raise RuntimeError(
             f"requested commit {oid} is not reachable from {remote}/{upstream_branch}"
         )
@@ -592,8 +711,12 @@ def _check_merge(repo: Path, integration_oid: str, upstream_oid: str) -> None:
     # not move refs or alter the checkout. Avoid a second disposable repository
     # merely to isolate garbage that normal Git maintenance can reclaim.
     result = _git(
-        repo, "merge-tree", "--write-tree", "--name-only",
-        integration_oid, upstream_oid,
+        repo,
+        "merge-tree",
+        "--write-tree",
+        "--name-only",
+        integration_oid,
+        upstream_oid,
         check=False,
     )
     if result.returncode:
@@ -642,20 +765,41 @@ def _probe_candidate_runtime(repo: Path, worktree: Path) -> None:
 
 
 def _build_candidate(
-    repo: Path, state_dir: Path, run_id: str, integration_oid: str, upstream_oid: str,
-    *, runtime_probe: bool = False,
+    repo: Path,
+    state_dir: Path,
+    run_id: str,
+    integration_oid: str,
+    upstream_oid: str,
+    *,
+    runtime_probe: bool = False,
 ) -> tuple[str, str]:
     candidate_ref = f"refs/hermes-maintenance/candidates/{run_id}"
     root = Path(tempfile.mkdtemp(prefix=f"candidate-{run_id}-", dir=state_dir))
     worktree = root / "worktree"
     added = False
     try:
-        _git(repo, "worktree", "add", "--detach", str(worktree), integration_oid, timeout=120)
+        _git(
+            repo,
+            "worktree",
+            "add",
+            "--detach",
+            str(worktree),
+            integration_oid,
+            timeout=120,
+        )
         added = True
         merged = _git(
-            worktree, "-c", "user.name=Hermes Maintenance", "-c",
-            "user.email=maintenance@localhost", "merge", "--no-ff", "--no-edit",
-            upstream_oid, check=False, timeout=120,
+            worktree,
+            "-c",
+            "user.name=Hermes Maintenance",
+            "-c",
+            "user.email=maintenance@localhost",
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            upstream_oid,
+            check=False,
+            timeout=120,
         )
         if merged.returncode:
             raise RuntimeError("isolated candidate merge failed")
@@ -665,7 +809,10 @@ def _build_candidate(
         # wrapper should reject whitespace introduced by the diatche side or by
         # conflict resolution without blocking on defects already in upstream.
         checked = _git(
-            worktree, "diff", "--check", f"{upstream_oid}..{candidate_oid}",
+            worktree,
+            "diff",
+            "--check",
+            f"{upstream_oid}..{candidate_oid}",
             check=False,
         )
         if checked.returncode:
@@ -676,21 +823,36 @@ def _build_candidate(
             )
         if runtime_probe:
             _probe_candidate_runtime(repo, worktree)
-        created = _git(repo, "update-ref", candidate_ref, candidate_oid, ZERO_OID, check=False)
+        created = _git(
+            repo, "update-ref", candidate_ref, candidate_oid, ZERO_OID, check=False
+        )
         if created.returncode:
             raise RuntimeError("candidate ref creation compare-and-swap failed")
         return candidate_ref, candidate_oid
     finally:
         if added:
-            _git(repo, "worktree", "remove", "--force", str(worktree), check=False, timeout=60)
+            _git(
+                repo,
+                "worktree",
+                "remove",
+                "--force",
+                str(worktree),
+                check=False,
+                timeout=60,
+            )
         shutil.rmtree(root, ignore_errors=True)
 
 
 def _update_ref_transaction(repo: Path, commands: list[str]) -> None:
     body = "\n".join(["start", *commands, "prepare", "commit", ""])
     result = subprocess.run(
-        ("git", "update-ref", "--stdin"), cwd=repo, input=body,
-        text=True, capture_output=True, check=False, timeout=30,
+        ("git", "update-ref", "--stdin"),
+        cwd=repo,
+        input=body,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
     )
     if result.returncode:
         raise RuntimeError(
@@ -700,22 +862,36 @@ def _update_ref_transaction(repo: Path, commands: list[str]) -> None:
 
 
 def _publish_integration(
-    repo: Path, *, current_main_oid: str, target_main_oid: str,
-    origin_main_oid: str, upstream_ref: str,
-    upstream_ref_oid: str, integration_branch: str, integration_old: str,
+    repo: Path,
+    *,
+    current_main_oid: str,
+    target_main_oid: str,
+    origin_main_oid: str,
+    upstream_ref: str,
+    upstream_ref_oid: str,
+    integration_branch: str,
+    integration_old: str,
     integration_new: str,
 ) -> None:
     """Restore the selected main target and publish integration in one CAS."""
-    _update_ref_transaction(repo, [
-        f"update refs/heads/main {target_main_oid} {current_main_oid}",
-        f"verify refs/remotes/origin/main {origin_main_oid}",
-        f"verify {upstream_ref} {upstream_ref_oid}",
-        f"update refs/heads/{integration_branch} {integration_new} {integration_old}",
-    ])
+    _update_ref_transaction(
+        repo,
+        [
+            f"update refs/heads/main {target_main_oid} {current_main_oid}",
+            f"verify refs/remotes/origin/main {origin_main_oid}",
+            f"verify {upstream_ref} {upstream_ref_oid}",
+            f"update refs/heads/{integration_branch} {integration_new} {integration_old}",
+        ],
+    )
 
 
 def _assert_official_update_result(
-    repo: Path, *, upstream_ref: str, branch_ref: str, target_oid: str, branch_oid: str,
+    repo: Path,
+    *,
+    upstream_ref: str,
+    branch_ref: str,
+    target_oid: str,
+    branch_oid: str,
     integration_old: str,
 ) -> str:
     expected = (
@@ -730,7 +906,9 @@ def _assert_official_update_result(
     current_origin = _oid(repo, "refs/remotes/origin/main")
     if current_main != current_origin:
         raise RuntimeError("official updater left main and origin/main out of sync")
-    if _git(repo, "merge-base", "--is-ancestor", branch_oid, current_main, check=False).returncode:
+    if _git(
+        repo, "merge-base", "--is-ancestor", branch_oid, current_main, check=False
+    ).returncode:
         raise RuntimeError("official updater left main outside the upstream lineage")
     branch = _git(repo, "branch", "--show-current").stdout.strip()
     expected_head = {"main": current_main, "diatche": integration_old}.get(branch)
@@ -744,7 +922,11 @@ def _assert_official_update_result(
 
 
 def _assert_pre_stop_snapshot(
-    repo: Path, *, main_oid: str, integration_oid: str, upstream_ref: str,
+    repo: Path,
+    *,
+    main_oid: str,
+    integration_oid: str,
+    upstream_ref: str,
     upstream_oid: str,
 ) -> None:
     _assert_checkout(repo, "diatche")
@@ -759,8 +941,13 @@ def _assert_pre_stop_snapshot(
 
 
 def _restore_refs(
-    repo: Path, *, main_old: str, main_new: str, integration_branch: str,
-    integration_old: str, integration_new: str,
+    repo: Path,
+    *,
+    main_old: str,
+    main_new: str,
+    integration_branch: str,
+    integration_old: str,
+    integration_new: str,
 ) -> None:
     current_main = _oid(repo, "refs/heads/main")
     current_integration = _oid(repo, f"refs/heads/{integration_branch}")
@@ -768,10 +955,13 @@ def _restore_refs(
         return
     if current_main != main_new or current_integration != integration_new:
         raise RuntimeError("cannot recover after concurrent ref movement")
-    _update_ref_transaction(repo, [
-        f"update refs/heads/main {main_old} {main_new}",
-        f"update refs/heads/{integration_branch} {integration_old} {integration_new}",
-    ])
+    _update_ref_transaction(
+        repo,
+        [
+            f"update refs/heads/main {main_old} {main_new}",
+            f"update refs/heads/{integration_branch} {integration_old} {integration_new}",
+        ],
+    )
 
 
 def _restore_checkout(repo: Path, integration_branch: str, expected_oid: str) -> None:
@@ -782,13 +972,20 @@ def _restore_checkout(repo: Path, integration_branch: str, expected_oid: str) ->
     if reset.returncode:
         raise RuntimeError("could not restore integration checkout files")
     _assert_checkout(repo, integration_branch)
-    if _oid(repo, "HEAD") != expected_oid or _oid(repo, f"refs/heads/{integration_branch}") != expected_oid:
+    if (
+        _oid(repo, "HEAD") != expected_oid
+        or _oid(repo, f"refs/heads/{integration_branch}") != expected_oid
+    ):
         raise RuntimeError("restored checkout identity does not match the expected OID")
 
 
 def _restore_checkout_after_publish(
-    repo: Path, *, integration_branch: str, expected_oid: str,
-    published_main_oid: str, updater_checkout_oid: str,
+    repo: Path,
+    *,
+    integration_branch: str,
+    expected_oid: str,
+    published_main_oid: str,
+    updater_checkout_oid: str,
 ) -> None:
     """Restore integration after CAS-moving the checked-out main ref.
 
@@ -805,7 +1002,9 @@ def _restore_checkout_after_publish(
         return
     if _git(repo, "diff", "--quiet", check=False).returncode:
         raise RuntimeError("cannot restore after concurrent worktree changes")
-    if _git(repo, "diff", "--cached", "--quiet", updater_checkout_oid, check=False).returncode:
+    if _git(
+        repo, "diff", "--cached", "--quiet", updater_checkout_oid, check=False
+    ).returncode:
         raise RuntimeError("cannot restore after concurrent index changes")
     if _git(repo, "ls-files", "--others", "--exclude-standard").stdout.strip():
         raise RuntimeError("cannot restore after concurrent untracked files")
@@ -821,7 +1020,10 @@ def _restore_checkout_after_publish(
 
 
 def _assert_transaction_checkout(
-    repo: Path, *, integration_old: str, integration_new: str,
+    repo: Path,
+    *,
+    integration_old: str,
+    integration_new: str,
 ) -> None:
     if _git(repo, "branch", "--show-current").stdout.strip() != "diatche":
         raise RuntimeError("cannot recover after concurrent checkout movement")
@@ -860,7 +1062,11 @@ def _recover_owned_git_state(repo: Path, payload: dict[str, Any]) -> None:
         if (
             current_origin != current_main
             or _git(
-                repo, "merge-base", "--is-ancestor", branch_oid, current_main,
+                repo,
+                "merge-base",
+                "--is-ancestor",
+                branch_oid,
+                current_main,
                 check=False,
             ).returncode
         ):
@@ -871,7 +1077,11 @@ def _recover_owned_git_state(repo: Path, payload: dict[str, Any]) -> None:
         if (
             current_origin is None
             or _git(
-                repo, "merge-base", "--is-ancestor", branch_oid, current_origin,
+                repo,
+                "merge-base",
+                "--is-ancestor",
+                branch_oid,
+                current_origin,
                 check=False,
             ).returncode
         ):
@@ -910,16 +1120,30 @@ def _recover_owned_git_state(repo: Path, payload: dict[str, Any]) -> None:
 
 
 def _journal_payload(
-    repo: Path, run_id: str, main_old: str, integration_old: str,
-    main_new: str, integration_new: str, phase: str, *, owner_pid: int | None = None,
+    repo: Path,
+    run_id: str,
+    main_old: str,
+    integration_old: str,
+    main_new: str,
+    integration_new: str,
+    phase: str,
+    *,
+    owner_pid: int | None = None,
 ) -> dict[str, Any]:
     return {
-        "version": 2, "run_id": run_id, "repo": str(repo.resolve()),
-        "common_git_dir": str(_common_git_dir(repo)), "integration_branch": "diatche",
-        "main_ref": "refs/heads/main", "integration_ref": "refs/heads/diatche",
-        "main_old": main_old, "integration_old": integration_old,
-        "main_new": main_new, "integration_new": integration_new,
-        "phase": phase, "owner_pid": os.getpid() if owner_pid is None else owner_pid,
+        "version": 2,
+        "run_id": run_id,
+        "repo": str(repo.resolve()),
+        "common_git_dir": str(_common_git_dir(repo)),
+        "integration_branch": "diatche",
+        "main_ref": "refs/heads/main",
+        "integration_ref": "refs/heads/diatche",
+        "main_old": main_old,
+        "integration_old": integration_old,
+        "main_new": main_new,
+        "integration_new": integration_new,
+        "phase": phase,
+        "owner_pid": os.getpid() if owner_pid is None else owner_pid,
         "updated_at": _now(),
     }
 
@@ -928,17 +1152,37 @@ def _validate_journal(payload: Any, repo: Path, run_id: str) -> dict[str, Any]:
     if not isinstance(payload, dict) or payload.get("version") != 2:
         raise RuntimeError("malformed recovery journal")
     required = {
-        "run_id", "repo", "common_git_dir", "integration_branch", "main_ref",
-        "integration_ref", "main_old", "integration_old", "main_new",
-        "integration_new", "phase", "owner_pid",
+        "run_id",
+        "repo",
+        "common_git_dir",
+        "integration_branch",
+        "main_ref",
+        "integration_ref",
+        "main_old",
+        "integration_old",
+        "main_new",
+        "integration_new",
+        "phase",
+        "owner_pid",
     }
     if not required.issubset(payload):
         raise RuntimeError("malformed recovery journal")
-    if payload["run_id"] != run_id or payload["repo"] != str(repo.resolve()) or payload["common_git_dir"] != str(_common_git_dir(repo)):
+    if (
+        payload["run_id"] != run_id
+        or payload["repo"] != str(repo.resolve())
+        or payload["common_git_dir"] != str(_common_git_dir(repo))
+    ):
         raise RuntimeError("foreign recovery journal")
-    if payload["integration_branch"] != "diatche" or payload["main_ref"] != "refs/heads/main" or payload["integration_ref"] != "refs/heads/diatche":
+    if (
+        payload["integration_branch"] != "diatche"
+        or payload["main_ref"] != "refs/heads/main"
+        or payload["integration_ref"] != "refs/heads/diatche"
+    ):
         raise RuntimeError("foreign recovery journal refs")
-    if not all(OID_RE.fullmatch(str(payload[key])) for key in ("main_old", "integration_old", "main_new", "integration_new")):
+    if not all(
+        OID_RE.fullmatch(str(payload[key]))
+        for key in ("main_old", "integration_old", "main_new", "integration_new")
+    ):
         raise RuntimeError("malformed recovery journal OID")
 
     owner = payload["owner_pid"]
@@ -970,8 +1214,13 @@ def _write_journal(state_dir: Path, payload: dict[str, Any]) -> None:
 
 
 def _recover_payload(
-    payload: dict[str, Any], repo: Path, wrapper: Path, health_script: Path,
-    *, wrapper_timeout: float, health_timeout: float,
+    payload: dict[str, Any],
+    repo: Path,
+    wrapper: Path,
+    health_script: Path,
+    *,
+    wrapper_timeout: float,
+    health_timeout: float,
 ) -> None:
     refs_are_original = (
         _oid(repo, "refs/heads/main") == payload["main_old"]
@@ -1006,24 +1255,28 @@ def _recover_payload(
                 integration_new=payload["integration_new"],
             )
             _restore_refs(
-                repo, main_old=payload["main_old"], main_new=payload["main_new"],
+                repo,
+                main_old=payload["main_old"],
+                main_new=payload["main_new"],
                 integration_branch="diatche",
                 integration_old=payload["integration_old"],
                 integration_new=payload["integration_new"],
             )
             _restore_checkout(repo, "diatche", payload["integration_old"])
         _ensure_hindsight_embeddings(repo, health_timeout)
-        _wrapper(
-            wrapper, repo, "--foreground", wrapper_timeout, maintenance_start=True
-        )
+        _wrapper(wrapper, repo, "--foreground", wrapper_timeout, maintenance_start=True)
         _wrapper(wrapper, repo, "--status", wrapper_timeout)
         _health(health_script, repo, health_timeout)
     _restore_profile_gateway_services(
         repo, payload.get("profile_gateway_labels", []), wrapper_timeout
     )
 
+
 def _run_pre_locked(
-    args: argparse.Namespace, repo: Path, state_dir: Path, run_id: str,
+    args: argparse.Namespace,
+    repo: Path,
+    state_dir: Path,
+    run_id: str,
 ) -> int:
     journal: dict[str, Any] | None = None
     wrapper_stopped = False
@@ -1045,7 +1298,9 @@ def _run_pre_locked(
         origin_old = _oid(repo, origin_ref)
         integration_old = _oid(repo, "refs/heads/diatche")
         prepared_ref = getattr(args, "prepared_ref", None)
-        candidate_base_oid = _oid(repo, prepared_ref) if prepared_ref else integration_old
+        candidate_base_oid = (
+            _oid(repo, prepared_ref) if prepared_ref else integration_old
+        )
         _progress(f"Resolving the requested {args.target_mode} update target")
         target = _resolve_update_target(
             repo,
@@ -1064,8 +1319,13 @@ def _run_pre_locked(
             repo, state_dir, run_id, candidate_base_oid, upstream_oid
         )
         journal = _journal_payload(
-            repo, run_id, main_old, integration_old, upstream_oid,
-            candidate_oid, "prepared",
+            repo,
+            run_id,
+            main_old,
+            integration_old,
+            upstream_oid,
+            candidate_oid,
+            "prepared",
         )
         profile_gateway_labels = _loaded_profile_gateway_labels(
             repo, args.wrapper_timeout
@@ -1076,7 +1336,9 @@ def _run_pre_locked(
             branch_oid=target.branch_oid,
             target_skew=target_skew,
             target_label=target.label,
-            backup_manifest=str(backup_manifest) if backup_manifest else "fixture-mode-not-required",
+            backup_manifest=str(backup_manifest)
+            if backup_manifest
+            else "fixture-mode-not-required",
             prepared_ref=prepared_ref,
             prepared_base_oid=candidate_base_oid,
             candidate_ref=candidate_ref,
@@ -1109,17 +1371,28 @@ def _run_pre_locked(
         _write_journal(state_dir, journal)
         # A failed stop may still have partially unloaded the supervisor.
         wrapper_stopped = True
-        _progress("Stopping all related Hermes gateways and dashboards")
+        _progress("Stopping recorded named-profile Hermes services")
+        _stop_profile_gateway_services(
+            repo,
+            profile_gateway_labels,
+            args.wrapper_timeout,
+        )
+        _progress("Stopping the custom Hermes wrapper and residual gateways")
         _stop_related_hermes_processes(
-            repo, args.wrapperctl.resolve(), args.wrapper_timeout,
+            repo,
+            args.wrapperctl.resolve(),
+            args.wrapper_timeout,
         )
         if upstream_oid != target.branch_oid:
             _progress("Advancing local main to the selected update target")
-            _update_ref_transaction(repo, [
-                f"verify refs/heads/diatche {integration_old}",
-                f"verify {fetch_ref} {upstream_oid}",
-                f"update refs/heads/main {upstream_oid} {main_old}",
-            ])
+            _update_ref_transaction(
+                repo,
+                [
+                    f"verify refs/heads/diatche {integration_old}",
+                    f"verify {fetch_ref} {upstream_oid}",
+                    f"update refs/heads/main {upstream_oid} {main_old}",
+                ],
+            )
         journal.update(phase="awaiting-official-update", updated_at=_now())
         _write_journal(state_dir, journal)
         update_command = " ".join(
@@ -1133,35 +1406,47 @@ def _run_pre_locked(
         print()
         print("Pre-update checks passed and the gateway is stopped.")
         print(f"Pinned target: {target.label} ({upstream_oid})")
-        print(f"Upstream tip: {args.remote}/{args.upstream_branch} ({target.branch_oid})")
-        print(f"Target skew: {target_skew} commit(s) behind upstream tip (diagnostic only)")
+        print(
+            f"Upstream tip: {args.remote}/{args.upstream_branch} ({target.branch_oid})"
+        )
+        print(
+            f"Target skew: {target_skew} commit(s) behind upstream tip (diagnostic only)"
+        )
         print("Run these commands in order:")
         print()
         print(f"  cd {shlex.quote(str(repo))} && {update_command}")
         print(f"  {post_invocation}")
         print()
-        print("Run the post command even if the official update fails or is interrupted.")
+        print(
+            "Run the post command even if the official update fails or is interrupted."
+        )
         return 0
     except Exception as exc:
         recovery_error = ""
         if journal is not None and wrapper_stopped:
             try:
-                _progress("Pre-update failed after gateway interruption; recovering the previous runtime")
+                _progress(
+                    "Pre-update failed after gateway interruption; recovering the previous runtime"
+                )
                 _recover_owned_git_state(repo, journal)
                 _ensure_hindsight_embeddings(repo, args.health_timeout)
                 _lcm_post_upgrade_check(
                     args.health_script.resolve(), repo, args.health_timeout
                 )
                 _wrapper(
-                    args.wrapperctl.resolve(), repo, "--foreground",
-                    args.wrapper_timeout, maintenance_start=True,
+                    args.wrapperctl.resolve(),
+                    repo,
+                    "--foreground",
+                    args.wrapper_timeout,
+                    maintenance_start=True,
                 )
                 _wrapper(
                     args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout
                 )
                 _health(args.health_script.resolve(), repo, args.health_timeout)
                 _restore_profile_gateway_services(
-                    repo, journal.get("profile_gateway_labels", []),
+                    repo,
+                    journal.get("profile_gateway_labels", []),
                     args.wrapper_timeout,
                 )
                 wrapper_stopped = False
@@ -1171,7 +1456,9 @@ def _run_pre_locked(
                 recovery_error = str(recovery_exc)
         if journal is not None:
             journal.update(
-                phase="failed", error=str(exc), recovery_error=recovery_error,
+                phase="failed",
+                error=str(exc),
+                recovery_error=recovery_error,
                 updated_at=_now(),
             )
             _write_journal(state_dir, journal)
@@ -1204,7 +1491,9 @@ def _load_post_handoff(repo: Path, state_dir: Path) -> dict[str, Any]:
 
 
 def _run_post_locked(
-    args: argparse.Namespace, repo: Path, state_dir: Path,
+    args: argparse.Namespace,
+    repo: Path,
+    state_dir: Path,
 ) -> int:
     journal: dict[str, Any] | None = None
     wrapper_started = False
@@ -1227,9 +1516,15 @@ def _run_post_locked(
             branch_oid=branch_oid,
             integration_old=integration_old,
         )
-        _progress("Rebuilding and validating the pinned candidate after dependency update")
+        _progress(
+            "Rebuilding and validating the pinned candidate after dependency update"
+        )
         post_candidate_ref, post_candidate_oid = _build_candidate(
-            repo, state_dir, f"post-{journal['run_id']}", candidate_base_oid, upstream_oid,
+            repo,
+            state_dir,
+            f"post-{journal['run_id']}",
+            candidate_base_oid,
+            upstream_oid,
             runtime_probe=True,
         )
         candidate_oid = post_candidate_oid
@@ -1267,13 +1562,14 @@ def _run_post_locked(
         _progress("Checking Hindsight embedding compatibility")
         _ensure_hindsight_embeddings(repo, args.health_timeout)
         _progress("Running offline LCM post-upgrade integrity and activation checks")
-        _lcm_post_upgrade_check(
-            args.health_script.resolve(), repo, args.health_timeout
-        )
+        _lcm_post_upgrade_check(args.health_script.resolve(), repo, args.health_timeout)
         _progress("Starting the custom Hermes gateway wrapper")
         _wrapper(
-            args.wrapperctl.resolve(), repo, "--foreground",
-            args.wrapper_timeout, maintenance_start=True,
+            args.wrapperctl.resolve(),
+            repo,
+            "--foreground",
+            args.wrapper_timeout,
+            maintenance_start=True,
         )
         wrapper_started = True
         _progress("Verifying wrapper ownership and live Hermes health")
@@ -1287,8 +1583,10 @@ def _run_post_locked(
         if _oid(repo, "HEAD") != candidate_oid:
             raise RuntimeError("runtime checkout moved during startup")
         journal.update(
-            phase="complete", upstream_sha=upstream_oid,
-            completed_at=_now(), updated_at=_now(),
+            phase="complete",
+            upstream_sha=upstream_oid,
+            completed_at=_now(),
+            updated_at=_now(),
         )
         _write_journal(state_dir, journal)
         print(f"Hermes maintenance complete at {candidate_oid[:12]}")
@@ -1297,10 +1595,14 @@ def _run_post_locked(
         recovery_error = ""
         if journal is not None:
             try:
-                _progress("Post-update verification failed; recovering the previous runtime")
+                _progress(
+                    "Post-update verification failed; recovering the previous runtime"
+                )
                 if wrapper_started:
                     _wrapper(
-                        args.wrapperctl.resolve(), repo, "--force-stop",
+                        args.wrapperctl.resolve(),
+                        repo,
+                        "--force-stop",
                         args.wrapper_timeout,
                     )
                 _recover_owned_git_state(repo, journal)
@@ -1309,15 +1611,19 @@ def _run_post_locked(
                     args.health_script.resolve(), repo, args.health_timeout
                 )
                 _wrapper(
-                    args.wrapperctl.resolve(), repo, "--foreground",
-                    args.wrapper_timeout, maintenance_start=True,
+                    args.wrapperctl.resolve(),
+                    repo,
+                    "--foreground",
+                    args.wrapper_timeout,
+                    maintenance_start=True,
                 )
                 _wrapper(
                     args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout
                 )
                 _health(args.health_script.resolve(), repo, args.health_timeout)
                 _restore_profile_gateway_services(
-                    repo, journal.get("profile_gateway_labels", []),
+                    repo,
+                    journal.get("profile_gateway_labels", []),
                     args.wrapper_timeout,
                 )
                 journal["recovered"] = True
@@ -1326,7 +1632,9 @@ def _run_post_locked(
                 recovery_error = str(recovery_exc)
         if journal is not None:
             journal.update(
-                phase="failed", error=str(exc), recovery_error=recovery_error,
+                phase="failed",
+                error=str(exc),
+                recovery_error=recovery_error,
                 updated_at=_now(),
             )
             _write_journal(state_dir, journal)
@@ -1342,9 +1650,7 @@ def _run_post(args: argparse.Namespace) -> int:
         return _run_post_locked(args, repo, state_dir)
 
 
-def _recover_interrupted(
-    args: argparse.Namespace, repo: Path, state_dir: Path
-) -> None:
+def _recover_interrupted(args: argparse.Namespace, repo: Path, state_dir: Path) -> None:
     """Recover only the latest state pointer; run files are historical records."""
     state = state_dir / "state.json"
     if not state.exists():
@@ -1386,7 +1692,11 @@ def _check(args: argparse.Namespace) -> int:
     try:
         _assert_checkout(repo, "diatche")
         prepared_ref = getattr(args, "prepared_ref", None)
-        integration = _oid(repo, prepared_ref) if prepared_ref else _oid(repo, "refs/heads/diatche")
+        integration = (
+            _oid(repo, prepared_ref)
+            if prepared_ref
+            else _oid(repo, "refs/heads/diatche")
+        )
         target = _resolve_update_target(
             repo,
             args.remote,
@@ -1398,10 +1708,16 @@ def _check(args: argparse.Namespace) -> int:
         fetch_ref, upstream = target.source_ref, target.oid
         target_skew = _target_skew(repo, upstream, target.branch_oid)
         _check_merge(repo, integration, upstream)
-        payload = {"ok": True, "mergeable": True, "integration_sha": integration,
-                   "upstream_sha": upstream, "fetch_ref": fetch_ref,
-                   "target": target.label, "branch_sha": target.branch_oid,
-                   "target_skew": target_skew}
+        payload = {
+            "ok": True,
+            "mergeable": True,
+            "integration_sha": integration,
+            "upstream_sha": upstream,
+            "fetch_ref": fetch_ref,
+            "target": target.label,
+            "branch_sha": target.branch_oid,
+            "target_skew": target_skew,
+        }
         if args.json:
             print(json.dumps(payload, indent=2, sort_keys=True))
         else:
@@ -1472,9 +1788,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.set_defaults(target_mode="stable")
     parser.add_argument("--repo", type=Path, default=DEFAULT_REPO, help=hidden)
-    parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR, help=hidden)
-    parser.add_argument("--wrapperctl", type=Path, default=DEFAULT_WRAPPERCTL, help=hidden)
-    parser.add_argument("--health-script", type=Path, default=DEFAULT_HEALTH_SCRIPT, help=hidden)
+    parser.add_argument(
+        "--state-dir", type=Path, default=DEFAULT_STATE_DIR, help=hidden
+    )
+    parser.add_argument(
+        "--wrapperctl", type=Path, default=DEFAULT_WRAPPERCTL, help=hidden
+    )
+    parser.add_argument(
+        "--health-script", type=Path, default=DEFAULT_HEALTH_SCRIPT, help=hidden
+    )
     parser.add_argument("--backup-root", type=Path, default=None, help=hidden)
     parser.add_argument("--updater-executable", type=Path, default=None, help=hidden)
     parser.add_argument("--remote", default="origin", help=hidden)
@@ -1491,7 +1813,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.target_mode = "commit"
     repo = args.repo.expanduser().resolve()
     args.repo = repo
-    if not _git(repo, "rev-parse", "--is-inside-work-tree", check=False).stdout.strip() == "true":
+    if (
+        not _git(repo, "rev-parse", "--is-inside-work-tree", check=False).stdout.strip()
+        == "true"
+    ):
         print(f"ERROR: not a Git checkout: {repo}", file=sys.stderr)
         return 2
     if args.check:
