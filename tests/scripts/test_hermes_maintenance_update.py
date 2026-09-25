@@ -82,6 +82,10 @@ def _make_repo(tmp_path: Path, *, conflict: bool = False) -> tuple[Path, str]:
         "  echo 'usage: hermes update [--no-backup]'\n"
         "  exit 0\n"
         "fi\n"
+        "if [ \"${1:-}\" = gateway ] && [ \"${2:-}\" = stop ]; then\n"
+        f"  printf '%s\\n' \"$*\" >> {updater_calls!s}\n"
+        "  exit 0\n"
+        "fi\n"
         f"printf '%s\\n' \"$*\" >> {updater_calls!s}\n"
         "git fetch origin main\n"
         "git update-ref refs/heads/main refs/remotes/origin/main\n"
@@ -263,6 +267,62 @@ def test_external_backup_gate_requires_complete_recent_generation(tmp_path: Path
     assert archive.stat().st_size == manifest["size_bytes"]
     with pytest.raises(RuntimeError, match="checksum does not match"):
         module._assert_fresh_verified_backup(tmp_path)
+
+
+def test_profile_gateway_inventory_filters_loaded_named_services(tmp_path: Path, monkeypatch) -> None:
+    module = _load_script_module()
+    monkeypatch.setattr(module, "DEFAULT_REPO", tmp_path)
+    monkeypatch.setattr(
+        module,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0],
+            0,
+            "1\t0\tai.hermes.gateway-recovery\n"
+            "2\t0\tai.hermes.gateway-crmwebhook\n"
+            "3\t0\tai.hermes.gateway\n"
+            "4\t0\tnz.diatche.hermes-gateway\n",
+            "",
+        ),
+    )
+
+    assert module._loaded_profile_gateway_labels(tmp_path, 30) == [
+        "ai.hermes.gateway-crmwebhook",
+        "ai.hermes.gateway-recovery",
+    ]
+
+
+def test_restore_profile_gateways_bootstraps_and_starts_recorded_services(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    module = _load_script_module()
+    label = "ai.hermes.gateway-recovery"
+    launch_agents = tmp_path / "Library" / "LaunchAgents"
+    _write(launch_agents, f"{label}.plist", "fixture")
+    monkeypatch.setattr(module.Path, "home", classmethod(lambda cls: tmp_path))
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(tuple(command))
+        if command[1] == "print" and len([c for c in calls if c[1] == "print"]) == 1:
+            return subprocess.CompletedProcess(command, 113, "", "not loaded")
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    module._restore_profile_gateway_services(tmp_path, [label], 30)
+
+    domain = f"gui/{os.getuid()}"
+    assert calls == [
+        ("/bin/launchctl", "print", f"{domain}/{label}"),
+        ("/bin/launchctl", "bootstrap", domain, str(launch_agents / f"{label}.plist")),
+        ("/bin/launchctl", "kickstart", f"{domain}/{label}"),
+        ("/bin/launchctl", "print", f"{domain}/{label}"),
+    ]
+
+
+def test_backup_freshness_policy_is_twenty_three_hours() -> None:
+    module = _load_script_module()
+    assert module.MAX_BACKUP_AGE_SECONDS == 23 * 60 * 60
 
 
 def test_post_update_candidate_runtime_probe_fails_closed(tmp_path: Path) -> None:
@@ -530,7 +590,9 @@ def test_pre_stops_runtime_prints_handoff_and_never_runs_updater(tmp_path: Path)
         "--force-stop",
         "--assert-update-quiescence",
     ]
-    assert not (tmp_path / "official-updater-calls.log").exists()
+    assert (tmp_path / "official-updater-calls.log").read_text(
+        encoding="utf-8"
+    ).splitlines() == ["gateway stop --all"]
     state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
     assert f"cd {repo}" in result.stdout
     assert (

@@ -2,10 +2,11 @@
 """Coordinate Pavel's guarded three-step Hermes maintenance update.
 
 ``--pre`` (also the no-argument default) prepares and validates an immutable
-merge candidate, stops the custom gateway wrapper, and prints the exact
+merge candidate, records and stops all related Hermes runtimes, and prints the exact
 official update and ``--post`` commands. The updater then runs directly in the
 operator's terminal. ``--post`` verifies its Git result, publishes
-``diatche``, restores the checkout, and restarts and health-checks the wrapper.
+``diatche``, restores the checkout, restarts and health-checks the wrapper, and
+restores the named-profile gateway services that were active before ``--pre``.
 Run ``--post`` even if the official update fails so the previous runtime can be
 recovered. ``--check`` fetches live upstream into a private maintenance ref and
 performs a no-checkout merge preflight without moving branch or tracking refs.
@@ -78,7 +79,8 @@ import transformers
 OFFICIAL_UPDATE_ARGUMENTS = ("update", "--branch", "main")
 OFFICIAL_UPDATE_SUFFIX = ("--no-backup", "--yes")
 SHALLOW_DEEPEN_COMMITS = 4096
-MAX_BACKUP_AGE_SECONDS = 4 * 60 * 60
+MAX_BACKUP_AGE_SECONDS = 23 * 60 * 60
+PROFILE_GATEWAY_LABEL_RE = re.compile(r"^ai[.]hermes[.]gateway-[A-Za-z0-9._-]+$")
 CANDIDATE_RUNTIME_IMPORT_PROBE = """\
 import gateway.run
 import gateway.platforms.api_server
@@ -239,6 +241,63 @@ def _wrapper(
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(f"wrapper {argument} failed{': ' + detail if detail else ''}")
+
+
+def _loaded_profile_gateway_labels(repo: Path, timeout: float) -> list[str]:
+    """Return loaded named-profile LaunchAgents that share this checkout."""
+    if repo.resolve() != DEFAULT_REPO.resolve():
+        return []
+    result = _run(("/bin/launchctl", "list"), cwd=repo, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError("could not inventory loaded Hermes profile gateways")
+    labels: set[str] = set()
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and PROFILE_GATEWAY_LABEL_RE.fullmatch(fields[-1]):
+            labels.add(fields[-1])
+    return sorted(labels)
+
+
+def _stop_related_hermes_processes(
+    repo: Path, wrapper: Path, timeout: float,
+) -> None:
+    """Stop the custom wrapper plus every Hermes profile/manual gateway."""
+    _wrapper(wrapper, repo, "--force-stop", timeout)
+    hermes = repo / "venv" / "bin" / "hermes"
+    if not hermes.is_file() or not os.access(hermes, os.X_OK):
+        raise RuntimeError(f"Hermes gateway controller is missing: {hermes}")
+    result = _run((str(hermes), "gateway", "stop", "--all"), cwd=repo, timeout=timeout)
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"could not stop all Hermes gateways{': ' + detail if detail else ''}")
+    _wrapper(wrapper, repo, "--assert-update-quiescence", timeout)
+
+
+def _restore_profile_gateway_services(
+    repo: Path, profile_labels: Sequence[str], timeout: float,
+) -> None:
+    """Restore only named-profile LaunchAgents recorded as loaded by ``--pre``."""
+    domain = f"gui/{os.getuid()}"
+    launch_agents = Path.home() / "Library" / "LaunchAgents"
+    for label in profile_labels:
+        if not PROFILE_GATEWAY_LABEL_RE.fullmatch(str(label)):
+            raise RuntimeError(f"invalid recorded profile gateway label: {label!r}")
+        plist = launch_agents / f"{label}.plist"
+        if not plist.is_file():
+            raise RuntimeError(f"recorded profile gateway plist is missing: {plist}")
+        probe = _run(("/bin/launchctl", "print", f"{domain}/{label}"), cwd=repo, timeout=timeout)
+        if probe.returncode:
+            loaded = _run(("/bin/launchctl", "bootstrap", domain, str(plist)), cwd=repo, timeout=timeout)
+            if loaded.returncode:
+                detail = loaded.stderr.strip() or loaded.stdout.strip()
+                raise RuntimeError(f"could not restore {label}{': ' + detail if detail else ''}")
+        started = _run(("/bin/launchctl", "kickstart", f"{domain}/{label}"), cwd=repo, timeout=timeout)
+        if started.returncode:
+            detail = started.stderr.strip() or started.stdout.strip()
+            raise RuntimeError(f"could not start {label}{': ' + detail if detail else ''}")
+        verified = _run(("/bin/launchctl", "print", f"{domain}/{label}"), cwd=repo, timeout=timeout)
+        if verified.returncode:
+            raise RuntimeError(f"restored profile gateway is not loaded: {label}")
 
 
 def _official_update_arguments(updater: Path, repo: Path, timeout: float) -> tuple[str, ...]:
@@ -959,6 +1018,9 @@ def _recover_payload(
         )
         _wrapper(wrapper, repo, "--status", wrapper_timeout)
         _health(health_script, repo, health_timeout)
+    _restore_profile_gateway_services(
+        repo, payload.get("profile_gateway_labels", []), wrapper_timeout
+    )
 
 def _run_pre_locked(
     args: argparse.Namespace, repo: Path, state_dir: Path, run_id: str,
@@ -1005,6 +1067,9 @@ def _run_pre_locked(
             repo, run_id, main_old, integration_old, upstream_oid,
             candidate_oid, "prepared",
         )
+        profile_gateway_labels = _loaded_profile_gateway_labels(
+            repo, args.wrapper_timeout
+        )
         journal.update(
             fetch_ref=fetch_ref,
             branch_ref=target.branch_ref,
@@ -1015,6 +1080,7 @@ def _run_pre_locked(
             prepared_ref=prepared_ref,
             prepared_base_oid=candidate_base_oid,
             candidate_ref=candidate_ref,
+            profile_gateway_labels=profile_gateway_labels,
             origin_ref=origin_ref,
             origin_old=origin_old,
             rollback_scope=(
@@ -1043,12 +1109,9 @@ def _run_pre_locked(
         _write_journal(state_dir, journal)
         # A failed stop may still have partially unloaded the supervisor.
         wrapper_stopped = True
-        _progress("Stopping the custom Hermes gateway wrapper")
-        _wrapper(args.wrapperctl.resolve(), repo, "--force-stop", args.wrapper_timeout)
-        _progress("Proving global Hermes update quiescence")
-        _wrapper(
-            args.wrapperctl.resolve(), repo, "--assert-update-quiescence",
-            args.wrapper_timeout,
+        _progress("Stopping all related Hermes gateways and dashboards")
+        _stop_related_hermes_processes(
+            repo, args.wrapperctl.resolve(), args.wrapper_timeout,
         )
         if upstream_oid != target.branch_oid:
             _progress("Advancing local main to the selected update target")
@@ -1097,6 +1160,10 @@ def _run_pre_locked(
                     args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout
                 )
                 _health(args.health_script.resolve(), repo, args.health_timeout)
+                _restore_profile_gateway_services(
+                    repo, journal.get("profile_gateway_labels", []),
+                    args.wrapper_timeout,
+                )
                 wrapper_stopped = False
                 journal["recovered"] = True
                 _progress("Previous Hermes runtime recovered and healthy")
@@ -1212,6 +1279,10 @@ def _run_post_locked(
         _progress("Verifying wrapper ownership and live Hermes health")
         _wrapper(args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout)
         _health(args.health_script.resolve(), repo, args.health_timeout)
+        _progress("Restoring previously active Hermes profile gateways")
+        _restore_profile_gateway_services(
+            repo, journal.get("profile_gateway_labels", []), args.wrapper_timeout
+        )
         _assert_checkout(repo, "diatche")
         if _oid(repo, "HEAD") != candidate_oid:
             raise RuntimeError("runtime checkout moved during startup")
@@ -1245,6 +1316,10 @@ def _run_post_locked(
                     args.wrapperctl.resolve(), repo, "--status", args.wrapper_timeout
                 )
                 _health(args.health_script.resolve(), repo, args.health_timeout)
+                _restore_profile_gateway_services(
+                    repo, journal.get("profile_gateway_labels", []),
+                    args.wrapper_timeout,
+                )
                 journal["recovered"] = True
                 _progress("Previous Hermes runtime recovered and healthy")
             except Exception as recovery_exc:
@@ -1355,12 +1430,12 @@ def _parser() -> argparse.ArgumentParser:
     phase.add_argument(
         "--pre",
         action="store_true",
-        help="prepare the update, stop Hermes, and print the next commands",
+        help="prepare the update, stop all related Hermes runtimes, and print the next commands",
     )
     phase.add_argument(
         "--post",
         action="store_true",
-        help="verify the official update, publish diatche, and restart Hermes",
+        help="verify the update, publish diatche, and restore recorded Hermes services",
     )
     phase.add_argument(
         "--check",
