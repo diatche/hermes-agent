@@ -335,6 +335,26 @@ def test_stop_profile_gateways_boots_out_and_verifies_recorded_services(
     ]
 
 
+def test_stop_profile_gateways_waits_for_launchd_removal(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_script_module()
+    label = "ai.hermes.gateway-crmwebhook"
+    outcomes = iter([0, 0, 113])
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(tuple(command))
+        return subprocess.CompletedProcess(command, next(outcomes), "", "")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+    module._stop_profile_gateway_services(tmp_path, [label], 30)
+
+    assert [command[1] for command in calls] == ["bootout", "print", "print"]
+
+
 def test_restore_profile_gateways_bootstraps_and_starts_recorded_services(
     tmp_path: Path,
     monkeypatch,
@@ -1687,6 +1707,15 @@ def test_stop_failure_keeps_refs_and_restarts_old_runtime(tmp_path: Path) -> Non
     ]
 
 
+def _set_fake_hindsight_python(module, tmp_path: Path, monkeypatch) -> Path:
+    python = tmp_path / "hindsight" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    python.chmod(0o755)
+    monkeypatch.setattr(module, "DEFAULT_HINDSIGHT_PYTHON", python)
+    return python
+
+
 def test_hindsight_embedding_guard_repairs_only_incompatible_hub(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1696,6 +1725,7 @@ def test_hindsight_embedding_guard_repairs_only_incompatible_hub(
     python.parent.mkdir(parents=True)
     python.write_text("", encoding="utf-8")
     python.chmod(0o755)
+    hindsight_python = _set_fake_hindsight_python(module, tmp_path, monkeypatch)
     commands: list[tuple[str, ...]] = []
     outcomes = iter([11, 0, 0, 0])
 
@@ -1719,7 +1749,7 @@ def test_hindsight_embedding_guard_repairs_only_incompatible_hub(
     )
     assert commands[2] == commands[0]
     assert commands[3][1] == "-c"
-    assert commands[3] != commands[0]
+    assert commands[3][0] == str(hindsight_python)
 
 
 def test_hindsight_embedding_guard_matches_lazy_dependency_pin() -> None:
@@ -1743,6 +1773,7 @@ def test_hindsight_embedding_guard_is_noop_when_version_and_imports_work(
     python.parent.mkdir(parents=True)
     python.write_text("", encoding="utf-8")
     python.chmod(0o755)
+    hindsight_python = _set_fake_hindsight_python(module, tmp_path, monkeypatch)
     commands: list[tuple[str, ...]] = []
 
     def fake_run(command, *, cwd, timeout=60, check=False, env=None):
@@ -1756,7 +1787,7 @@ def test_hindsight_embedding_guard_is_noop_when_version_and_imports_work(
     assert len(commands) == 2
     assert commands[0][1] == "-c"
     assert commands[1][1] == "-c"
-    assert commands[1] != commands[0]
+    assert commands[1][0] == str(hindsight_python)
 
 
 def test_hindsight_embedding_guard_does_not_repair_unrelated_import_failure(
@@ -1768,6 +1799,7 @@ def test_hindsight_embedding_guard_does_not_repair_unrelated_import_failure(
     python.parent.mkdir(parents=True)
     python.write_text("", encoding="utf-8")
     python.chmod(0o755)
+    _set_fake_hindsight_python(module, tmp_path, monkeypatch)
     commands: list[tuple[str, ...]] = []
     outcomes = iter([0, 1])
 

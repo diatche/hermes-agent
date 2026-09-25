@@ -39,6 +39,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 import uuid
 from contextlib import contextmanager
@@ -53,6 +54,9 @@ DEFAULT_WRAPPERCTL = (
 )
 DEFAULT_HEALTH_SCRIPT = (
     Path.home() / ".hermes" / "local" / "health" / "hermes_core_health.py"
+)
+DEFAULT_HINDSIGHT_PYTHON = (
+    Path.home() / ".hermes" / "local" / "hindsight-daemon" / "venv" / "bin" / "python"
 )
 DEFAULT_BACKUP_ROOT = Path("/Volumes/SamsungS3/Backups/Hermes")
 
@@ -339,14 +343,21 @@ def _stop_profile_gateway_services(
                 f"failed to stop recorded profile gateway {label}"
                 f"{': ' + detail if detail else ''}"
             )
-        probe = _run(
-            ("/bin/launchctl", "print", target),
-            cwd=repo,
-            timeout=timeout,
-            check=False,
-        )
-        if probe.returncode == 0:
-            raise RuntimeError(f"profile gateway remained loaded after stop: {label}")
+        deadline = time.monotonic() + min(timeout, 15.0)
+        while True:
+            probe = _run(
+                ("/bin/launchctl", "print", target),
+                cwd=repo,
+                timeout=timeout,
+                check=False,
+            )
+            if probe.returncode != 0:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"profile gateway remained loaded after stop: {label}"
+                )
+            time.sleep(0.2)
 
 
 def _restore_profile_gateway_services(
@@ -525,7 +536,7 @@ def _lcm_post_upgrade_check(health_script: Path, repo: Path, timeout: float) -> 
 
 
 def _ensure_hindsight_embeddings(repo: Path, timeout: float) -> None:
-    """Repair the known shared-venv HF downgrade, then prove imports work."""
+    """Repair Hermes' HF pin and prove the isolated Hindsight runtime imports."""
     python = repo / "venv" / "bin" / "python"
     if not python.is_file() or not os.access(python, os.X_OK):
         raise RuntimeError(f"Hermes venv Python is missing: {python}")
@@ -576,7 +587,10 @@ def _ensure_hindsight_embeddings(repo: Path, timeout: float) -> None:
                 + (f": {detail}" if detail else "")
             )
 
-    import_probe = (str(python), "-c", HINDSIGHT_IMPORT_PROBE)
+    hindsight_python = DEFAULT_HINDSIGHT_PYTHON
+    if not hindsight_python.is_file() or not os.access(hindsight_python, os.X_OK):
+        raise RuntimeError(f"isolated Hindsight Python is missing: {hindsight_python}")
+    import_probe = (str(hindsight_python), "-c", HINDSIGHT_IMPORT_PROBE)
     imports_verified = _run(import_probe, cwd=repo, timeout=timeout)
     if imports_verified.returncode:
         detail = imports_verified.stderr.strip() or imports_verified.stdout.strip()
