@@ -498,6 +498,26 @@ class TodoChecklistAgent:
         }
 
 
+class CurrentTodoToolAgent:
+    """Exercises the current todo_list completion name and clear result."""
+
+    def __init__(self, **kwargs):
+        self.tool_complete_callback = kwargs.get("tool_complete_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        complete = self.tool_complete_callback
+        assert complete is not None
+        complete(
+            "todo-1", "todo_list", {"merge": False},
+            '{"todos":[{"id":"check","content":"Check Telegram pins","status":"in_progress"}]}',
+        )
+        time.sleep(0.35)
+        complete("todo-2", "todo_list", {"todos": []}, '{"todos":[]}')
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
 class InitiallyEmptyTodoAgent:
     """Emits an authoritative empty todo list before any checklist exists."""
 
@@ -2445,6 +2465,32 @@ async def test_telegram_todo_pin_pins_created_checklist_silently(monkeypatch, tm
         }
     ]
     assert adapter._bot.unpins == []
+
+
+@pytest.mark.asyncio
+async def test_telegram_current_todo_tool_pins_and_clears_checklist(monkeypatch, tmp_path):
+    adapter, _ = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CurrentTodoToolAgent,
+        session_id="sess-current-todo-pin",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "todo_progress": True,
+                "platforms": {"telegram": {"todo_progress_pin": True}},
+            }
+        },
+        adapter_cls=PinningProgressAdapter,
+    )
+
+    assert len(adapter.sent) == 1
+    assert "Check Telegram pins" in adapter.sent[0]["content"]
+    assert getattr(adapter, "_bot").pins == [
+        {"chat_id": -1001, "message_id": "progress-1", "disable_notification": True}
+    ]
+    assert getattr(adapter, "_bot").unpins == [{"chat_id": -1001, "message_id": "progress-1"}]
+    assert adapter.deletes == [{"chat_id": "-1001", "message_id": "progress-1"}]
 
 
 @pytest.mark.asyncio

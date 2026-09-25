@@ -110,8 +110,8 @@ class TurnRunner:
         """Publish an authoritative todo-tool result onto the dedicated checklist rail."""
         ctx = self._ctx
         if (
-            not ctx.todo_progress_enabled or tool_name != "todo" or not ctx.progress_queue
-            or not ctx._run_still_current()
+            not ctx.todo_progress_enabled or tool_name not in {"todo_list", "todo"}
+            or not ctx.progress_queue or not ctx._run_still_current()
         ):
             return
         checklist_text = ctx.todo_checklist.update_from_result(result)
