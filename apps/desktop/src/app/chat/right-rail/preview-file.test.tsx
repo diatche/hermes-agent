@@ -1,5 +1,7 @@
-import { cleanup, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import * as desktopFs from '@/lib/desktop-fs'
 
 import { MarkdownPreview } from './preview-file'
 
@@ -11,6 +13,7 @@ import { MarkdownPreview } from './preview-file'
 describe('MarkdownPreview', () => {
   afterEach(() => {
     cleanup()
+    vi.restoreAllMocks()
   })
 
   it('renders block and inline math through KaTeX', () => {
@@ -40,6 +43,31 @@ describe('MarkdownPreview', () => {
     const img = container.querySelector('img')
     expect(img?.getAttribute('alt')).toBe('a chart')
     expect(img?.getAttribute('src')).toBe('https://example.com/chart.png')
+  })
+
+  it('renders markdown inside styled disclosure sections', () => {
+    const readImage = vi.spyOn(desktopFs, 'readDesktopFileDataUrl').mockResolvedValue('data:image/png;base64,aGVybWVz')
+
+    const { container } = render(
+      <MarkdownPreview
+        filePath="/work/reviews/REVIEW.md"
+        text={'<details><summary>Wider context</summary>\n\n![Context crop](review/context.png)\n\n</details>'}
+      />
+    )
+
+    const details = container.querySelector('details')
+    const summary = details?.querySelector('summary')
+
+    expect(summary?.textContent).toBe('Wider context')
+    expect(summary?.getAttribute('class')).toContain('preview-markdown-summary')
+
+    return waitFor(() => {
+      const image = details?.querySelector('img')
+
+      expect(readImage).toHaveBeenCalledWith('/work/reviews/review/context.png')
+      expect(image?.getAttribute('alt')).toBe('Context crop')
+      expect(image?.getAttribute('src')).toBe('data:image/png;base64,aGVybWVz')
+    })
   })
 
   it('renders external links to open in a new tab safely', () => {
