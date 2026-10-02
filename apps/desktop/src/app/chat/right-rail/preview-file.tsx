@@ -368,16 +368,12 @@ function MarkdownTable({ className, ...rest }: ComponentProps<'table'>) {
   )
 }
 
-const PREVIEW_IMAGE_URL = 'https://hermes.invalid/__markdown-preview-image#'
-
 function MarkdownImage({ alt, src, ...rest }: ComponentProps<'img'>) {
-  const resolvedSrc = src?.startsWith(PREVIEW_IMAGE_URL) ? decodeURIComponent(src.slice(PREVIEW_IMAGE_URL.length)) : src
-
   return (
     <img
       alt={alt ?? ''}
       className="my-3 max-h-96 w-auto max-w-full rounded-lg border border-border object-contain shadow-sm"
-      src={resolvedSrc}
+      src={src}
       {...rest}
     />
   )
@@ -417,100 +413,11 @@ const MARKDOWN_COMPONENTS = {
   td: tagged('td'),
   thead: tagged('thead'),
   img: MarkdownImage,
-  a: MarkdownLink,
-  details: ({ className, ...props }: ComponentProps<'details'>) => (
-    <details className={cn('my-4 rounded-lg bg-muted/25 px-3 py-2', className)} {...props} />
-  ),
-  summary: ({ className, ...props }: ComponentProps<'summary'>) => (
-    <summary
-      className={cn(
-        'preview-markdown-summary select-none rounded-md px-1 py-1 font-semibold text-foreground transition-colors hover:bg-accent/60',
-        className
-      )}
-      {...props}
-    />
-  )
+  a: MarkdownLink
 }
 
-function relativePreviewImagePath(markdownPath: string, src: string): string | null {
-  if (!src || /^(?:[a-z][a-z\d+.-]*:|\/|\\\\|#)/i.test(src)) {
-    return null
-  }
-
-  const cleanSrc = src.split(/[?#]/, 1)[0]
-  const separator = markdownPath.includes('\\') && !markdownPath.includes('/') ? '\\' : '/'
-  const base = markdownPath.replace(/[\\/][^\\/]*$/, '')
-
-  return `${base}${separator}${cleanSrc.replace(/^\.\//, '')}`
-}
-
-export function MarkdownPreview({ filePath, text }: { filePath?: string; text: string }) {
+export function MarkdownPreview({ text }: { text: string }) {
   const mathText = useMemo(() => normalizeFilePreviewMath(text), [text])
-  const [renderText, setRenderText] = useState(mathText)
-
-  useEffect(() => {
-    let active = true
-
-    if (!filePath) {
-      setRenderText(mathText)
-
-      return () => {
-        active = false
-      }
-    }
-
-    const imagePattern = /!\[[^\]\n]*\]\(\s*<?([^\s)>]+)>?(?:\s+["'][^\n)]*["'])?\s*\)/g
-
-    const matches = Array.from(mathText.matchAll(imagePattern))
-      .map(match => {
-        const src = match[1] || ''
-        const path = relativePreviewImagePath(filePath, src)
-        const sourceOffset = match[0].indexOf(src)
-
-        return path && sourceOffset >= 0
-          ? { end: (match.index ?? 0) + sourceOffset + src.length, path, start: (match.index ?? 0) + sourceOffset }
-          : null
-      })
-      .filter((match): match is { end: number; path: string; start: number } => match !== null)
-
-    if (!matches.length) {
-      setRenderText(mathText)
-
-      return () => {
-        active = false
-      }
-    }
-
-    setRenderText(mathText)
-    void Promise.all(
-      matches.map(async match => {
-        try {
-          return { ...match, dataUrl: await readDesktopFileDataUrl(match.path) }
-        } catch {
-          return null
-        }
-      })
-    )
-      .then(resolved => {
-        if (!active) {
-          return
-        }
-
-        let next = mathText
-
-        for (const match of resolved
-          .filter((item): item is { dataUrl: string; end: number; path: string; start: number } => item !== null)
-          .reverse()) {
-          next = `${next.slice(0, match.start)}${PREVIEW_IMAGE_URL}${encodeURIComponent(match.dataUrl)}${next.slice(match.end)}`
-        }
-
-        setRenderText(next)
-      })
-
-    return () => {
-      active = false
-    }
-  }, [filePath, mathText])
 
   return (
     <div className="preview-markdown mx-auto max-w-3xl px-4 py-3 text-sm text-foreground" data-selectable-text="true">
@@ -521,7 +428,7 @@ export function MarkdownPreview({ filePath, text }: { filePath?: string; text: s
         parseIncompleteMarkdown={false}
         plugins={{ math: previewMathPlugin }}
       >
-        {renderText}
+        {mathText}
       </Streamdown>
     </div>
   )
@@ -1244,7 +1151,7 @@ export function LocalFilePreview({
         />
         <div className="min-h-0 flex-1 overflow-auto">
           {mode === 'rendered' ? (
-            <MarkdownPreview filePath={filePath} text={state.text} />
+            <MarkdownPreview text={state.text} />
           ) : mode === 'diff' ? (
             <FileDiffPanel
               className="mx-0 mb-0 h-full max-h-none"
