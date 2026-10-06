@@ -568,6 +568,17 @@ class TestAgentCacheIdleResume:
             f"tabs and cookies gone on resume. Calls: {browser_calls}"
         )
 
+    def test_true_cache_eviction_closes_context_engine_once(self):
+        """The gateway cache entry—not generic client release—owns engine destruction."""
+        from gateway.run import GatewayRunner
+
+        agent = MagicMock()
+        runner = GatewayRunner.__new__(GatewayRunner)
+
+        runner._release_evicted_agent_soft(agent)
+
+        agent.release_clients.assert_called_once_with()
+        agent._close_context_engine.assert_called_once_with()
 
     def test_close_vs_release_full_teardown_difference(self, monkeypatch):
         """close() tears down task state; release_clients() does not.

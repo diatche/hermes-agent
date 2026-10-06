@@ -72,3 +72,21 @@ def test_agent_closes_context_engine_clone_once():
     agent._close_context_engine()
 
     engine.close.assert_called_once_with()
+
+
+def test_release_clients_does_not_close_borrowed_context_engine():
+    owner = object.__new__(AIAgent)
+    borrower = object.__new__(AIAgent)
+    engine = MagicMock()
+    owner.context_compressor = engine
+    borrower.context_compressor = engine
+    borrower._active_children = []
+    borrower._active_children_lock = threading.Lock()
+    borrower.client = None
+    borrower._codex_session = None
+
+    borrower.release_clients()
+
+    engine.close.assert_not_called()
+    engine.prepare_messages.return_value = ["still-open"]
+    assert owner.context_compressor.prepare_messages([]) == ["still-open"]

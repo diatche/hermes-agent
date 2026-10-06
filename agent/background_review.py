@@ -1129,9 +1129,12 @@ class _ReviewForkState:
 
 def _release_fork_clients(review_agent: Any) -> None:
     """The fork shares the foreground session ID: close() / shutdown_memory_provider() are
-    session-bound (close() kills that session's terminal processes), so release only clients."""
+    session-bound (close() kills that session's terminal processes), so release clients and the
+    fork-owned context-engine clone without invoking hard session cleanup."""
     with suppress(Exception):
         review_agent.release_clients()
+    with suppress(Exception):
+        review_agent._close_context_engine()
 
 
 def _run_review_fork(

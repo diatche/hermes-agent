@@ -219,6 +219,9 @@ def _retire_agent(cli) -> None:
     agent = cli.agent
     if agent is not None and hasattr(agent, "release_clients"):
         agent.release_clients()
+        close_engine = getattr(agent, "_close_context_engine", None)
+        if callable(close_engine):
+            close_engine()
     cli.agent = None
 
 

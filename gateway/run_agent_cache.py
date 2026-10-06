@@ -787,7 +787,10 @@ class GatewayAgentCacheMixin:
 
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents: unlike _cleanup_agent_resources, the session may
-        resume, so terminal sandbox, browser daemon and bg processes outlive the AIAgent instance."""
+        resume, so terminal sandbox, browser daemon and bg processes outlive the AIAgent instance.
+        The cache entry exclusively owns its context-engine clone, so close that clone here rather
+        than in release_clients(): temporary review/child forks may call release_clients() while
+        borrowing the foreground engine."""
         if agent is None:
             return
         with suppress(Exception):
@@ -796,6 +799,13 @@ class GatewayAgentCacheMixin:
             else:
                 # Older agent instance (shouldn't happen in practice) — legacy full-close path.
                 self._cleanup_agent_resources(agent)
+        # This helper is reached only after the agent has been removed from the gateway cache. Keep
+        # engine destruction at that ownership-proven boundary; generic release_clients() also serves
+        # temporary forks which can share the foreground engine by identity.
+        with suppress(Exception):
+            close_engine = getattr(agent, "_close_context_engine", None)
+            if callable(close_engine):
+                close_engine()
         # Free conversation history — tens of MB of tool output on heavy 100+-tool-call sessions.
         # release_clients() preserves session tool state for resume, but the message list is rebuilt from
         # persisted session JSON on the next turn, so dropping it here is safe.

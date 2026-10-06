@@ -964,10 +964,6 @@ class AIAgent(
         # The Codex app-server child is an LLM client, not session tool state: the evicted instance is popped
         # from the cache and a rebuilt agent spawns its own child, so an unclosed one leaks for the gateway's life.
         _quietly(self._close_codex_session)
-        # Plugin context engines are cloned per AIAgent and may own SQLite connections, advisory leases,
-        # threads, or clients. This AIAgent is permanently discarded on cache eviction even though
-        # session-level terminal/browser resources intentionally survive.
-        _quietly(self._close_context_engine)
 
     def _close_context_engine(self) -> None:
         """Close this AIAgent's context-engine clone once."""
@@ -1015,6 +1011,7 @@ class AIAgent(
             if soft:
                 try:
                     child.release_clients()
+                    _quietly(child._close_context_engine)
                     continue
                 except Exception:
                     pass
