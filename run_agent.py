@@ -400,8 +400,19 @@ class AIAgent(
             start_context = {
                 "old_session_id": old_session_id, "carry_over_context": carry_over_context,
                 "platform": _session_source_for_agent(getattr(self, "platform", None)),
-                "model": getattr(self, "model", ""), "context_length": getattr(engine, "context_length", None),
-                "conversation_id": getattr(self, "_gateway_session_key", None), **extra_context,
+                "model": getattr(self, "model", ""),
+                "context_length": getattr(engine, "context_length", None),
+                "conversation_id": getattr(self, "_gateway_session_key", None),
+                # Same key agent/agent_init.py passes when it opens the very
+                # first session on this engine.  Without it here, an engine
+                # that keys per-profile storage off ``hermes_home`` is told
+                # once at init and never again, so every later transition
+                # leaves it bound to whatever home the engine happened to see
+                # first.  Placed in the defaults so an explicit
+                # ``extra_context["hermes_home"]`` from a profile-aware caller
+                # still wins via the ``update`` below.
+                "hermes_home": str(get_hermes_home()),
+                **extra_context,
             }
             start_context = {k: v for k, v in start_context.items() if v not in (None, "")}
             _call_engine_hook(engine, "on_session_start", target_session_id, **start_context)

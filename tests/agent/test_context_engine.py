@@ -151,10 +151,53 @@ class TestPluginContextEngineSlot:
         assert mgr._context_engine.name == "stub"
 
 
+class TestSessionTransitionPassesHermesHome:
+    """Every context-engine session transition carries the active profile home."""
 
+    class _Recorder:
+        name = "recorder"
+        context_length = 128000
 
+        def __init__(self):
+            self.starts = []
 
+        def on_session_start(self, session_id, **kwargs):
+            self.starts.append(kwargs)
 
+        def on_session_reset(self):
+            pass
 
+    class _StubAgent:
+        def __init__(self, engine):
+            from run_agent import AIAgent
+            self.context_compressor = engine
+            self.session_id = "S2"
+            self.platform = None
+            self.model = "m"
+            self._gateway_session_key = "C1"
+            self._transition = AIAgent._transition_context_engine_session
 
+    def test_transition_passes_hermes_home(self):
+        engine = self._Recorder()
+        agent = self._StubAgent(engine)
+        agent._transition(
+            agent,
+            old_session_id="S1",
+            new_session_id="S2",
+            previous_messages=[],
+        )
+        assert engine.starts
+        assert engine.starts[-1]["hermes_home"]
+
+    def test_caller_supplied_hermes_home_wins(self):
+        engine = self._Recorder()
+        agent = self._StubAgent(engine)
+        agent._transition(
+            agent,
+            old_session_id="S1",
+            new_session_id="S2",
+            previous_messages=[],
+            hermes_home="/tmp/explicit-profile-home",
+        )
+        assert engine.starts[-1]["hermes_home"] == "/tmp/explicit-profile-home"
 
