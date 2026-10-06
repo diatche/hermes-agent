@@ -4,10 +4,11 @@ SQLite connections — hermes-lcm) stay selectable and a child's model never lea
 (#99640, #42449)."""
 
 import threading
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from agent.agent_init import _select_context_engine
 from agent.context_engine import ContextEngine
+from run_agent import AIAgent
 
 
 class _Engine(ContextEngine):
@@ -60,3 +61,14 @@ def test_default_clone_isolates_parent_from_child_update_model():
     child.update_model(model="small", context_length=204_800)
     assert child is not singleton
     assert (singleton.context_length, child.context_length) == (1_000_000, 204_800)
+
+
+def test_agent_closes_context_engine_clone_once():
+    agent = object.__new__(AIAgent)
+    engine = MagicMock()
+    setattr(agent, "context_compressor", engine)
+
+    agent._close_context_engine()
+    agent._close_context_engine()
+
+    engine.close.assert_called_once_with()

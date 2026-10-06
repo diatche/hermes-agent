@@ -547,6 +547,29 @@ class GatewayInboundMixin:
             _is_ended = getattr(_reap_store, "_is_session_ended_in_db", None)
             _reap_sid = _reap_peek(_quick_key) if callable(_reap_peek) else None
             if isinstance(_reap_sid, str) and _reap_sid and callable(_is_ended) and _is_ended(_reap_sid) is True:
+                # Compression ends the parent row before the live AIAgent adopts its child. A message
+                # in that narrow publication window must heal the route, not interrupt the healthy child.
+                # Verify the identity through the owning store's durable lineage: a merely different
+                # agent session id must not suppress #99106's genuine dead-session recovery.
+                _peek_state = getattr(self, "_peek_session_state", None)
+                _state = _peek_state(_quick_key) if callable(_peek_state) else None
+                _turn_state = getattr(_state, "turn", None)
+                _running_agent = getattr(_turn_state, "agent", None)
+                _active_sid = getattr(_running_agent, "session_id", None)
+                _tip_lookup = getattr(_reap_store, "_compression_tip_for_session_id", None)
+                _advance = getattr(_reap_store, "advance_compression_session", None)
+                if (
+                    isinstance(_active_sid, str) and _active_sid and _active_sid != _reap_sid
+                    and callable(_tip_lookup) and callable(_advance)
+                    and _tip_lookup(_reap_sid) == _active_sid
+                    and _is_ended(_active_sid) is False
+                    and _advance(_quick_key, _reap_sid, _active_sid) is not None
+                ):
+                    logger.info(
+                        "Healed live compression route for %s: %s -> %s; preserving active turn",
+                        _quick_key, _reap_sid, _active_sid,
+                    )
+                    return
                 logger.warning(
                     "Evicting stale _running_agents entry for %s — "
                     "durable session %s is ended (reaped) in state.db; "

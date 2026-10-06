@@ -40,6 +40,7 @@ class _DeadReapedAgent:
 
     def __init__(self):
         self.interrupts = []
+        self.session_id = ""
 
     def interrupt(self, text):
         self.interrupts.append(text)
@@ -211,3 +212,43 @@ async def test_guard_is_inert_with_stubbed_session_store(tmp_path):
     assert runner._is_session_running(key) is True
     assert result is None
     assert agent.interrupts == ["stub store follow-up"]
+
+
+def test_reaped_parent_with_live_compression_child_heals_without_eviction(tmp_path):
+    store = _store(tmp_path)
+    src = _source(chat_id="555004")
+    entry = store.get_or_create_session(src)
+    key = store._generate_session_key(src)
+    parent = entry.session_id
+    child = f"{parent}_compressed"
+    store._db.end_session(parent, "compression")
+    store._db.create_session(child, "telegram", parent_session_id=parent)
+
+    runner = _make_runner(store)
+    agent = _DeadReapedAgent()
+    agent.session_id = child
+    _occupy_turn_slot(runner, key, agent)
+
+    runner._hm_evict_reaped_agent(key)
+
+    assert store.peek_session_id(key) == child
+    assert runner._is_session_running(key) is True
+    assert agent.interrupts == []
+
+
+def test_unrelated_live_agent_id_does_not_suppress_reaped_recovery(tmp_path):
+    store = _store(tmp_path)
+    src = _source(chat_id="555005")
+    entry = store.get_or_create_session(src)
+    key = store._generate_session_key(src)
+    store._db.end_session(entry.session_id, "ws_orphan_reap")
+
+    runner = _make_runner(store)
+    agent = _DeadReapedAgent()
+    agent.session_id = "not-a-compression-child"
+    _occupy_turn_slot(runner, key, agent)
+
+    runner._hm_evict_reaped_agent(key)
+
+    assert runner._is_session_running(key) is False
+    assert agent.interrupts == [_INTERRUPT_REASON_EVICTED]

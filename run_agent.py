@@ -964,6 +964,20 @@ class AIAgent(
         # The Codex app-server child is an LLM client, not session tool state: the evicted instance is popped
         # from the cache and a rebuilt agent spawns its own child, so an unclosed one leaks for the gateway's life.
         _quietly(self._close_codex_session)
+        # Plugin context engines are cloned per AIAgent and may own SQLite connections, advisory leases,
+        # threads, or clients. This AIAgent is permanently discarded on cache eviction even though
+        # session-level terminal/browser resources intentionally survive.
+        _quietly(self._close_context_engine)
+
+    def _close_context_engine(self) -> None:
+        """Close this AIAgent's context-engine clone once."""
+        if getattr(self, "_context_engine_closed", False):
+            return
+        self._context_engine_closed = True
+        engine = getattr(self, "context_compressor", None)
+        close = getattr(engine, "close", None)
+        if callable(close):
+            close()
 
     def close(self) -> None:
         """Release every resource this agent holds (idempotent); each phase is guarded so one failure never
@@ -977,6 +991,7 @@ class AIAgent(
         _quietly(self._drop_shared_client, lambda c: self._close_openai_client(c, reason="agent_close", shared=True))
         self._close_request_clients("agent_close")
         _quietly(self._close_codex_session)
+        _quietly(self._close_context_engine)
         # Free conversation history proactively: callers may still hold the closed agent. The DB-flush
         # settled-prefix snapshot and the streamed-text accumulator are shadow copies of the same transcript;
         # on a closed delegate child they were the only remaining owners, pinning its history in the parent heap.
