@@ -221,7 +221,6 @@ final class Supervisor {
             ["gateway", "run", "--replace", "--external-supervisor"],
             name: "gateway"
         )
-        _ = launch(hermes, ["dashboard", "--host", "0.0.0.0", "--port", "9119", "--no-open", "--skip-build"], name: "dashboard")
     }
 
     private func isAlive(_ child: ManagedChild) -> Bool {
