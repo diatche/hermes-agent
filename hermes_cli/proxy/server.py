@@ -8,6 +8,8 @@ The one shim: after a *clean* upstream EOF, a ``text/event-stream`` response tha
 from __future__ import annotations
 
 import asyncio
+import hmac
+import ipaddress
 import logging
 import signal
 from typing import Optional
@@ -15,10 +17,12 @@ from typing import Optional
 try:
     import aiohttp
     from aiohttp import web
+    from yarl import URL
     AIOHTTP_AVAILABLE = True
 except ImportError:
     aiohttp = None  # type: ignore[assignment]
     web = None  # type: ignore[assignment]
+    URL = None  # type: ignore[assignment,misc]
     AIOHTTP_AVAILABLE = False
 
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
@@ -42,6 +46,47 @@ DEFAULT_HOST = "127.0.0.1"
 MAX_REQUEST_BYTES = 10_000_000
 
 
+def is_loopback_host(host: str) -> bool:
+    """True only for explicit loopback literals or localhost."""
+    value = str(host or "").strip().lower()
+    if value == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def _strip_owned_headers(headers: dict, owned_names: frozenset[str]) -> dict:
+    """Remove all client spellings of adapter-owned identity headers."""
+    owned = {str(name).strip().lower() for name in owned_names if str(name).strip()}
+    return {
+        key: value for key, value in headers.items() if str(key).lower() not in owned
+    }
+
+
+def _merge_adapter_headers(
+    headers: dict,
+    adapter_headers: dict[str, str],
+) -> dict:
+    """Overlay trusted adapter headers case-insensitively.
+
+    Client-controlled values with alternate casing must not survive alongside
+    Codex account/originator headers. Authorization remains owned exclusively
+    by the server's credential path.
+    """
+    merged = dict(headers)
+    for key, value in adapter_headers.items():
+        normalized = str(key).strip()
+        if not normalized or normalized.lower() in _HOP_BY_HOP_HEADERS:
+            continue
+        for existing in list(merged):
+            if str(existing).lower() == normalized.lower():
+                merged.pop(existing, None)
+        merged[normalized] = str(value)
+    return merged
+
+
 def _require_aiohttp() -> None:
     if not AIOHTTP_AVAILABLE:
         raise RuntimeError("aiohttp is required for `hermes proxy`. Run `hermes setup` to install it.")
@@ -58,22 +103,24 @@ def _filter_headers(headers, drop: frozenset = _HOP_BY_HOP_HEADERS) -> dict:
     return {key: value for key, value in headers.items() if key.lower() not in drop}
 
 
-async def _open_upstream(request: "web.Request", rel_path: str, body: bytes, cred: UpstreamCredential):
+async def _open_upstream(request: "web.Request", rel_path: str, body: bytes, cred: UpstreamCredential, adapter: UpstreamAdapter):
     """Send the request upstream with ``cred``; returns ``(session, response)`` or
     ``(error_response, None)``."""
     upstream_url = f"{cred.base_url.rstrip('/')}{rel_path}"
-    if request.query_string:  # preserved verbatim
-        upstream_url = f"{upstream_url}?{request.query_string}"
+    if "?" in request.raw_path:
+        upstream_url += "?" + request.raw_path.split("?", 1)[1]
     fwd_headers = _filter_headers(request.headers)
+    fwd_headers = _strip_owned_headers(fwd_headers, adapter.get_owned_upstream_header_names())
+    fwd_headers = _merge_adapter_headers(fwd_headers, adapter.get_upstream_headers(cred))
     fwd_headers["Authorization"] = f"{cred.token_type} {cred.bearer}"
-    logger.debug("proxy: forwarding %s %s -> %s (body=%d bytes)", request.method, rel_path, upstream_url, len(body))
+    logger.debug("proxy: forwarding %s %s -> %s (body=%d bytes)", request.method, rel_path, cred.base_url, len(body))
     try:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300))
     except Exception as exc:  # pragma: no cover - aiohttp setup issue
         return _json_error(500, f"proxy session init failed: {exc}"), None
     try:
         upstream_resp = await session.request(
-            request.method, upstream_url, data=body if body else None, headers=fwd_headers, allow_redirects=False
+            request.method, URL(upstream_url, encoded=True), data=body if body else None, headers=fwd_headers, allow_redirects=False
         )
     except RuntimeError as exc:
         await session.close()
@@ -85,13 +132,13 @@ async def _open_upstream(request: "web.Request", rel_path: str, body: bytes, cre
     except asyncio.TimeoutError:
         await session.close()
         return _json_error(504, "upstream request timed out", code="upstream_timeout"), None
-    except Exception:
+    except BaseException:
         await session.close()
         raise
     return session, upstream_resp
 
 
-async def _stream_back(request: "web.Request", session, upstream_resp) -> "web.StreamResponse":
+async def _stream_back(request: "web.Request", session, upstream_resp, *, normalize_sse_done: bool = True) -> "web.StreamResponse":
     """Relay status + filtered headers, then the body chunk-by-chunk, appending a missing SSE
     ``[DONE]`` only after a clean EOF."""
     resp = web.StreamResponse(
@@ -99,7 +146,7 @@ async def _stream_back(request: "web.Request", session, upstream_resp) -> "web.S
     )
     await resp.prepare(request)
     done_tracker: Optional[SseDoneTracker] = None
-    if content_type_is_sse(upstream_resp.headers):
+    if normalize_sse_done and content_type_is_sse(upstream_resp.headers):
         done_tracker = SseDoneTracker()
     try:
         async for chunk in upstream_resp.content.iter_any():
@@ -123,7 +170,7 @@ async def _stream_back(request: "web.Request", session, upstream_resp) -> "web.S
     return resp
 
 
-def create_app(adapter: UpstreamAdapter) -> "web.Application":
+def create_app(adapter: UpstreamAdapter, *, client_auth_token: Optional[str] = None) -> "web.Application":
     """Build the aiohttp application bound to a specific upstream adapter.
 
     Every adapter method is synchronous and blocking (the Nous adapter takes the 15s cross-process
@@ -132,15 +179,41 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
     the single loop and every other in-flight streaming completion.
     """
     _require_aiohttp()
+    if adapter.requires_client_auth and not client_auth_token:
+        raise RuntimeError(f"{adapter.display_name} proxy requires client authentication.")
     app = web.Application(client_max_size=MAX_REQUEST_BYTES)
     # AppKey: forward-compat with aiohttp versions that strip bare-string keys.
     app[web.AppKey("adapter", UpstreamAdapter)] = adapter
 
+    def _client_is_authorized(request: "web.Request") -> bool:
+        if client_auth_token is None:
+            return True
+        authorization = request.headers.get("Authorization", "")
+        scheme, separator, supplied = authorization.partition(" ")
+        supplied = supplied.strip()
+        if not separator or scheme.lower() != "bearer" or not supplied:
+            return False
+        return hmac.compare_digest(
+            supplied.encode("utf-8"),
+            client_auth_token.encode("utf-8"),
+        )
+
+    def _client_auth_error() -> "web.Response":
+        return _json_error(
+            401,
+            "A valid proxy bearer token is required.",
+            code="proxy_auth_failed",
+        )
+
     async def handle_health(request: "web.Request") -> "web.Response":
+        if not _client_is_authorized(request):
+            return _client_auth_error()
         authenticated = await asyncio.to_thread(adapter.is_authenticated)
         return web.json_response({"status": "ok", "upstream": adapter.display_name, "authenticated": authenticated})
 
     async def handle_proxy(request: "web.Request") -> "web.StreamResponse":
+        if not _client_is_authorized(request):
+            return _client_auth_error()
         rel_path = "/" + request.match_info.get("tail", "").lstrip("/")
         if rel_path not in adapter.allowed_paths:
             allowed = ", ".join(sorted(adapter.allowed_paths))
@@ -150,12 +223,13 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         try:
             cred = await asyncio.to_thread(adapter.get_credential)
         except Exception as exc:
-            logger.warning("proxy: credential resolution failed: %s", exc)
-            return _json_error(401, str(exc), code="upstream_auth_failed")
+            message = "Codex OAuth credentials need attention." if adapter.requires_client_auth else str(exc)
+            logger.warning("proxy: credential resolution failed: %s", message)
+            return _json_error(401, message, code="upstream_auth_failed")
         # Body read into memory once (chat/embeddings payloads are small); switch to streaming
         # if large multipart uploads ever need forwarding.
         body = await request.read()
-        session, upstream_resp = await _open_upstream(request, rel_path, body, cred)
+        session, upstream_resp = await _open_upstream(request, rel_path, body, cred, adapter)
         if upstream_resp is None:
             return session
         if upstream_resp.status in {401, 429}:
@@ -166,15 +240,16 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                     adapter.get_retry_credential, failed_credential=cred, status_code=upstream_resp.status
                 )
             except Exception as exc:
-                logger.warning("proxy: retry credential resolution failed: %s", exc)
+                message = "Codex OAuth retry failed." if adapter.requires_client_auth else str(exc)
+                logger.warning("proxy: retry credential resolution failed: %s", message)
                 retry_cred = None
             if retry_cred is not None:
                 upstream_resp.release()
                 await session.close()
-                session, upstream_resp = await _open_upstream(request, rel_path, body, retry_cred)
+                session, upstream_resp = await _open_upstream(request, rel_path, body, retry_cred, adapter)
                 if upstream_resp is None:
                     return session
-        return await _stream_back(request, session, upstream_resp)
+        return await _stream_back(request, session, upstream_resp, normalize_sse_done=adapter.normalize_sse_done)
 
     app.router.add_get("/health", handle_health)  # never goes upstream
     app.router.add_route("*", "/v1/{tail:.*}", handle_proxy)  # forwards if the path is allowed
@@ -186,10 +261,14 @@ async def run_server(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     shutdown_event: Optional[asyncio.Event] = None,
+    *,
+    client_auth_token: Optional[str] = None,
 ) -> None:
     """Run the proxy in the current event loop until shutdown_event is set."""
     _require_aiohttp()
-    app = create_app(adapter)
+    if adapter.loopback_only and not is_loopback_host(host):
+        raise RuntimeError(f"{adapter.display_name} proxy is loopback-only; refusing bind host {host!r}.")
+    app = create_app(adapter, client_auth_token=client_auth_token)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, host=host, port=port)

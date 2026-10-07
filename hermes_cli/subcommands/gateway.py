@@ -177,16 +177,18 @@ def build_gateway_parser(
         "proxy", help="Local OpenAI-compatible proxy to OAuth providers",
         description="Run a local HTTP server that forwards OpenAI-compatible requests "
             "to an OAuth-authenticated provider (e.g. Nous Portal). External "
-            "apps can point at the proxy with any bearer token; the proxy "
+            "apps use a local bearer (required for Codex); the proxy "
             "attaches your real credentials.")
     proxy_subparsers = proxy_parser.add_subparsers(dest="proxy_command")
 
     proxy_start = proxy_subparsers.add_parser("start", help="Run the proxy in the foreground")
     proxy_start.add_argument("--provider", default="nous",
-        help="Upstream provider: nous or xai (default: nous). See `hermes proxy providers`.")
+        help="Upstream provider: openai-codex (alias codex), nous or xai (default: nous). See `hermes proxy providers`.")
     proxy_start.add_argument("--host", default=None,
-        help="Bind address (default: 127.0.0.1). Use 0.0.0.0 to expose on LAN.")
+        help="Bind address (default: 127.0.0.1). Codex refuses non-loopback addresses.")
     proxy_start.add_argument("--port", type=int, default=None, help="Bind port (default: 8645)")
+
+    proxy_start.add_argument("--auth-token-file", help="Owner-only bearer token file (required for Codex).")
 
     proxy_subparsers.add_parser("status", help="Show which proxy upstreams are ready")
     proxy_subparsers.add_parser("providers", help="List available proxy upstream providers")

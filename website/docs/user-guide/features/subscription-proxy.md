@@ -18,7 +18,7 @@ This is different from the [API server](./api-server.md):
 |---|---|---|
 | What it serves | Your agent (full toolset, memory, skills) | Raw model inference |
 | Use case | "Use Hermes as a chat backend" | "Use my Portal sub from another app" |
-| Auth | Your `API_SERVER_KEY` | Any bearer (proxy attaches the real one) |
+| Auth | Your `API_SERVER_KEY` | Codex: required local bearer; Nous/xAI: optional |
 | Tool calls | Yes — the agent runs tools | No — passthrough only |
 
 Use the API server when you want the **agent** as a backend. Use the
@@ -72,9 +72,39 @@ automatically when the bearer approaches expiry.
 hermes proxy providers
 ```
 
-Currently shipped: `nous` (Nous Portal) and `xai` (xAI / Grok). More
+Currently shipped: `openai-codex` (alias `codex`), `nous` (Nous Portal), and `xai` (xAI / Grok). More
 OAuth providers can be added by implementing the `UpstreamAdapter`
 interface in `hermes_cli/proxy/adapters/`.
+
+## OpenAI Codex OAuth
+
+Authenticate with `hermes auth add openai-codex --type oauth`, then start:
+
+```bash
+umask 077
+python -c "import secrets; from pathlib import Path; Path('proxy-token').write_text(secrets.token_urlsafe(32))"
+hermes proxy start --provider openai-codex --auth-token-file ./proxy-token
+```
+
+`codex` is an alias for `openai-codex`. Set your Responses client's base URL
+to `http://127.0.0.1:8645/v1` and its API key to the file's token, **not** your
+OAuth credential. The token file must be an owner-only regular file (0600 on
+POSIX; current-user/SYSTEM-only DACL on Windows). Symlinks, permissive files,
+empty tokens, whitespace-containing tokens, and files over 4096 characters
+are refused.
+
+Codex refuses non-loopback binds, even with client authentication. `/health`
+and `/v1/*` require the local bearer before OAuth lookup or upstream contact.
+Only `/v1/responses` and `/v1/models` are forwarded to the trusted ChatGPT
+Codex endpoint. Request bytes, encoded queries, Responses SSE, and strict
+JSON Schema `text.format` are preserved. Clients must use the upstream
+Responses contract, including `store: false` and streaming where required;
+this is not a chat-completions translation layer.
+
+Hermes uses its current-profile credential pool and refresh path. Authorization,
+identity, account, and residency headers are adapter-owned and cannot be
+spoofed by callers. Nous/xAI retain their existing behavior; optionally protect
+them too with `--auth-token-file`.
 
 ## Check status
 
@@ -169,7 +199,7 @@ hermes proxy start --host 0.0.0.0 --port 8645
 ```
 
 ⚠ **Be aware:** anyone on your network can now use your Portal
-subscription. The proxy has no auth of its own — it accepts any bearer.
+subscription. Without `--auth-token-file`, Nous/xAI accept any bearer. Codex refuses LAN exposure.
 Use a firewall, VPN, or reverse proxy with proper auth if you expose
 this beyond your trusted network.
 
