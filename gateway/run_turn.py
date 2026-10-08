@@ -3472,6 +3472,11 @@ class GatewayTurnMixin:
             try:
                 return run_sync()
             finally:
+                _finished_agent = agent_holder[0] if agent_holder else None
+                release_engine = getattr(_finished_agent, "_release_context_engine_claim", None)
+                if callable(release_engine):
+                    with suppress(Exception):
+                        release_engine()
                 worker.worker_done.set()
                 # `.turn.agent` stays reachable until the *next* turn is claimed; clearing the
                 # ownership markers now means a /stop on the finished turn no longer reaps background
@@ -3480,7 +3485,6 @@ class GatewayTurnMixin:
                 # *next* turn is claimed (see _session_state(...).turn.agent = ... at claim time), so a
                 # stale reference to this exact agent instance stays reachable from
                 # _interrupt_and_clear_session() until then. See #76115.
-                _finished_agent = agent_holder[0] if agent_holder else None
                 if _finished_agent is not None:
                     _finished_agent._gateway_turn_process_task_id = ""
                     _finished_agent._gateway_turn_process_baseline = frozenset()

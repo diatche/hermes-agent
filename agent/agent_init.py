@@ -1922,6 +1922,13 @@ def _compressor_max_tokens(agent):
 
 
 def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
+    # Cache eviction may race the short resolve→turn-promotion window. Initialize
+    # the claim lock before publishing any engine object so close and turn pins
+    # always serialize on the same lock.
+    agent._context_engine_lifecycle_lock = threading.Lock()
+    agent._context_engine_turn_claims = 0
+    agent._context_engine_close_pending = False
+    agent._context_engine_closed = False
     _selected_engine = _select_context_engine(_agent_cfg)
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine

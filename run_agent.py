@@ -976,12 +976,47 @@ class AIAgent(
         # from the cache and a rebuilt agent spawns its own child, so an unclosed one leaks for the gateway's life.
         _quietly(self._close_codex_session)
 
+    def _context_engine_claim_lock(self) -> threading.Lock:
+        """Return the lazy lock protecting turn claims and deferred close."""
+        lock = getattr(self, "_context_engine_lifecycle_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._context_engine_lifecycle_lock = lock
+        return lock
+
+    def _claim_context_engine(self) -> None:
+        """Pin this agent's context-engine clone for one gateway turn."""
+        with self._context_engine_claim_lock():
+            if getattr(self, "_context_engine_closed", False):
+                raise RuntimeError("context engine is already closed")
+            self._context_engine_turn_claims = getattr(self, "_context_engine_turn_claims", 0) + 1
+
+    def _release_context_engine_claim(self) -> None:
+        """Release one turn pin and perform a close deferred by cache eviction."""
+        engine = None
+        with self._context_engine_claim_lock():
+            claims = max(0, getattr(self, "_context_engine_turn_claims", 0) - 1)
+            self._context_engine_turn_claims = claims
+            if claims == 0 and getattr(self, "_context_engine_close_pending", False):
+                self._context_engine_close_pending = False
+                if not getattr(self, "_context_engine_closed", False):
+                    self._context_engine_closed = True
+                    engine = getattr(self, "context_compressor", None)
+        close = getattr(engine, "close", None)
+        if callable(close):
+            close()
+
     def _close_context_engine(self) -> None:
-        """Close this AIAgent's context-engine clone once."""
-        if getattr(self, "_context_engine_closed", False):
-            return
-        self._context_engine_closed = True
-        engine = getattr(self, "context_compressor", None)
+        """Close this clone once, deferring while a gateway turn still owns it."""
+        engine = None
+        with self._context_engine_claim_lock():
+            if getattr(self, "_context_engine_closed", False):
+                return
+            if getattr(self, "_context_engine_turn_claims", 0) > 0:
+                self._context_engine_close_pending = True
+                return
+            self._context_engine_closed = True
+            engine = getattr(self, "context_compressor", None)
         close = getattr(engine, "close", None)
         if callable(close):
             close()

@@ -1432,6 +1432,14 @@ class TurnRunner:
                     cache[ctx.session_key] = (agent, sig, msg_count, ctx.session_id)
                     runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, sig)
+        # Pin the clone before returning it to turn wiring. Cache invalidation and
+        # idle/pressure eviction release on background threads; without this
+        # claim they can close SQLite-backed engines in the resolve→promotion
+        # window while this turn is already committed to using the agent.
+        claim_engine = getattr(agent, "_claim_context_engine", None)
+        if callable(claim_engine):
+            claim_engine()
+        ctx.agent_holder[0] = agent
         return agent, found.reused
 
     # ── per-turn agent wiring ───────────────────────────────────────────────────────────────

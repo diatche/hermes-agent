@@ -580,6 +580,30 @@ class TestAgentCacheIdleResume:
         agent.release_clients.assert_called_once_with()
         agent._close_context_engine.assert_called_once_with()
 
+    def test_context_engine_close_waits_for_inflight_turn_claim(self):
+        """Cache eviction must not close an engine while compression still uses it."""
+        from run_agent import AIAgent
+
+        engine = MagicMock()
+        agent = object.__new__(AIAgent)
+        agent.context_compressor = engine
+
+        agent._claim_context_engine()
+        agent._close_context_engine()
+
+        engine.close.assert_not_called()
+        assert agent._context_engine_close_pending is True
+
+        agent._release_context_engine_claim()
+
+        engine.close.assert_called_once_with()
+        assert agent._context_engine_closed is True
+
+        # Both paths are idempotent after the deferred close is fulfilled.
+        agent._release_context_engine_claim()
+        agent._close_context_engine()
+        engine.close.assert_called_once_with()
+
     def test_close_vs_release_full_teardown_difference(self, monkeypatch):
         """close() tears down task state; release_clients() does not.
 
