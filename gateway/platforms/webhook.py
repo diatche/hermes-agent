@@ -605,8 +605,18 @@ class WebhookAdapter(BasePlatformAdapter):
             if script:
                 # Shells out (up to its timeout) — worker thread so the loop isn't blocked; to_thread
                 # copies contextvars so the profile scope follows.
-                keep, transformed_payload = await asyncio.to_thread(
-                    self._route_processor.run_route_script, script, payload)
+                try:
+                    keep, transformed_payload = await asyncio.to_thread(
+                        self._route_processor.run_route_script, script, payload)
+                    if type(keep) is not bool or (keep and not isinstance(transformed_payload, dict)) or (
+                            not keep and transformed_payload is not None):
+                        raise ValueError("Invalid script result")
+                except Exception as exc:
+                    # No verdict was reached. Do not consume the delivery ID or leak
+                    # processor output/exception text; queueing producers must retry.
+                    logger.warning("[webhook] script failed route=%s error_type=%s", route_name, type(exc).__name__)
+                    return web.json_response({"status": "error", "reason": "script_failed", "route": route_name},
+                                             status=503)
                 if not keep:
                     logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
                     return web.json_response({"status": "ignored", "reason": "script", "route": route_name})

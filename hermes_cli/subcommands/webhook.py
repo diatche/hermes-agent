@@ -44,8 +44,8 @@ def build_webhook_parser(subparsers, *, cmd_webhook: Callable) -> None:
     wh_sub.add_argument(
         "--script", default="",
         help="Filter/transform script under ~/.hermes/scripts/. The route "
-        "payload is passed as JSON on stdin; empty stdout, [SILENT], or a "
-        "nonzero exit code ignores the webhook.")
+        "payload is passed as JSON on stdin; exit-zero empty stdout or [SILENT] "
+        "ignores the webhook. Execution failures return HTTP 503 for retry.")
     wh_sub.add_argument(
         "--cron-job", default="",
         help="Fire an existing cron job (by ID or name) when this route receives an event, instead of "

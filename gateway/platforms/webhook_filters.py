@@ -169,13 +169,13 @@ class WebhookRouteProcessor:
     def run_route_script(self, script_value: Any, payload: dict) -> tuple[bool, Optional[dict]]:
         """Run a route script and return (should_continue, transformed_payload).
 
-        Non-zero exit, empty/``[SILENT]`` stdout, or a ``[SILENT]``/``__hermes_ignore__`` flag drops the
-        webhook; JSON-object stdout replaces the payload, other text is attached as ``script_output``.
+        Only exit-zero empty/``[SILENT]`` stdout or a ``[SILENT]``/``__hermes_ignore__`` flag drops the
+        webhook. Execution failures raise so the HTTP caller can request a retry. JSON-object stdout
+        replaces the payload; other text is attached as ``script_output``.
         """
         path, error = _resolve_script_path(script_value)
         if error or path is None:
-            logger.warning("[webhook] script ignored webhook: %s", error)
-            return False, None
+            raise RuntimeError("Route script unavailable")
         is_shell = path.suffix.lower() in {".sh", ".bash"}
         interpreter = sys.executable
         if is_shell:
@@ -184,9 +184,8 @@ class WebhookRouteProcessor:
             from tools.environments.local import _find_bash
             try:
                 interpreter = _find_bash()
-            except RuntimeError as exc:
-                logger.warning("[webhook] script ignored webhook: %s", exc)
-                return False, None
+            except RuntimeError:
+                raise RuntimeError("Route script interpreter unavailable") from None
         try:
             from tools.environments.local import build_subprocess_env
             popen_kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
@@ -195,31 +194,26 @@ class WebhookRouteProcessor:
                 timeout=self.script_timeout_seconds, cwd=str(path.parent), env=build_subprocess_env(), **popen_kwargs,
             )
         except subprocess.TimeoutExpired:
-            logger.warning("[webhook] script timed out: %s", path)
-            return False, None
-        except Exception as exc:
-            logger.warning("[webhook] script execution failed: %s", exc)
-            return False, None
+            raise RuntimeError("Route script timed out") from None
+        except Exception:
+            raise RuntimeError("Route script execution failed") from None
         stdout, stderr = (result.stdout or "").strip(), (result.stderr or "").strip()
         try:
             from agent.redact import redact_sensitive_text
             stdout, stderr = redact_sensitive_text(stdout), redact_sensitive_text(stderr)
-        except Exception as exc:
-            logger.warning("[webhook] Failed to redact script output: %s", exc)
-            stdout = stderr = "[REDACTED - redaction failed]"
+        except Exception:
+            raise RuntimeError("Route script output redaction failed") from None
         if result.returncode != 0:
-            # A veto normally says why; rc!=0 with NO output at all is the "interpreter never
-            # started" signature (WSL stub, missing shebang target) and must reach errors.log.
-            level = logging.WARNING if not stdout and not stderr else logging.INFO
-            logger.log(level, "[webhook] script ignored webhook path=%s code=%s stderr=%s", path.name, result.returncode, stderr[:200])
-        if result.returncode != 0 or not stdout or stdout == "[SILENT]":
+            # Stderr can contain secrets even after best-effort redaction. Log only metadata.
+            logger.warning("[webhook] script failed path=%s code=%s", path.name, result.returncode)
+            raise RuntimeError("Route script exited unsuccessfully")
+        if not stdout or stdout == "[SILENT]":
             return False, None
         try:
             transformed = json.loads(stdout)
         except json.JSONDecodeError:
             transformed = {**payload, "script_output": stdout}
         if not isinstance(transformed, dict):
-            logger.warning("[webhook] script stdout must be a JSON object or text")
-            return False, None
+            raise RuntimeError("Route script stdout must be a JSON object or text")
         silenced = transformed.get("[SILENT]") is True or transformed.get("__hermes_ignore__") is True
         return (False, None) if silenced else (True, transformed)

@@ -1,4 +1,4 @@
-"""Webhook filter scripts run under the Git-Bash-safe interpreter and log silent failures."""
+"""Webhook filter scripts use the Git-Bash-safe interpreter; failures raise for HTTP retry."""
 import logging
 import stat
 
@@ -40,14 +40,14 @@ def test_shell_filter_runs_under_find_bash_interpreter(tmp_path, monkeypatch):
 
 @pytest.mark.linux_only  # POSIX shebang fixture; the Windows half is the wine2e receipt
 def test_silent_nonzero_exit_is_logged_as_warning(tmp_path, monkeypatch, caplog):
-    """rc!=0 with no stdout AND no stderr is the interpreter-never-ran signature: WARNING, not INFO."""
+    """A silent nonzero exit is a failure, not a veto, and reaches warning-level logs."""
     fake = _fake_bash(tmp_path, "exit 1\n")
     monkeypatch.setattr(local, "_find_bash", lambda: str(fake))
     filt = _filter_script("")
 
     with caplog.at_level(logging.INFO, logger="gateway.platforms.webhook_filters"):
-        accepted, _ = WebhookRouteProcessor().run_route_script(str(filt), {})
+        with pytest.raises(RuntimeError):
+            WebhookRouteProcessor().run_route_script(str(filt), {})
 
-    assert accepted is False
-    silent = [r for r in caplog.records if "script ignored webhook path=filter.sh" in r.getMessage()]
+    silent = [r for r in caplog.records if "script failed path=filter.sh" in r.getMessage()]
     assert silent and silent[0].levelno == logging.WARNING
