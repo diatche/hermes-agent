@@ -1345,11 +1345,32 @@ class TurnRunner:
                 )
             else:
                 out.agent = cached[0]
+                claim_engine = getattr(out.agent, "_claim_context_engine", None)
+                try:
+                    if callable(claim_engine):
+                        claim_engine()
+                except RuntimeError:
+                    logger.info(
+                        "Agent cache invalidated for session %s: cached context engine is closed",
+                        ctx.session_key,
+                    )
+                    out.agent = None
+                    out.evicted = self._pop_cached_agent_for_eviction()
+                    return out
                 # Refresh LRU order so cap enforcement evicts truly-oldest entries.
                 if hasattr(cache, "move_to_end"):
                     with suppress(KeyError):
                         cache.move_to_end(ctx.session_key)
-                self._runner._init_cached_agent_for_turn(out.agent, ctx._interrupt_depth)
+                try:
+                    self._runner._init_cached_agent_for_turn(out.agent, ctx._interrupt_depth)
+                except BaseException:
+                    # The turn never takes ownership when cached-agent setup fails, so do not
+                    # strand a claim that would defer terminal engine cleanup indefinitely.
+                    release_engine = getattr(out.agent, "_release_context_engine_claim", None)
+                    if callable(release_engine):
+                        with suppress(Exception):
+                            release_engine()
+                    raise
                 # Cached agent may have been created with old config.
                 out.agent.max_iterations = max_iterations
                 logger.debug("Reusing cached agent for session %s", ctx.session_key)
@@ -1427,18 +1448,18 @@ class TurnRunner:
             )
             if cache_lock and cache is not None:
                 with cache_lock:
+                    claim_engine = getattr(agent, "_claim_context_engine", None)
+                    if callable(claim_engine):
+                        claim_engine()
                     # Record the snapshot's session_id with message_count so the cross-process guard
                     # can skip the meaningless count comparison if the active session_id switches.
                     cache[ctx.session_key] = (agent, sig, msg_count, ctx.session_id)
                     runner._enforce_agent_cache_cap()
+            else:
+                claim_engine = getattr(agent, "_claim_context_engine", None)
+                if callable(claim_engine):
+                    claim_engine()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, sig)
-        # Pin the clone before returning it to turn wiring. Cache invalidation and
-        # idle/pressure eviction release on background threads; without this
-        # claim they can close SQLite-backed engines in the resolve→promotion
-        # window while this turn is already committed to using the agent.
-        claim_engine = getattr(agent, "_claim_context_engine", None)
-        if callable(claim_engine):
-            claim_engine()
         ctx.agent_holder[0] = agent
         return agent, found.reused
 

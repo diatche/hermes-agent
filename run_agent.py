@@ -987,7 +987,9 @@ class AIAgent(
     def _claim_context_engine(self) -> None:
         """Pin this agent's context-engine clone for one gateway turn."""
         with self._context_engine_claim_lock():
-            if getattr(self, "_context_engine_closed", False):
+            engine = getattr(self, "context_compressor", None)
+            if getattr(self, "_context_engine_closed", False) or getattr(engine, "closed", False) is True:
+                self._context_engine_closed = True
                 raise RuntimeError("context engine is already closed")
             self._context_engine_turn_claims = getattr(self, "_context_engine_turn_claims", 0) + 1
 

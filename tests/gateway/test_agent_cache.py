@@ -10,6 +10,7 @@ Verifies that the agent cache correctly:
 """
 
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -603,6 +604,69 @@ class TestAgentCacheIdleResume:
         agent._release_context_engine_claim()
         agent._close_context_engine()
         engine.close.assert_called_once_with()
+
+    def test_cached_agent_with_closed_engine_is_rebuilt_before_turn(self):
+        """A retired plugin engine must never survive cache reuse into preflight compression."""
+        from gateway.run_turn_runner import TurnRunner
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        agent.context_compressor = SimpleNamespace(closed=True)
+        runner = _make_runner()
+        runner._agent_cache["shopping"] = (agent, "sig", 3, "session-1")
+        ctx = SimpleNamespace(session_key="shopping", session_id="session-1")
+
+        found = TurnRunner(runner, ctx)._lookup_cached_agent(
+            "sig", runner._agent_cache_lock, runner._agent_cache,
+            100, "session-1", False, 3,
+        )
+
+        assert found.agent is None
+        assert found.evicted is agent
+        assert "shopping" not in runner._agent_cache
+        assert getattr(agent, "_context_engine_turn_claims", 0) == 0
+
+    def test_cached_agent_claim_is_atomic_with_cache_lookup(self):
+        """Idle eviction cannot pop and close an agent between lookup and its turn claim."""
+        from gateway.run_turn_runner import TurnRunner
+
+        runner = _make_runner()
+        agent = MagicMock()
+        agent._claim_context_engine.side_effect = lambda: (
+            None if runner._agent_cache_lock.locked()
+            else (_ for _ in ()).throw(AssertionError("claim escaped cache lock"))
+        )
+        runner._agent_cache["shopping"] = (agent, "sig", 3, "session-1")
+        runner._init_cached_agent_for_turn = MagicMock()
+        ctx = SimpleNamespace(session_key="shopping", session_id="session-1", _interrupt_depth=0)
+
+        found = TurnRunner(runner, ctx)._lookup_cached_agent(
+            "sig", runner._agent_cache_lock, runner._agent_cache,
+            100, "session-1", False, 3,
+        )
+
+        assert found.agent is agent
+        assert found.reused is True
+        agent._claim_context_engine.assert_called_once_with()
+
+    def test_cached_agent_setup_failure_releases_atomic_claim(self):
+        """A setup exception before turn ownership must not strand the cache-lock claim."""
+        from gateway.run_turn_runner import TurnRunner
+
+        runner = _make_runner()
+        agent = MagicMock()
+        runner._agent_cache["shopping"] = (agent, "sig", 3, "session-1")
+        runner._init_cached_agent_for_turn = MagicMock(side_effect=ValueError("setup failed"))
+        ctx = SimpleNamespace(session_key="shopping", session_id="session-1", _interrupt_depth=0)
+
+        with pytest.raises(ValueError, match="setup failed"):
+            TurnRunner(runner, ctx)._lookup_cached_agent(
+                "sig", runner._agent_cache_lock, runner._agent_cache,
+                100, "session-1", False, 3,
+            )
+
+        agent._claim_context_engine.assert_called_once_with()
+        agent._release_context_engine_claim.assert_called_once_with()
 
     def test_close_vs_release_full_teardown_difference(self, monkeypatch):
         """close() tears down task state; release_clients() does not.
