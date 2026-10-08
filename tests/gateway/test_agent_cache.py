@@ -506,6 +506,33 @@ class TestAgentCacheSpilloverLive:
             except Exception:
                 pass
 
+    def test_admitted_engine_claim_blocks_cap_and_idle_eviction(self, monkeypatch):
+        """An atomic turn claim remains authoritative before running bookkeeping catches up."""
+        import time as _t
+        from gateway import run as gw_run
+
+        monkeypatch.setattr(gw_run, "_AGENT_CACHE_MAX_SIZE", 1)
+        monkeypatch.setattr(gw_run, "_AGENT_CACHE_IDLE_TTL_SECS", 0.01)
+        runner = self._runner()
+        claimed = self._real_agent()
+        newer = self._real_agent()
+        claimed._last_activity_ts = _t.time() - 10.0
+        claimed._claim_context_engine()
+        try:
+            # Deliberately leave _running_agents empty: this is the admission
+            # window that the old pre-lock snapshot failed to protect.
+            runner._agent_cache["claimed"] = (claimed, "sig")
+            runner._agent_cache["newer"] = (newer, "sig")
+            with runner._agent_cache_lock:
+                runner._enforce_agent_cache_cap()
+            assert "claimed" in runner._agent_cache
+            assert runner._sweep_idle_cached_agents() == 1
+            assert "claimed" in runner._agent_cache
+        finally:
+            claimed._release_context_engine_claim()
+            claimed.close()
+            newer.close()
+
 
 class TestAgentCacheIdleResume:
     """End-to-end: idle-TTL-evicted session resumes cleanly with task state.

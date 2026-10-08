@@ -993,6 +993,11 @@ class AIAgent(
                 raise RuntimeError("context engine is already closed")
             self._context_engine_turn_claims = getattr(self, "_context_engine_turn_claims", 0) + 1
 
+    def _context_engine_is_claimed(self) -> bool:
+        """Return whether a gateway turn currently owns this engine clone."""
+        with self._context_engine_claim_lock():
+            return getattr(self, "_context_engine_turn_claims", 0) > 0
+
     def _release_context_engine_claim(self) -> None:
         """Release one turn pin and perform a close deferred by cache eviction."""
         engine = None

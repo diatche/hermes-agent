@@ -42,6 +42,14 @@ def _tuple_agent(entry: Any) -> Any:
     return entry[0] if isinstance(entry, tuple) and entry else None
 
 
+def _context_engine_claimed(agent: Any) -> bool:
+    """Whether cache eviction must preserve ``agent`` for an admitted turn."""
+    # Inspect the type to avoid MagicMock/dynamic ``__getattr__`` inventing a
+    # claim method for test doubles or third-party agents.
+    check = getattr(type(agent), "_context_engine_is_claimed", None)
+    return bool(check(agent)) if callable(check) else False
+
+
 class GatewayAgentCacheMixin:
     """Agent cache, session model overrides, turn leases, run generations and conversation-scope reset for GatewayRunner."""
 
@@ -872,15 +880,23 @@ class GatewayAgentCacheMixin:
         rss_mb = read_anon_rss_mb()
         if rss_mb is None or rss_mb < bounds.memory_high_mb:
             return 0
-        running_ids = self._running_agent_ids()
-
-        def _is_live(agent: Any) -> bool:
-            return agent is not None and agent is not _AGENT_PENDING_SENTINEL and id(agent) not in running_ids
-
-        def _is_evictable(key: str, agent: Any) -> bool:
-            return _is_live(agent) and transcript_persistence_caught_up(agent)
-
         with _lock:
+            # Take the running snapshot only after acquiring the same cache lock
+            # used by turn admission. The engine claim is the final authority:
+            # it closes the residual race where bookkeeping has not caught up.
+            running_ids = self._running_agent_ids()
+
+            def _is_live(agent: Any) -> bool:
+                return (
+                    agent is not None
+                    and agent is not _AGENT_PENDING_SENTINEL
+                    and id(agent) not in running_ids
+                    and not _context_engine_claimed(agent)
+                )
+
+            def _is_evictable(key: str, agent: Any) -> bool:
+                return _is_live(agent) and transcript_persistence_caught_up(agent)
+
             ordered = [(key, _first_agent(entry)) for key, entry in _cache.items()]
             plan = plan_pressure_evictions(
                 ordered, is_evictable=_is_evictable, max_evictions=bounds.max_evictions_per_pass,
@@ -953,7 +969,11 @@ class GatewayAgentCacheMixin:
         # history) to protect a long-running one. Cache may stay over cap until the next insert.
         cap = self._agent_cache_cap()
         candidates = [(key, _tuple_agent(_cache.get(key))) for key in list(_cache.keys())[:max(0, len(_cache) - cap)]]
-        evict_plan = [(key, agent) for key, agent in candidates if agent is None or id(agent) not in running_ids]
+        evict_plan = [
+            (key, agent)
+            for key, agent in candidates
+            if agent is None or (id(agent) not in running_ids and not _context_engine_claimed(agent))
+        ]
         for key, _ in evict_plan:
             _cache.pop(key, None)
         remaining_over_cap = len(_cache) - cap
@@ -981,11 +1001,11 @@ class GatewayAgentCacheMixin:
         now = time.time()
         idle_ttl = self._agent_cache_idle_ttl()
         to_evict: List[tuple] = []
-        running_ids = self._running_agent_ids()
         with _lock:
+            running_ids = self._running_agent_ids()
             for key, entry in list(_cache.items()):
                 agent = _tuple_agent(entry)
-                if agent is None or id(agent) in running_ids:
+                if agent is None or id(agent) in running_ids or _context_engine_claimed(agent):
                     continue  # mid-turn — don't tear it down
                 last_activity = getattr(agent, "_last_activity_ts", None)
                 if last_activity is None or (now - last_activity) <= idle_ttl:
