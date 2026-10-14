@@ -294,13 +294,17 @@ def _jobs_lock():
         # stamps from unlocked loads or prior sections can never suppress a needed merge.
         # See #80703.
         _jobs_lock_state.load_stamp = None
+        _jobs_lock_state.cross_process_path = None
         lock_fd = None
         try:
             try:
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8")
                 lock_fd.seek(0)
-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
+                if acquired is True:
+                    _jobs_lock_state.cross_process_path = _jobs_lock_file()
+                if acquired is False:
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
@@ -322,6 +326,7 @@ def _jobs_lock():
         finally:
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
+            _jobs_lock_state.cross_process_path = None
 
 
 @contextlib.contextmanager
@@ -1332,8 +1337,8 @@ def _parse_jobs_file(jobs_file: Path) -> Tuple[Any, bool]:
         return json.loads(raw, strict=False), True
 
 
-def load_jobs() -> List[Dict[str, Any]]:
-    """Load all jobs from storage."""
+def load_jobs(*, repair: bool = True) -> List[Dict[str, Any]]:
+    """Load raw stored records; ``repair=False`` suppresses auto-repair writes."""
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Stamp BEFORE reading (fail-safe, see _record_load_stamp): a racing write then forces the
@@ -1354,7 +1359,7 @@ def load_jobs() -> List[Dict[str, Any]]:
 
     # Accept the canonical dict, or a bare list (auto-repair); any other top-level shape is
     # corruption.
-    repair = "had invalid control characters" if _strict_retry else None
+    repair_reason = "had invalid control characters" if _strict_retry else None
     if isinstance(data, dict):
         jobs = data.get("jobs", [])
         if isinstance(jobs, dict):
@@ -1367,16 +1372,16 @@ def load_jobs() -> List[Dict[str, Any]]:
                     len(skipped), "y" if len(skipped) == 1 else "ies",
                     ", ".join(map(repr, skipped)))
             jobs = [{**v, "id": v.get("id") or k} for k, v in jobs.items() if isinstance(v, dict)]
-            repair = "id-keyed jobs map flattened to list"
+            repair_reason = "id-keyed jobs map flattened to list"
     elif isinstance(data, list):
         jobs = data
-        repair = "bare list wrapped as dict"
+        repair_reason = "bare list wrapped as dict"
     else:
         raise RuntimeError(
             f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}")
-    if jobs and repair:
+    if jobs and repair and repair_reason:
         save_jobs(jobs)
-        logger.warning("Auto-repaired jobs.json (%s)", repair)
+        logger.warning("Auto-repaired jobs.json (%s)", repair_reason)
     _record_load_stamp(pre_read_stamp)
     return jobs
 
@@ -2022,8 +2027,27 @@ def _fill_missing_next_run(updated: Dict[str, Any]) -> None:
     updated["next_run_at"] = next_run
 
 
-def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Update a job by ID, refreshing derived schedule fields when needed."""
+class JobUpdateConflict(RuntimeError):
+    """A conditional update found a changed or deleted raw record; no store write occurred."""
+
+    def __init__(self, job_id: str, current_job: Optional[Dict[str, Any]]):
+        self.job_id = job_id
+        self.current_job = copy.deepcopy(current_job)
+        super().__init__(f"Cron job '{job_id}' changed or was removed; reload before updating.")
+
+
+def update_job(
+    job_id: str, updates: Dict[str, Any], *, expected_job: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Update a job by ID, refreshing derived schedule fields when needed.
+
+    With ``expected_job``, compare the entire raw record from ``load_jobs(repair=False)``
+    under the store lock before applying updates. Sorted JSON equality ignores object key
+    order, but preserves missing/null fields, array order and JSON scalar representations.
+    A changed/deleted record raises ``JobUpdateConflict`` without writing (even repairs).
+    Cross-process locking must be available, otherwise raise ``RuntimeError``. Without
+    ``expected_job``, the existing unconditional update/missing-job behavior is unchanged.
+    """
     # ``id`` is a path component under OUTPUT_DIR — changing it would leak path-escape values.
     bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
     if bad_fields:
@@ -2061,7 +2085,22 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         save_jobs(jobs)
         return _normalize_job_record(updated)
 
-    return _with_job(job_id, apply)
+    if expected_job is None:
+        return _with_job(job_id, apply)
+
+    expected_json = json.dumps(expected_job, sort_keys=True, allow_nan=False)
+    with _jobs_lock():
+        # Ordinary writes can degrade to in-process locking; compare-and-update cannot.
+        # Also reject a nested call scoped to a different home than the held lock.
+        if getattr(_jobs_lock_state, "cross_process_path", None) != _jobs_lock_file():
+            raise RuntimeError("Conditional cron update requires the store's cross-process lock")
+        stored_jobs = load_jobs(repair=False)
+        for i, job in enumerate(stored_jobs):
+            if job["id"] == job_id:
+                if json.dumps(job, sort_keys=True, allow_nan=False) != expected_json:
+                    raise JobUpdateConflict(job_id, job)
+                return apply(stored_jobs, i, job)
+        raise JobUpdateConflict(job_id, None)
 
 
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:

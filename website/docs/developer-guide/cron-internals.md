@@ -63,6 +63,89 @@ Jobs are stored in `~/.hermes/cron/jobs.json` with atomic write semantics (write
 }
 ```
 
+### Atomic conditional updates (Python API)
+
+A separate `load/check/update_job` sequence can overwrite a competing operator or
+scheduler mutation: the check is outside the store's read/write critical section.
+For reviewed maintenance changes, use the existing API's optional comparison:
+
+```python
+from cron.jobs import JobUpdateConflict, load_jobs, update_job, use_cron_store
+
+with use_cron_store(profile_home):
+    expected = next(j for j in load_jobs(repair=False) if j["id"] == job_id)
+    # Review expected before requesting the change.
+    try:
+        update_job(job_id, {"paused_reason": "reviewed reason"}, expected_job=expected)
+    except JobUpdateConflict as conflict:
+        # Reload/review; never blindly retry the old payload with a fresh baseline.
+        current = conflict.current_job  # raw detached record, or None if deleted
+```
+
+**Contract and invariants:**
+
+- `expected_job=None` (the default) preserves ordinary `update_job` behavior,
+  including `None` for a missing job. Conditional deletion/mismatch raises
+  `JobUpdateConflict`, with `job_id` and a deep-copied `current_job`.
+- Compare the **whole raw job record**, not `get_job`, `resolve_job_ref`, or
+  `list_jobs`: those normalize nullable text, skills and lifecycle state, and
+  the list view also adds execution metadata. `load_jobs(repair=False)` avoids
+  repair writes while obtaining the baseline. Supported legacy container
+  shapes are decoded as usual; comparison is of the resulting job object,
+  not the top-level container or serialized file formatting.
+- Equality is sorted-key JSON serialization (`allow_nan=False`). Object key
+  order is irrelevant; array order, missing versus null, boolean versus number,
+  integer versus float representation and exact timestamp strings matter.
+  Unknown fields also count, as do `enabled`, `state`, `paused_at`,
+  `paused_reason`, schedule fields, claims and run counters. This is state
+  equality, not a monotonic revision: an intervening change restored exactly
+  to the baseline (ABA) is not detected.
+- Read, comparison, normal update validation and save share the existing
+  per-home `.jobs.lock` critical section. A conflict never enters the save
+  path, including auto-repair, so `jobs.json` bytes, mtime and inode remain
+  untouched. Lock/directory infrastructure may still be created. An unavailable,
+  failed or timed-out cross-process lock raises `RuntimeError` for conditional
+  updates; they never use ordinary writes' degraded in-process-only mode.
+  Locks are advisory: non-cooperating direct file writers remain outside this
+  guarantee. No multi-job transaction or execution lease is introduced.
+- A successful call uses **all existing update semantics**, including field
+  normalization, immutable-field checks, terminal activation protection and
+  removal of `pending_slot` on explicit lifecycle/schedule edits. Its return
+  remains a normalized view; obtain the next baseline with `load_jobs(repair=False)`.
+  Repeating an already-applied change with the old baseline conflicts if the
+  record changed; callers can inspect the conflict record to recognize their
+  intended result without another write. Reapplying with a matching current
+  baseline is allowed; success does not promise to skip a redundant save.
+
+**Reproduction and regression coverage:** create a temporary recurring job,
+retain its raw record, pause it through `pause_job`, then attempt an update with
+that old `expected_job`. Before this facility there was no atomic public
+precondition; an unconditional update accepted the stale payload. The regression
+first failed on the base's missing conflict API, then passed with this fix:
+
+```bash
+scripts/run_tests.sh -j 2 --file-retries 0 tests/cron/test_conditional_update.py
+scripts/run_tests.sh -j 2 --file-retries 0 tests/cron/
+```
+
+The tests use real imports and temporary `HERMES_HOME` stores, prove zero-write
+conflicts (including repairable input), matching updates, useful retry/deletion
+conflicts, normalized/raw distinction, A→B→A same-ID profile isolation, and exactly
+one winner from two independent processes sharing a baseline. They also restore
+only reviewed controls on an expired retained one-shot, preserving its old
+schedule and `next_run_at`, verify ordinary `resume_job` still refuses it, and
+verify the real due scan returns no runnable job.
+
+**Operational non-goals:** this API does not authorize restoring controls, pause
+or resume any live job, replay/rearm a stale one-shot, change the 120-second grace
+window, dispatch an execution, or bypass update validation. A retained expired
+one-shot with its historical `next_run_at` can have reviewed control values
+restored without shifting that instant; ordinary resume remains intentionally
+different and rejects expired one-shots. Exact whole-record restoration is not
+promised (for example a lifecycle update discards a pending occurrence).
+No agent tool, CLI option, CRM-specific behavior, deployment or automatic retry
+is added. No upstream issue or PR was created for this change.
+
 ### `last_status` literals
 
 `last_status` is a closed set written only by `cron.jobs.mark_job_run`. Every
