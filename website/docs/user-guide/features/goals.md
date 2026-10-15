@@ -175,6 +175,8 @@ The barrier (pid- or time-based) is persisted with the goal in `SessionDB.state_
 
 Typical flow: the agent pushes a PR, starts a CI watcher with `terminal(background=true, notify_on_complete=true)`, and reports "watching CI." The judge sees the watcher process still running, returns `wait` on its pid, and the loop goes quiet — then picks back up the instant CI finishes and judges the goal against the actual result.
 
+Wait boundaries do not consume the goal's continuation-turn budget. When delegated subagents are still active, Hermes also parks deterministically until a batch returns, even if the judge says `continue` or `blocked`. This prevents status-only continuation turns and keeps a correctable child problem from being mistaken for an unachievable standing goal. A genuine block remains eligible for `blocked` once no delegated batch is in flight.
+
 ## Behavior details
 
 ### The judge

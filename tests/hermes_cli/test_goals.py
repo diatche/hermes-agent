@@ -575,7 +575,10 @@ class TestJudgeDrivenWait:
             assert decision["verdict"] == "wait"
             assert decision["should_continue"] is False
             assert decision["continuation_prompt"] is None
-            assert mgr.state.waiting_on_pid == proc.pid
+            state = mgr.state
+            assert state is not None
+            assert state.waiting_on_pid == proc.pid
+            assert state.turns_used == 0
             assert mgr.is_waiting() is True
 
             # Next turn while still parked: judge must NOT be called again.

@@ -67,3 +67,47 @@ def test_a_delegation_wait_lifts_when_a_batch_returns_not_only_when_the_timer_ru
     with patch.object(goals, "count_active_delegations", return_value=0):
         assert mgr.is_waiting() is True
     goals._DB_CACHE.clear()
+
+
+def test_active_delegations_park_a_continue_without_burning_a_goal_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes")); (tmp_path / ".hermes").mkdir()
+    goals._DB_CACHE.clear()
+    mgr = goals.GoalManager(session_id="root-continue")
+    mgr.set("integrate the delegated work")
+
+    with patch.object(
+        goals, "judge_goal",
+        return_value=("continue", "the worker is still running", False, None, False),
+    ):
+        decision = mgr.evaluate_after_turn("The worker is still running.", active_delegations=2)
+
+    assert decision["verdict"] == "wait"
+    assert decision["should_continue"] is False
+    state = mgr.state
+    assert state is not None
+    assert state.status == "active"
+    assert state.turns_used == 0
+    assert state.waiting_on_delegations == 2
+    goals._DB_CACHE.clear()
+
+
+def test_active_delegations_defer_a_blocked_verdict_instead_of_pausing(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes")); (tmp_path / ".hermes").mkdir()
+    goals._DB_CACHE.clear()
+    mgr = goals.GoalManager(session_id="root-blocked")
+    mgr.set("integrate the delegated work")
+
+    with patch.object(
+        goals, "judge_goal",
+        return_value=("blocked", "the worker needs correction", False, None, False),
+    ):
+        decision = mgr.evaluate_after_turn("The worker needs correction.", active_delegations=1)
+
+    assert decision["verdict"] == "wait"
+    assert decision["should_continue"] is False
+    state = mgr.state
+    assert state is not None
+    assert state.status == "active"
+    assert state.turns_used == 0
+    assert state.waiting_on_delegations == 1
+    goals._DB_CACHE.clear()

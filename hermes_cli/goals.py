@@ -53,6 +53,7 @@ DEFAULT_GATE_MAX_RETRIES = 3
 # Longest a pid/session wait barrier may hold the loop before judging resumes. Timed barriers
 # (``waiting_until``) carry their own deadline and are exempt.
 _MAX_BARRIER_WAIT_S = 30 * 60
+_DELEGATION_WAIT_SECONDS = 20 * 60
 # Bounded tail of a failed gate's combined stdout/stderr fed back to the agent.
 _GATE_OUTPUT_TAIL_CHARS = 3000
 
@@ -1419,9 +1420,8 @@ class GoalManager:
         return _decision("active", False, None, "waiting", reason, f"⏳ Goal parked — waiting on {tgt}: {reason}")
 
     def _apply_wait_directive(self, wait_directive: Dict[str, Any], reason: str, *, active_delegations: int = 0) -> Optional[Dict[str, Any]]:
-        """Judge said WAIT: set the barrier and park. The counted turn stands (the judge ran) but no
-        continuation fires; the loop resumes once the barrier clears. ``None`` = the barrier is
-        unobservable here, so the caller continues instead."""
+        """Judge said WAIT: set the barrier and park. ``None`` = the barrier is unobservable here,
+        so the caller continues instead."""
         if wait_directive.get("session_id"):
             tgt = f"session {self.wait_on_session(str(wait_directive['session_id']), reason=reason).waiting_on_session}"
         elif wait_directive.get("pid"):
@@ -1439,6 +1439,22 @@ class GoalManager:
             self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason, on_delegations=active_delegations)
             tgt = f"{wait_directive['seconds']}s"
         return _decision("active", False, None, "wait", reason, f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}")
+
+    def _uncharged_wait(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        """A parked boundary coordinates existing work; it is not another goal attempt."""
+        state = self._require_active()
+        state.turns_used = max(0, state.turns_used - 1)
+        self._save()
+        return decision
+
+    def _wait_for_delegations(self, count: int, reason: str) -> Dict[str, Any]:
+        count = max(1, int(count))
+        self.wait_for_seconds(_DELEGATION_WAIT_SECONDS, reason=reason, on_delegations=count)
+        noun = "batch" if count == 1 else "batches"
+        return self._uncharged_wait(_decision(
+            "active", False, None, "wait", reason,
+            f"⏳ Goal parked — waiting for {count} delegated {noun}: {reason}",
+        ))
 
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:
         return self._pause_decision(
@@ -1489,7 +1505,15 @@ class GoalManager:
         if verdict == "wait" and wait_directive:
             parked = self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
             if parked is not None:
-                return parked
+                return self._uncharged_wait(parked)
+
+        # A parent that ends its turn while delegated work is still live has already yielded to
+        # that work. Re-poking it produces status recaps, and a judge can mistake a correctable
+        # child problem for a goal-level impossibility. Park deterministically until one batch
+        # returns; then the completion event resumes the parent with new evidence. A genuine block
+        # remains eligible for BLOCKED once no delegated work is still in flight.
+        if active_delegations > 0:
+            return self._wait_for_delegations(active_delegations, reason)
 
         # BLOCKED is NOT done: pause so the user sees the judge's reason and can re-scope or override,
         # instead of burning turns on an unachievable goal or waving it through as complete.
