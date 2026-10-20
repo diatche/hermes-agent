@@ -812,6 +812,32 @@ class TestJudgeWithContract:
         assert "completion contract" in user_msg.lower()
         assert "pytest -q passes" in user_msg
 
+    def test_judge_prompt_distinguishes_agent_owned_readiness_work(self, hermes_home):
+        from unittest.mock import patch
+        from hermes_cli import goals
+
+        captured = {}
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            side_effect=self._fake_call_llm(captured),
+        ):
+            goals.judge_goal(
+                "complete the migration",
+                "Deployment is not ready; authorized design and tests remain.",
+            )
+        system_msg = next(
+            (
+                m["content"]
+                for m in (captured.get("messages") or [])
+                if m["role"] == "system"
+            ),
+            "",
+        )
+        assert "An unready intermediate stage is CONTINUE" in system_msg
+        assert "within the goal's scope, authority, and stop conditions" in system_msg
+        assert "use WAIT instead when its criteria apply" in system_msg
+        assert "Do not invent a next step or treat mere repetition as progress" in system_msg
+
 
 class TestDraftContract:
     def test_draft_parses_json(self, hermes_home):
