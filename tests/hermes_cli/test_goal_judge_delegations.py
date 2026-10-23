@@ -7,7 +7,86 @@ processes), so it returned CONTINUE and each nudge bought a status recap (19 API
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli import goals
+
+
+@pytest.fixture
+def rotated_work(tmp_path, monkeypatch):
+    """Real compression lineage; every record deliberately shares a routing key."""
+    from hermes_state import SessionDB
+    from tools import async_delegation as ad
+    from tools.process_registry import process_registry
+
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(goals, "_get_session_db", lambda: db)
+    key = "agent:main:telegram:dm:test-peer:test-topic"
+    db.create_session("root", "telegram", session_key=key)
+    db.end_session("root", end_reason="compression")
+    db.create_session("middle", "telegram", parent_session_id="root", session_key=key)
+    db.end_session("middle", end_reason="compression")
+    db.create_session("tip", "telegram", parent_session_id="middle", session_key=key)
+    for sid, source, cfg in (
+        ("branch", "telegram", {"_branched_from": "root"}),
+        ("delegate", "telegram", {"_delegate_from": "root"}),
+        ("tool", "tool", {}),
+        ("reset", "telegram", {"_reset_from": "root"}),
+    ):
+        db.create_session(sid, source, parent_session_id="root", model_config=cfg, session_key=key)
+    db.create_session("grandchild", "tool", parent_session_id="delegate", session_key=key)
+    db.create_session("unrelated", "telegram", session_key=key)
+    db.create_session("old-reset", "telegram", session_key=key)
+    db.end_session("old-reset", end_reason="reset")
+    db.create_session("after-reset", "telegram", parent_session_id="old-reset", session_key=key)
+    owners = ["root", "middle", "tip", "branch", "delegate", "tool", "reset",
+              "grandchild", "unrelated", "old-reset", "after-reset"]
+    procs = [dict(session_id=f"proc_{sid}", owner_task_id=sid, task_id="default",
+                  session_key=key, status="running") for sid in owners]
+    procs.append(dict(session_id="proc_done", owner_task_id="root", status="exited"))
+    monkeypatch.setattr(process_registry, "list_sessions", lambda **kw: procs)
+    records = {sid: dict(parent_session_id=sid, session_key=key, status="running") for sid in owners}
+    records["done"] = dict(parent_session_id="root", session_key=key, status="completed")
+    monkeypatch.setattr(ad, "_records", records)
+    yield db, records
+    db.close()
+
+
+def test_background_processes_survive_compression_without_claiming_child_work(rotated_work):
+    for sid in ("tip", "root"):
+        assert [p["session_id"] for p in goals.gather_background_processes(owner_task_id=sid)] == [
+            "proc_root", "proc_middle", "proc_tip"]
+    for sid in ("branch", "delegate", "tool", "reset", "grandchild", "unrelated", "after-reset"):
+        assert [p["session_id"] for p in goals.gather_background_processes(owner_task_id=sid)] == [f"proc_{sid}"]
+    for unavailable in (False, True):
+        with patch.object(goals, "_get_session_db", return_value=None,
+                          side_effect=RuntimeError("store unavailable") if unavailable else None):
+            assert [p["session_id"] for p in goals.gather_background_processes(owner_task_id="tip")] == ["proc_tip"]
+
+
+def test_delegations_survive_compression_and_keep_the_goal_parked(rotated_work):
+    _db, records = rotated_work
+    mgr = goals.GoalManager(session_id="tip")
+    mgr.set("integrate the delegated work")
+    live = goals.count_active_delegations("tip")
+    assert live == 3
+    with patch.object(goals, "judge_goal", return_value=("continue", "workers running", False, None, False)):
+        decision = mgr.evaluate_after_turn("Waiting on workers.", active_delegations=live)
+    assert decision["should_continue"] is False
+    assert decision["verdict"] == "wait"
+    assert mgr.state is not None
+    assert mgr.state.turns_used == 0
+    assert mgr.is_waiting() is True
+    assert goals.count_active_delegations("root") == 3
+    records["root"]["status"] = "completed"
+    assert mgr.is_waiting() is False
+    assert goals.count_active_delegations("tip") == 2
+    for sid in ("branch", "delegate", "tool", "reset", "grandchild", "unrelated", "after-reset"):
+        assert goals.count_active_delegations(sid) == 1
+    for unavailable in (False, True):
+        with patch.object(goals, "_get_session_db", return_value=None,
+                          side_effect=RuntimeError("store unavailable") if unavailable else None):
+            assert goals.count_active_delegations("tip") == 1
 
 
 def _resp(content):

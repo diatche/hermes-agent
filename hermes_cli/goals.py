@@ -946,13 +946,32 @@ def judge_goal(
     return verdict, reason, parse_failed, wait_directive, False
 
 
+def _goal_work_session_ids(session_id: str) -> set[str]:
+    """Physical owners of this conversation's work, never branch/delegate/tool/reset relatives.
+
+    Compression replaces the physical session, not its outstanding work. Use the canonical
+    compression lineage rather than the routing key (which also survives /new and is shared by
+    subagents). A missing/unavailable store preserves exact-owner matching.
+    """
+    session_id = str(session_id)
+    try:
+        db = _get_session_db()
+        lineage = db.get_compression_lineage(session_id) if db is not None else []
+        if session_id in lineage:
+            return set(lineage)
+    except Exception as exc:
+        logger.debug("goal work lineage lookup failed: %s", exc)
+    return {session_id}
+
+
 def count_active_delegations(session_id: Optional[str]) -> int:
-    """Live async delegation batches spawned by this session (fail-safe 0)."""
+    """Live async batches spawned by this conversation's compression segments (fail-safe 0)."""
     if not session_id:
         return 0
     try:
         from tools.async_delegation import _LIVE_STATES, _session_records
-        return len(_session_records(_LIVE_STATES, "", "", str(session_id)))
+        return sum(len(_session_records(_LIVE_STATES, "", "", sid))
+                   for sid in _goal_work_session_ids(session_id))
     except Exception:
         return 0
 
@@ -1010,8 +1029,9 @@ def gather_background_processes(task_id: Optional[str] = None, *, owner_task_id:
     """Fail-safe snapshot of RUNNING ``process_registry`` sessions for the judge; ``[]`` on any error
     so the loop degrades to its pre-wait-barrier behavior.
 
-    ``owner_task_id`` restricts the snapshot to processes the goal's OWN session spawned. The registry's
-    ``task_id`` is the container key, which collapses to one value for every agent in the process, so
+    ``owner_task_id`` restricts the snapshot to the goal's own compression lineage (or the exact
+    task owner for stable CLI/TUI keys). The registry's ``task_id`` is the container key, which
+    collapses to one value for every agent in the process, so
     without this filter a fan-out parent's judge saw every subagent's pollers and parked the goal on a
     grandchild's ``proc_*`` session (one run: 7 of 7 root verdicts were WAIT on child-owned processes;
     parked 3 h 22 min at the end while nothing of its own was running)."""
@@ -1024,7 +1044,8 @@ def gather_background_processes(task_id: Optional[str] = None, *, owner_task_id:
         return []
     running = [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
     if owner_task_id:
-        running = [s for s in running if str(s.get("owner_task_id") or s.get("task_id") or "") == str(owner_task_id)]
+        owners = _goal_work_session_ids(owner_task_id)
+        running = [s for s in running if str(s.get("owner_task_id") or s.get("task_id") or "") in owners]
     return running
 
 
