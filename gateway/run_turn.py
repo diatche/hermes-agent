@@ -476,6 +476,33 @@ class GatewayTurnMixin:
             return session_entry
         stored_session_id = str(binding.get("session_id") or "")
         bound_session_id = stored_session_id
+        # Delegate transcripts share their parent's platform routing metadata so their work remains
+        # inspectable, but they are not conversation owners.  If persistence displaced a topic
+        # binding with such a child, following it would end the parent as ``session_switch`` and
+        # strand every parent-scoped state item (notably /goal).  Repair the binding to the route we
+        # already resolved instead; explicit /resume targets have no matching ``_delegate_from``.
+        if bound_session_id and bound_session_id != session_entry.session_id and self._session_db is not None:
+            try:
+                bound_row = await self._session_db.get_session(bound_session_id)
+                raw_config = (bound_row or {}).get("model_config")
+                if isinstance(raw_config, str):
+                    raw_config = json.loads(raw_config or "{}")
+                delegate_from = (
+                    str(raw_config.get("_delegate_from") or "")
+                    if isinstance(raw_config, dict)
+                    else ""
+                )
+            except Exception:
+                logger.debug("delegate-owner lookup failed for %s", bound_session_id, exc_info=True)
+                delegate_from = ""
+            if delegate_from == session_entry.session_id:
+                await asyncio.to_thread(
+                    self._sync_telegram_topic_binding,
+                    source,
+                    session_entry,
+                    reason="delegate-child-owner-repair",
+                )
+                return session_entry
         # A binding pointing at a pre-compression parent is walked forward to the tip so the next
         # message resumes the compressed child instead of reloading the oversized parent.
         # Returns the input unchanged when the session isn't a compression parent, so this is cheap and

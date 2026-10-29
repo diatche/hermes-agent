@@ -559,6 +559,50 @@ async def test_topic_binding_heal_switches_with_cas_on_snapshot_session(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_topic_binding_does_not_promote_delegate_child_over_parent(tmp_path):
+    """A subagent may persist under the topic for transcript visibility, but it does not own the lane."""
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    topic_source = _make_source(thread_id="17585")
+    topic_key = build_session_key(topic_source)
+    session_db.create_session(
+        session_id="parent-session", source="telegram", user_id="208214988",
+    )
+    session_db.create_session(
+        session_id="delegate-session", source="telegram", user_id="208214988",
+        parent_session_id="parent-session",
+        model_config={"_delegate_from": "parent-session"},
+    )
+    # Reproduces the observed corruption: child persistence displaced the topic binding.
+    session_db.bind_telegram_topic(
+        chat_id="208214988", thread_id="17585", user_id="208214988",
+        session_key=topic_key, session_id="delegate-session",
+    )
+    runner = _make_runner(session_db=session_db)
+    snapshot = SessionEntry(
+        session_key=topic_key,
+        session_id="parent-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=topic_source,
+    )
+
+    resolved = await runner._hmwa_heal_telegram_topic_binding(
+        topic_source, snapshot, topic_key,
+    )
+
+    assert resolved.session_id == "parent-session"
+    runner.session_store.switch_session.assert_not_called()
+    repaired = session_db.get_telegram_topic_binding(
+        chat_id="208214988", thread_id="17585",
+    )
+    assert repaired is not None
+    assert repaired["session_id"] == "parent-session"
+
+
+@pytest.mark.asyncio
 async def test_topic_root_command_lists_unlinked_sessions_for_restore(tmp_path, monkeypatch):
     import gateway.run as gateway_run
 
