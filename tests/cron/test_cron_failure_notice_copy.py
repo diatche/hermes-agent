@@ -9,6 +9,7 @@ import re
 
 import cron.scheduler as scheduler
 from cron.scheduler import _compose_run_delivery, _summarize_cron_failure_for_delivery
+from cron.scheduler_failure_copy import generic_failure_notice
 
 JOB = {"name": "Morning brief", "id": "ab12cd34"}
 _HTTP_LEAD = re.compile(r"failed: (HTTP|Error code:|provider )")
@@ -68,6 +69,29 @@ def test_cron_cause_gloss_is_the_shared_table():
 
 
 
+
+
+def test_structured_script_failure_becomes_a_human_status_card():
+    raw = """Script exited with code 1
+stdout:
+Correspondence asset retention failed.
+Component: Beeper attachment retention
+Phase: collector initialization/database processing
+Scope: collector-wide startup failure; no specific episode, event, or message was identified.
+Cause: unable to open database file
+Impact: eligible attachment retention may be delayed until the next successful run.
+Urgency: low for one isolated run; elevated if the next run also fails.
+Retry: automatic on the next scheduled run. Escalate if the next run also fails.
+"""
+    msg = generic_failure_notice("Retain Beeper correspondence assets", "ab12cd34", raw)
+    assert msg.startswith("⚠️ **Retain Beeper correspondence assets needs attention**")
+    assert "**What happened:** collector-wide startup failure" in msg
+    assert "**Impact:** eligible attachment retention may be delayed" in msg
+    assert "**Urgency:** low for one isolated run" in msg
+    assert "**Next:** automatic on the next scheduled run" in msg
+    assert "Script exited with code 1" not in msg
+    assert "run it again with" not in msg.lower()
+    assert "`hermes cron runs ab12cd34`" in msg
 
 
 def test_blocked_config_notice_says_it_did_not_run_and_will_self_heal():

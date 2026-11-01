@@ -109,14 +109,47 @@ def provider_failure_notice(
     )
 
 
+def _structured_failure_fields(error: str) -> dict[str, str]:
+    """Extract script-authored operator context without exposing wrapper noise."""
+    fields: dict[str, str] = {}
+    for line in error.splitlines():
+        label, separator, value = line.partition(":")
+        key = label.strip().casefold()
+        if separator and key in {"scope", "cause", "impact", "urgency", "retry"} and value.strip():
+            fields[key] = value.strip()
+    return fields
+
+
 def generic_failure_notice(job_name: str, job_id: str, cleaned_error: str) -> str:
-    """Unclassified failure: the cleaned error text plus where to look and what to do."""
-    return (
-        f"⚠️ Cron '{job_name}' failed: {cleaned_error}. "
-        f"See the full run with `hermes cron runs {job_id}` (output saved under "
-        f"{cron_output_dir_display(job_id)}); run it again with `hermes cron run {job_id}`, "
-        f"edit it with `hermes cron edit {job_id}`, or pause it with `hermes cron pause {job_id}`."
+    """Present unclassified failures as an operator status card, not a CLI dump."""
+    fields = _structured_failure_fields(cleaned_error)
+    if {"scope", "impact", "urgency", "retry"}.issubset(fields):
+        what = fields["scope"]
+        if fields.get("cause"):
+            what = f"{what} Cause: {fields['cause']}."
+        return "\n".join((
+            f"⚠️ **{job_name} needs attention**",
+            f"**What happened:** {what}",
+            f"**Impact:** {fields['impact']}",
+            f"**Urgency:** {fields['urgency']}",
+            f"**Next:** {fields['retry']}",
+            f"**Details:** `hermes cron runs {job_id}`",
+        ))
+
+    issue = re.sub(
+        r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*", "", cleaned_error[:2000]
     )
+    issue = " ".join(issue.split()).strip().rstrip(".")
+    if len(issue) > 240:
+        issue = issue[:237].rstrip() + "..."
+    return "\n".join((
+        f"⚠️ **{job_name} needs attention**",
+        f"**Issue:** {issue or 'This scheduled run did not complete.'}",
+        "**Impact:** This run did not complete; the saved run log has the technical details.",
+        "**Urgency:** Review soon if the job is time-sensitive or if the failure repeats.",
+        "**Next:** Hermes will try again at the next scheduled time.",
+        f"**Details:** `hermes cron runs {job_id}`",
+    ))
 
 
 def script_timeout_notice(job_name: str, job_id: str) -> str:
