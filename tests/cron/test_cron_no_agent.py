@@ -243,6 +243,7 @@ def test_run_job_script_nul_path_fails_cleanly(hermes_env):
         "Script failed: ReadTimeout contacting localhost",
     ],
 )
+@pytest.mark.usefixtures("deterministic_cron_failure_copy")
 def test_no_agent_failure_never_blamed_on_a_provider(error):
     """A script job's failure must never be reported as a provider/fallback failure."""
     from cron.scheduler import _summarize_cron_failure_for_delivery

@@ -9,8 +9,12 @@ fingerprint — when boot SHA != disk HEAD, the delivered error must say so and
 name the command.
 """
 
+import pytest
+
 import cron.scheduler as scheduler
 from cron.scheduler import _summarize_cron_failure_for_delivery
+
+pytestmark = pytest.mark.usefixtures("deterministic_cron_failure_copy")
 
 IMPORT_ERROR = (
     "ImportError: cannot import name 'user_originated_turn_view' "

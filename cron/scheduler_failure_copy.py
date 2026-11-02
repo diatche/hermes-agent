@@ -1,9 +1,9 @@
-"""Plain-language copy for the one-line cron failure notice delivered to a job's chat.
+"""Plain-language cron failure notices delivered to a job's chat.
 
 The scheduler classifies the failure text through ``agent.error_classifier.classify_api_error``
 (one classifier for the whole app, no cron-local regex ladder) and looks the verdict up here.
-Every notice says WHAT happened and WHAT TO DO, and names the exact ``hermes cron`` command plus
-the real output directory — "cron output" alone sent operators hunting.
+Specialized and script-authored copy stays deterministic. Unstructured failures get
+one bounded Luna summary attempt; presentation and run references remain scheduler-owned.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import re
 from typing import Any, Optional
 
 from hermes_constants import display_hermes_home
+from cron.scheduler_failure_summary import attempt_summary as _attempt_luna_summary
 
 
 def cron_output_dir_display(job_id: str) -> str:
@@ -136,6 +137,33 @@ def generic_failure_notice(job_name: str, job_id: str, cleaned_error: str) -> st
             f"**Details:** `hermes cron runs {job_id}`",
         ))
 
+    # Preserve script-authored fields above. Only unstructured evidence crosses
+    # the one-attempt seam; validation failure is an ordinary deterministic fallback.
+    try:
+        from cron.scheduler_failure_summary import FailureSummary
+        raw = _attempt_luna_summary({
+            "error": cleaned_error[:6000],
+            "automatic_retry": "not established; do not promise another run",
+        })
+        summary = FailureSummary.model_validate_json(raw) if raw else None
+        if summary is not None:
+            if any("\n" in value or "\r" in value for value in summary.model_dump().values()):
+                raise ValueError("multiline summary field")
+            lines = [
+                f"⚠️ **{job_name} needs attention**",
+                f"**What happened:** {summary.what_happened}",
+                f"**Impact:** {summary.impact}",
+                f"**Urgency:** {summary.urgency}",
+                f"**Next:** {summary.next}",
+                f"**User action:** {summary.user_action}",
+            ]
+            if summary.technical_detail and summary.technical_detail != summary.what_happened:
+                lines.append(f"**Technical detail:** {summary.technical_detail}")
+            lines.append(f"**Details:** `hermes cron runs {job_id}`")
+            return "\n".join(lines)
+    except Exception:
+        pass  # Enrichment must never prevent the deterministic failure notice.
+
     issue = re.sub(
         r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*", "", cleaned_error[:2000]
     )
@@ -147,9 +175,21 @@ def generic_failure_notice(job_name: str, job_id: str, cleaned_error: str) -> st
         f"**Issue:** {issue or 'This scheduled run did not complete.'}",
         "**Impact:** This run did not complete; the saved run log has the technical details.",
         "**Urgency:** Review soon if the job is time-sensitive or if the failure repeats.",
-        "**Next:** Hermes will try again at the next scheduled time.",
+        "**Next:** Review the saved run before deciding what to do.",
         f"**Details:** `hermes cron runs {job_id}`",
     ))
+
+
+def failure_references(job: dict, *, execution_id: Optional[str] = None) -> str:
+    """Scheduler metadata only; never infer IDs from model output or log prose."""
+    lines = [
+        "**References**", f"Job: {job.get('name') or job['id']}",
+        f"Job ID: {job['id']}",
+    ]
+    run = execution_id or job.get("execution_id")
+    if run:
+        lines.append(f"Run: {run}")
+    return "\n".join(lines)
 
 
 def script_timeout_notice(job_name: str, job_id: str) -> str:

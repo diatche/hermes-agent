@@ -2819,7 +2819,7 @@ def _classify_delivery_outcome(
 
 def _compose_run_delivery(
     job: dict, *, success: bool, error, final_response: str, output_file,
-    agent_declared: bool = False,
+    agent_declared: bool = False, execution_id: Optional[str] = None,
 ) -> tuple[str, bool, bool, bool, Optional[str]]:
     """Text to deliver for a finished run. Returns ``(deliver_content, blocked_config,
     silent_alert, incident_acked, failure_incident_id)``; ``silent_alert``: an alert-once marker
@@ -2863,6 +2863,9 @@ def _compose_run_delivery(
                 # The one alert on entering a provider-window hold says so (#89376).
                 + hold_notice(job, job.get("_quota_hold_seconds"))
             )
+    if not success and deliver_content:
+        from cron.scheduler_failure_copy import failure_references
+        deliver_content += "\n\n" + failure_references(job, execution_id=execution_id)
     return deliver_content, blocked_config, blocked_config_silent, incident_acked, failure_incident_id
 
 
@@ -2941,6 +2944,7 @@ class _RunDelivery:
     incident_acked: bool = False
     failure_incident_id: Optional[str] = None
     side_effect_ownership_lost: bool = False
+    execution_id: Optional[str] = None
 
 
 def _save_compose_deliver(
@@ -2973,7 +2977,7 @@ def _save_compose_deliver(
         deliver_content, d.blocked_config, _silent_alert, d.incident_acked, d.failure_incident_id,
     ) = _compose_run_delivery(
         job, success=d.success, error=d.error, final_response=final_response,
-        output_file=output_file, agent_declared=d.agent_declared)
+        output_file=output_file, agent_declared=d.agent_declared, execution_id=d.execution_id)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
     if d.should_deliver and not d.success and job.get("_model_unreachable"):
@@ -3096,7 +3100,7 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
 
 
 def _deliver_crash_failure(
-    job: dict, err_text: str, *, adapters, loop,
+    job: dict, err_text: str, *, adapters, loop, execution_id: Optional[str] = None,
 ) -> tuple[Optional[str], str]:
     """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
@@ -3106,11 +3110,13 @@ def _deliver_crash_failure(
         return None, "suppressed_acked"
     delivery_error = None
     try:
+        from cron.scheduler_failure_copy import failure_references
         delivery_error = _deliver_result(
             job,
             # Same text as the normal failure delivery: this run also counts toward
             # failure_streak, so the nudge must leave through here too.
-            _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job),
+            _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job)
+            + "\n\n" + failure_references(job, execution_id=execution_id),
             adapters=adapters,
             loop=loop,
             for_failure=True,
@@ -3251,7 +3257,8 @@ def _run_one_job_body(
 
         # Agent is still live through delivery; wrap ALL of save/compose/deliver in try/finally so a
         # raise anywhere still tears the deferred agent down.
-        d = _RunDelivery(job=job, success=success, error=error, agent_declared=agent_declared)
+        d = _RunDelivery(job=job, success=success, error=error, agent_declared=agent_declared,
+                         execution_id=execution_id)
         try:
             _save_compose_deliver(
                 d, fence, final_response, output, adapters=adapters, loop=loop, verbose=verbose,
@@ -3327,7 +3334,7 @@ def _run_one_job_body(
             and not _fire_claim_ownership_lost()
         ):
             delivery_error, delivery_outcome = _deliver_crash_failure(
-                job, _err_text, adapters=adapters, loop=loop)
+                job, _err_text, adapters=adapters, loop=loop, execution_id=execution_id)
         try:
             if (
                 not _consume_interrupted_flag(job["id"], execution_token)

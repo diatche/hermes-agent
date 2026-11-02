@@ -14,6 +14,13 @@ inside the test, which overrides this fixture's value for that scope.
 import pytest
 
 
+@pytest.fixture
+def deterministic_cron_failure_copy(monkeypatch):
+    """Explicit opt-in for raw fallback-copy tests, not a suite-wide model mock."""
+    import cron.scheduler_failure_copy as failure_copy
+    monkeypatch.setattr(failure_copy, "_attempt_luna_summary", lambda evidence: None)
+
+
 @pytest.fixture()
 def make_cron_provider():
     """Factory for minimal CronScheduler test doubles.

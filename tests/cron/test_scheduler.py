@@ -39,6 +39,7 @@ def test_cron_cleanup_worker_inherits_caller_contextvars():
     assert observed == ["profile-key"]
 
 
+@pytest.mark.usefixtures("deterministic_cron_failure_copy")
 class TestSummarizeCronFailureForDelivery:
     def test_embedded_429_in_source_identifier_is_not_a_rate_limit(self):
         summary = _summarize_cron_failure_for_delivery(
