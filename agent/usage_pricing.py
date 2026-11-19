@@ -271,6 +271,18 @@ _OFFICIAL_DOCS_PRICING[("openai", "gpt-6-astra")] = _snap(
     cache_write_cost_per_million_above=Decimal("25.00"),
 )
 
+# GPT-6.2 Astra keeps the same 1.05M/922K-input shape with lower published rates.
+_OFFICIAL_DOCS_PRICING[("openai", "gpt-6.2-astra")] = _snap(
+    "8.00", "40.00", "0.40", "10.00",
+    url="https://developers.openai.com/api/docs/models/gpt-6.2-astra",
+    version="openai-gpt-6.2-2026-11",
+    tier_threshold_tokens=272_000,
+    input_cost_per_million_above=Decimal("16.00"),
+    output_cost_per_million_above=Decimal("60.00"),
+    cache_read_cost_per_million_above=Decimal("0.80"),
+    cache_write_cost_per_million_above=Decimal("20.00"),
+)
+
 # GPT-6 Sol / Luna (the 5.6 Sol/Luna successors): same 272K whole-request tier as Astra
 # (2x input + cache, 1.5x output). Cache write = 1.25x input, cache read = 0.10x input.
 # Terra has no published model page yet, so it deliberately has no row.
@@ -323,6 +335,7 @@ for _provider, _alias, _canonical in (
     *((("openai", f"{m}-{suffix}", m)
        for m in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna")
        for suffix in ("pro", "900k"))),
+    ("openai", "gpt-6.2-astra-900k", "gpt-6.2-astra"),
     ("google", "gemini-3.1-pro-preview", "gemini-3.1-pro"),
     ("google", "gemini-3.1-flash-lite-preview", "gemini-3.1-flash-lite"),
 ):

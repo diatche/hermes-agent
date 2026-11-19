@@ -52,23 +52,31 @@ def test_astra_codex_oauth_fallback_uses_backend_context_limit():
     assert codex_ctx < DEFAULT_CONTEXT_LENGTHS["gpt-6-astra"]  # Codex caps below the direct API window
 
 
+@pytest.mark.parametrize("base", ["gpt-6-astra", "gpt-6.2-astra"])
 @pytest.mark.parametrize("advertised,expected", [(272_000, 900_000), (200_000, 200_000), (1_050_000, 1_050_000)])
-def test_astra_900k_opt_in_preserves_live_limits_and_wire_contract(monkeypatch, tmp_path, advertised, expected):
+def test_astra_900k_opt_in_preserves_live_limits_and_wire_contract(
+    monkeypatch, tmp_path, base, advertised, expected,
+):
     """Only the known stale advertisement is lifted; the alias never reaches the wire."""
     from agent import model_metadata as metadata
     from agent.reasoning_effort import CODEX_ASTRA_EFFORTS, codex_supported_efforts
     from agent.transports.codex import ResponsesApiTransport
 
+    variant = f"{base}-900k"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(metadata, "_codex_oauth_context_cache", {})
     monkeypatch.setattr(metadata.requests, "get", lambda *args, **kwargs: SimpleNamespace(
         status_code=200,
-        json=lambda: {"models": [{"slug": "gpt-6-astra", "context_window": advertised}]},
+        json=lambda: {"models": [{"slug": base, "context_window": advertised}]},
     ))
     route = {"base_url": "https://chatgpt.com/backend-api/codex", "provider": "openai-codex"}
-    assert metadata.get_model_context_length("gpt-6-astra-900k", api_key="test-token", **route) == expected
-    assert metadata.get_model_context_length("gpt-6-astra", api_key="test-token", **route) == advertised
-    assert codex_supported_efforts("gpt-6-astra-900k") == CODEX_ASTRA_EFFORTS
+    assert metadata.get_model_context_length(variant, api_key="test-token", **route) == expected
+    assert metadata.get_model_context_length(base, api_key="test-token", **route) == advertised
+    assert codex_supported_efforts(variant) == CODEX_ASTRA_EFFORTS
+    if base == "gpt-6.2-astra":
+        from agent.usage_pricing import _OFFICIAL_DOCS_PRICING
+
+        assert _OFFICIAL_DOCS_PRICING[("openai", variant)] is _OFFICIAL_DOCS_PRICING[("openai", base)]
 
     for config in ({"effort": "max"}, {"enabled": False}):
         params = dict(
@@ -76,9 +84,9 @@ def test_astra_900k_opt_in_preserves_live_limits_and_wire_contract(monkeypatch, 
             is_codex_backend=True, reasoning_config=config,
             request_overrides={"temperature": 0.5, "logprobs": True}, **route,
         )
-        kwargs = ResponsesApiTransport().build_kwargs(model="gpt-6-astra-900k", **params)
-        assert kwargs["model"] == "gpt-6-astra"
-        assert kwargs == ResponsesApiTransport().build_kwargs(model="gpt-6-astra", **params)
+        kwargs = ResponsesApiTransport().build_kwargs(model=variant, **params)
+        assert kwargs["model"] == base
+        assert kwargs == ResponsesApiTransport().build_kwargs(model=base, **params)
 
 
 @pytest.mark.parametrize("provider,model", [

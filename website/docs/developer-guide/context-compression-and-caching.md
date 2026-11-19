@@ -372,14 +372,15 @@ hermes config set compression.codex_gpt55_autoraise_notice false
 ### Codex large-context `-900k` picker variants (opt-in)
 
 The ChatGPT Codex backend *advertises* a 272K window for the gpt-5.4, gpt-5.6
-(Sol/Terra/Luna) and GPT-6 (Sol/Terra/Luna) families, but actually accepts ~911K input tokens
-for ChatGPT-subscription accounts (live-verified Aug 2026). Hermes keeps the
+(Sol/Terra/Luna), GPT-6 (Sol/Terra/Luna), and Astra models, but actually accepts much larger inputs
+for ChatGPT-subscription accounts. GPT-6.2 Astra accepted a 780K-token start/end retrieval probe
+in November 2026; its live catalog currently caps the opt-in variant at 872K. Hermes keeps the
 **advertised 272K as the default** for the base slugs — a bigger window means
 more tokens per request and much faster subscription-usage burn, so the large
 window is strictly opt-in.
 
 To use the large window, pick the explicit `-900k` variant in `/model` (e.g.
-`gpt-6-sol-900k`, `gpt-6-terra-900k`, `gpt-6-luna-900k`, `gpt-5.6-sol-900k`,
+`gpt-6.2-astra-900k`, `gpt-6-astra-900k`, `gpt-6-sol-900k`, `gpt-6-terra-900k`, `gpt-6-luna-900k`, `gpt-5.6-sol-900k`,
 `gpt-5.6-terra-900k`, `gpt-5.6-luna-900k`, `gpt-5.4-900k`). These are Hermes-side aliases: the suffix is stripped before
 the model id is sent to the backend, and pricing/usage accounting treats them
 as the base model. Slugs that genuinely enforce 272K (gpt-5.5, gpt-5.4-mini)

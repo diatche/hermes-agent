@@ -1,6 +1,8 @@
 import json
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.codex_models import (
     _FORWARD_COMPAT_TEMPLATE_MODELS,
     DEFAULT_CODEX_MODELS,
@@ -106,35 +108,37 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
     assert "gpt-5-internal" not in models
 
 
-def test_astra_requires_live_codex_account_discovery(monkeypatch, tmp_path):
+@pytest.mark.parametrize("base", ["gpt-6-astra", "gpt-6.2-astra"])
+def test_astra_requires_live_codex_account_discovery(monkeypatch, tmp_path, base):
     """Cached/configured Astra names must not manufacture current OAuth entitlement."""
     from hermes_cli import codex_models
 
-    (tmp_path / "config.toml").write_text('model = "gpt-6-astra"\n', encoding="utf-8")
+    variant = f"{base}-900k"
+    (tmp_path / "config.toml").write_text(f'model = "{base}"\n', encoding="utf-8")
     (tmp_path / "models_cache.json").write_text(
         json.dumps({"models": [
-            {"slug": "gpt-6-astra", "priority": 0},
-            {"slug": "openai/gpt-6-astra", "priority": 1},
-            {"slug": "gpt-6-astra-900k", "priority": 2},
-            {"slug": "openai/gpt-6-astra-900k", "priority": 3},
+            {"slug": base, "priority": 0},
+            {"slug": f"openai/{base}", "priority": 1},
+            {"slug": variant, "priority": 2},
+            {"slug": f"openai/{variant}", "priority": 3},
         ]}),
         encoding="utf-8",
     )
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     monkeypatch.setattr(codex_models, "_fetch_models_from_api", lambda _token: [])
 
-    assert "gpt-6-astra" not in get_codex_model_ids(access_token="stale-token")
-    assert "openai/gpt-6-astra" not in get_codex_model_ids(access_token="stale-token")
-    assert "gpt-6-astra-900k" not in get_codex_model_ids(access_token="stale-token")
-    assert "openai/gpt-6-astra-900k" not in get_codex_model_ids(access_token="stale-token")
+    assert base not in get_codex_model_ids(access_token="stale-token")
+    assert f"openai/{base}" not in get_codex_model_ids(access_token="stale-token")
+    assert variant not in get_codex_model_ids(access_token="stale-token")
+    assert f"openai/{variant}" not in get_codex_model_ids(access_token="stale-token")
 
     monkeypatch.setattr(
         codex_models,
         "_fetch_models_from_api",
-        lambda _token: codex_models._finalize_codex_models(["gpt-6-astra"]),
+        lambda _token: codex_models._finalize_codex_models([base]),
     )
     entitled = get_codex_model_ids(access_token="entitled-token")
-    assert entitled[entitled.index("gpt-6-astra") + 1] == "gpt-6-astra-900k"
+    assert entitled[entitled.index(base) + 1] == variant
 
 
 
